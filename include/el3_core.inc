@@ -69,6 +69,14 @@ EL3_RX_LEN_MASK         equ 0x07FF
 EL3_RXF_STATION         equ 0x01
 EL3_RXF_BROADCAST       equ 0x04
 
+; ---- Window 2: station address (6 byte registers at offsets 0..5) ----
+EL3_W2_STATION_REG      equ 0x00
+
+; ---- Window 4: media / transceiver ----
+EL3_W4_MEDIA_STATUS     equ 0x0A     ; media type/status register
+EL3_MEDIA_LBEAT_ENABLE  equ 0x0080   ; enable 10BaseT link beat
+EL3_MEDIA_JABBER_ENABLE equ 0x0040   ; enable 10BaseT jabber guard
+
 ; ---- EEPROM (shared word layout + read opcode) ----
 EL3_EE_READ             equ 0x80     ; OR with word addr to issue a read
 EL3_EE_ADDR0            equ 0        ; station address words 0..2 (big-endian)

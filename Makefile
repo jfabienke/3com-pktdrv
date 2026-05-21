@@ -32,8 +32,9 @@ all: .SYMBOLIC $(TARGET)
 $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
     python3 tools/mkfrag.py
 
-$(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm include/codegen.inc &
-                     include/el3_tomahawk.inc include/el3_core.inc $(BUILD)/frags_asm.inc
+$(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.asm &
+                     include/codegen.inc include/el3_tomahawk.inc include/el3_core.inc &
+                     $(BUILD)/frags_asm.inc
     $(ASM) $(AFLAGS) src/asm/start.asm -o $@
 
 $(TARGET) : $(BUILD)/start.obj 3cpd.lnk

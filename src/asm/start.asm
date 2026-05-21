@@ -116,6 +116,7 @@ segment _TEXT public class=CODE use16
 %endif
         jc      .fail               ; no card found
 .build:
+        call    el3_init            ; bring the activated card to operational state
         call    build_plan          ; copy io_base into the plan's PIO steps
 
         call    compose_resident    ; ax = emitted length, fills resident_image + g_off
@@ -178,6 +179,9 @@ phase_validate_dma:
 
 ; detect_nic / id_read_eeprom / io_delay -- the real 3C509B ISA probe + activation.
 %include "el3_probe.asm"
+
+; el3_init -- operational bring-up of the activated card (MAC, media, RX/TX enable).
+%include "el3_init.asm"
 
 ;------------------------------------------------------------------------------
 ; build_plan -- the HAL hands the composer the NIC's immediates: io_base into the PIO
