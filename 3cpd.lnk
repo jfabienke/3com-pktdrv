@@ -1,29 +1,16 @@
-# wlink directive — 3com-pktdrv (minimal floor milestone)
+# wlink directive -- 3com-pktdrv (fully-assembly floor).
 #
-# Resident-first class ordering is what makes copy-down work: RESIDENT classes are placed
-# first (lowest); after the composer emits the hot image we TSR-keep up to the end of the
-# resident region, reclaiming everything above (composer/fragments/cold init).
+# One NASM object, DOS MZ .EXE, no C library. Entry point is ..start (carried in the OMF
+# module-end record by NASM). The resident region (resident_image + state in _BSS) is
+# packed by copy-down at runtime; class ordering for a tight TSR keep-boundary returns when
+# the install + DOS-keep path lands.
 
 system dos
 name build/3cpd.exe
 option quiet
 option map=build/3cpd.map
-option stack=2048
+# DOSSEG order: CODE first, then DATA, with _BSS + _STACK last so the uninitialized
+# regions fall under minalloc instead of being stored in the file image.
+option dosseg
 
-# Class ordering: the default DOSSEG-style order already places the hot code class (CODE:
-# _TEXT) before the cold class (COLD_TEXT), which is what copy-down relies on. Verified in
-# build/3cpd.map:  _TEXT @ 0000  ->  COLD_TEXT @ 0075 (after).  An explicit ORDER directive
-# placing RESIDENT_DATA + EMIT_ARENA between them will be added when copy-down is implemented
-# (it must pack resident data adjacent to resident code so the keep-boundary is tight).
-
-# minimal floor object set
-file build/api.obj
-file build/packet.obj
-file build/hal.obj
-file build/compose.obj
-file build/frag_pio.obj
-file build/main.obj
-file build/el3_core.obj
-file build/el3_isa.obj
-file build/cpu_detect.obj
-file build/nic_irq.obj
+file build/start.obj
