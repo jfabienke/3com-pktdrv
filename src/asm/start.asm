@@ -48,6 +48,7 @@ PLAN_STEP_SIZE  equ 3
 ;==============================================================================
 segment _BSS public class=BSS use16
 
+psp_seg:        resw 1          ; PSP segment (saved at entry, for the TSR keep)
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_P6 (set by detect_cpu)
                 resb 1
 g_nic_io:       resw 1          ; detected 3C509B I/O base
@@ -80,14 +81,20 @@ segment _STACK stack class=STACK use16
 
 ;==============================================================================
 ; CODE
+;
+; _TEXT is in DGROUP (tiny model): CS = DS = ES = SS = DGROUP, one addressable segment, so
+; the resident INT 60h handler / ISR (next milestone) can NEAR-call the emitted datapath in
+; resident_image. The _BSS + _STACK tail is uninitialized -> minalloc, not stored in the file.
 ;==============================================================================
-group DGROUP _DATA _BSS _STACK
+group DGROUP _TEXT _DATA _BSS _STACK
 segment _TEXT public class=CODE use16
 
 ..start:
+        mov     bp, es              ; ES = PSP at .EXE entry -- save for the TSR keep
         mov     ax, DGROUP
         mov     ds, ax
         mov     es, ax              ; composer uses ES:DI for the emit destination
+        mov     [psp_seg], bp
 
         call    detect_cpu          ; -> g_cpu_class
 
