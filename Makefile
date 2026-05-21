@@ -15,7 +15,7 @@ TARGET = $(BUILD)/3cpd.exe
 
 # -f obj: 16-bit OMF for wlink. Includes resolve codegen.inc (include/) and the generated
 # frags_asm.inc (build/). All sources declare `cpu 8086` -- the 5150 floor.
-AFLAGS = -f obj -iinclude/ -i$(BUILD)/
+AFLAGS = -f obj -iinclude/ -i$(BUILD)/ -isrc/asm/
 
 # Hot-path fragment palette (assembled to bins + embedded by mkfrag.py, not linked).
 FRAG_SRC = &
@@ -32,7 +32,8 @@ all: .SYMBOLIC $(TARGET)
 $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
     python3 tools/mkfrag.py
 
-$(BUILD)/start.obj : src/asm/start.asm include/codegen.inc $(BUILD)/frags_asm.inc
+$(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm include/codegen.inc &
+                     include/el3_tomahawk.inc include/el3_core.inc $(BUILD)/frags_asm.inc
     $(ASM) $(AFLAGS) src/asm/start.asm -o $@
 
 $(TARGET) : $(BUILD)/start.obj 3cpd.lnk

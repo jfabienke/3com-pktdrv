@@ -14,6 +14,8 @@ cpu 8086
 bits 16
 
 %include "codegen.inc"
+; EL3 register constants are pulled per-generation by the probe (el3_probe.asm includes
+; el3_tomahawk.inc -> el3_core.inc); start.asm proper needs none directly.
 
 ;==============================================================================
 ; DATA (initialized) -- fragment palette, plan template
@@ -49,6 +51,8 @@ segment _BSS public class=BSS use16
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_P6 (set by detect_cpu)
                 resb 1
 g_nic_io:       resw 1          ; detected 3C509B I/O base
+g_nic_irq:      resw 1          ; detected IRQ
+g_mac:          resb 6          ; station address (from EEPROM)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
 
@@ -98,7 +102,20 @@ segment _TEXT public class=CODE use16
         call    phase_platform_probe    ; (>=286) V86/VDS/memory tiers      [stub]
         call    phase_validate_dma      ; (>=286) busmaster test + cache    [stub]
 .floor:
-        call    detect_nic          ; -> g_nic_io (floor: 3C509B probe)
+        ; ISA NIC detection. The native 3Com ID-port sequence is the universal EtherLink III
+        ; ISA mechanism and runs on ANY CPU -- it's just port I/O. ISA PnP is a SEPARATE
+        ; software protocol over fixed ports (0x279/0xA79 + relocatable read) that ALSO works
+        ; on any ISA bus: it is NOT CPU-dependent (no PnP BIOS or 286+ needed to run the
+        ; isolation -- a software PnP manager does it). PnP only matters for a 3C509B left in
+        ; PnP-only mode or already claimed by a PnP BIOS, so it is a FULL-PROFILE add
+        ; (CFG_PNP), compiled out of the minimal floor for size -- gated by profile, not CPU.
+        call    detect_nic          ; native 3Com ID-port (Tomahawk) -> g_nic_io/irq/mac
+%ifdef CFG_PNP
+        jnc     .build              ; native found a card
+        call    detect_nic_pnp      ; else (full profile) try ISA PnP (cache-kit isapnp)
+%endif
+        jc      .fail               ; no card found
+.build:
         call    build_plan          ; copy io_base into the plan's PIO steps
 
         call    compose_resident    ; ax = emitted length, fills resident_image + g_off
@@ -159,13 +176,8 @@ phase_platform_probe:
 phase_validate_dma:
         ret
 
-;------------------------------------------------------------------------------
-; detect_nic -- floor: assume a 3C509B at a default I/O base (real ID-port isolation
-; + EEPROM/MAC read land next). Sets g_nic_io.
-;------------------------------------------------------------------------------
-detect_nic:
-        mov     word [g_nic_io], 0x300
-        ret
+; detect_nic / id_read_eeprom / io_delay -- the real 3C509B ISA probe + activation.
+%include "el3_probe.asm"
 
 ;------------------------------------------------------------------------------
 ; build_plan -- the HAL hands the composer the NIC's immediates: io_base into the PIO

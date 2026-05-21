@@ -1,0 +1,141 @@
+; el3_probe.asm -- 3C509 (Tomahawk) ISA ID-port probe + activation. COLD; %included by
+; start.asm. Self-contained, 8088-clean. Shares DS=DGROUP and the BSS globals in start.asm.
+;
+; The 3C509 has no fixed I/O base at power-on; it answers on a shared "ID port" (0x110)
+; until activated. Sequence (verified against the Nestor 8086 3c509 driver): clock the ID
+; pattern to move cards into ID state, global-reset, re-clock the pattern, clear tags, read
+; & validate the EEPROM (which also drives per-card contention), then tag + activate the
+; winner at the I/O base its own EEPROM specifies.
+
+%include "el3_tomahawk.inc"
+
+;------------------------------------------------------------------------------
+; detect_nic -- probe & activate one 3C509.
+; out: CF=0 and g_nic_io / g_nic_irq / g_mac[6] set on success; CF=1 if no card.
+; clobbers AX, BX, CX, DX, SI, DI.
+;------------------------------------------------------------------------------
+detect_nic:
+        call    write_id_pat                ; clock cards into ID state
+        mov     dx, EL3_ID_PORT
+        mov     al, EL3_ID_GLOBAL_RESET     ; 0xC0: reset the adapter(s)
+        out     dx, al
+        call    reset_delay
+        call    write_id_pat                ; re-clock into ID-CMD state
+
+        mov     dx, EL3_ID_PORT
+        mov     al, EL3_ID_TAG_BASE         ; 0xD0: clear all board tags
+        out     dx, al
+
+        mov     al, EL3_EE_PROD_ID          ; confirm product id (word 3, masked)
+        call    id_read_eeprom
+        and     ax, EL3_PRODID_MASK
+        cmp     ax, EL3_PRODID_3C509B
+        jne     .nocard
+
+        mov     al, EL3_EE_MFG_ID           ; confirm manufacturer id (word 7)
+        call    id_read_eeprom
+        cmp     ax, EL3_MFG_ID
+        jne     .nocard
+
+        ; station address: EEPROM words 0..2, stored big-endian into g_mac
+        xor     si, si                      ; byte index into g_mac
+        xor     di, di                      ; EEPROM word index
+.macloop:
+        mov     ax, di
+        call    id_read_eeprom              ; ax = word (MSB first)
+        mov     [g_mac + si], ah
+        mov     [g_mac + si + 1], al
+        add     si, 2
+        inc     di
+        cmp     di, 3
+        jb      .macloop
+
+        ; I/O base from address-config word 8: 0x200 + ((w & 0x1F) << 4)
+        mov     al, EL3_EE_ADDR_CFG
+        call    id_read_eeprom
+        and     ax, 0x001F
+        mov     cl, 4
+        shl     ax, cl
+        add     ax, 0x200
+        mov     [g_nic_io], ax
+
+        ; IRQ from resource-config word 9: bits 15..12
+        mov     al, EL3_EE_RESOURCE_CFG
+        call    id_read_eeprom
+        mov     cl, 12
+        shr     ax, cl
+        mov     [g_nic_irq], ax
+
+        mov     dx, EL3_ID_PORT
+        mov     al, EL3_ID_TAG_BASE + 1     ; tag this card (a rescan then skips it)
+        out     dx, al
+        mov     al, EL3_ID_ACTIVATE_CFG     ; 0xFF: activate at the EEPROM-configured base
+        out     dx, al
+
+        clc
+        ret
+.nocard:
+        stc
+        ret
+
+;------------------------------------------------------------------------------
+; write_id_pat -- select the ID port and clock out the 3c509 ID pattern: a 9-bit LFSR
+; (poly 0xCF) emitted low-byte-first for 255 cycles. Carry-feedback form (matches Nestor).
+;------------------------------------------------------------------------------
+write_id_pat:
+        mov     dx, EL3_ID_PORT
+        xor     al, al
+        out     dx, al                      ; select the ID port
+        out     dx, al                      ; reset the pattern generator
+        mov     cx, 255
+        mov     al, 0xFF                     ; lrs_state
+.wp:
+        out     dx, al
+        shl     al, 1                       ; bit 7 -> carry
+        jnc     .wpnf
+        xor     al, 0xCF
+.wpnf:
+        loop    .wp
+        ret
+
+;------------------------------------------------------------------------------
+; id_read_eeprom -- read one 16-bit EEPROM word through the ID port.
+; in: AL = word index ; out: AX = word (MSB first). clobbers BX, CX, DX.
+;------------------------------------------------------------------------------
+id_read_eeprom:
+        mov     dx, EL3_ID_PORT
+        add     al, EL3_EE_READ             ; 0x80 | index
+        out     dx, al
+        call    io_delay                    ; EEPROM read latency (~162 us)
+        xor     bx, bx
+        mov     cx, 16
+.rbit:
+        in      al, dx                      ; data bit in bit 0
+        shr     al, 1                       ; bit 0 -> carry
+        rcl     bx, 1                       ; carry -> bx (MSB first)
+        loop    .rbit
+        mov     ax, bx
+        ret
+
+;------------------------------------------------------------------------------
+; io_delay -- ~300 reads of the POST port (0x80), ~1 us each on ISA: bus-bound, so the
+; delay is independent of CPU speed (works on a 4.77 MHz 8088 and a Pentium alike).
+; reset_delay -- ~8x that, for the post-global-reset settle.
+;------------------------------------------------------------------------------
+io_delay:
+        push    cx
+        mov     cx, 300
+.dly:
+        in      al, 0x80
+        loop    .dly
+        pop     cx
+        ret
+
+reset_delay:
+        push    cx
+        mov     cx, 8
+.rs:
+        call    io_delay
+        loop    .rs
+        pop     cx
+        ret

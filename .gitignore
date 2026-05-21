@@ -5,3 +5,4 @@
 /build/*.bin
 /build/frags.inc
 *.bak
+/build/*.inc
