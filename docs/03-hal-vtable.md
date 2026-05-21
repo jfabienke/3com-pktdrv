@@ -75,6 +75,35 @@ HW_CAP_PERMWIN1       Vortex+ keep window 1 mapped (elide window switches)
 `HW_CAP_PERMWIN1` is a good example of capability→emit: if set, the composer omits the
 window-switch fragments entirely from the hot path.
 
+## Bus is an orthogonal axis (bus probers)
+
+The bus is not a NIC generation — the EtherLink III core and the emitted datapath are
+**bus-agnostic**. The bus differs only in *cold-time* concerns, handled by a small
+per-bus **prober** that finds the card and fills `nic_info_t` (io_base, irq, caps):
+
+| Bus | EL3 NIC(s) | Enumeration / config | DMA constraint |
+|-----|-----------|----------------------|----------------|
+| ISA8/16 | 3C509B, 3C515 | PnP isolation / ID port / manual | ISA 24-bit/16 MB/64 KB |
+| EISA | 3C579, 3C597-TX | slot scan, EISA ID `0xzC80`, config regs | 32-bit bus-master |
+| MCA | 3C529 | POS registers, adapter-ID slot scan | 32-bit bus-master, level IRQ |
+| PCMCIA-16 | 3C589, 3C562 | CIS tuples via Socket Services / PCIC | PIO (no bus-master) |
+| PCI / CardBus | Vortex…Tornado, 3C575 | PCI config space | PCI-class (no 16 MB limit) |
+
+```c
+typedef struct bus_prober {
+    bus_type_t bus;
+    int (*probe)(nic_info_t *out, int max);   /* enumerate EL3 cards on this bus */
+} bus_prober_t;
+```
+
+Probers run in boot phase 4 (cold) and are reclaimed after install. The only thing the
+bus contributes to the *hot* path is the I/O access primitive — port `in`/`out` for
+ISA/EISA/MCA/PCMCIA-16, optional MMIO for PCI/CardBus — selected as one fragment
+(`FRAG_IO_PORT` vs `FRAG_IO_MMIO`). Everything else downstream is identical.
+
+Floor note: only ISA8 is in the 5150 `minimal` profile. EISA/MCA/PCMCIA/PCI probers are
+additive (`full` profile), compiled out of the floor build.
+
 ## How the vtable relates to the JIT
 
 The vtable operates at **two times**:

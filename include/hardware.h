@@ -22,12 +22,17 @@ typedef enum {
     NIC_TORNADO        /* 3C905C PCI, +scatter-gather, WoL                       */
 } nic_type_t;
 
+/* Bus is orthogonal to NIC generation: each bus differs only in cold-time enumeration/
+ * config + IRQ/DMA constraints + I/O access method (port vs MMIO). The EL3 core and the
+ * emitted datapath are bus-agnostic. See docs/03-hal-vtable.md (bus probers). */
 typedef enum {
-    BUS_ISA8 = 0,      /* 8-bit ISA (5150 floor)            */
-    BUS_ISA16,
-    BUS_EISA,
-    BUS_PCI,
-    BUS_CARDBUS
+    BUS_ISA8 = 0,      /* 8-bit ISA (5150 floor)                       */
+    BUS_ISA16,         /* 16-bit ISA                                   */
+    BUS_EISA,          /* EISA: slot regs, 32-bit bus-master (3C579/3C597) */
+    BUS_MCA,           /* MicroChannel: POS regs (3C529)               */
+    BUS_PCMCIA16,      /* 16-bit PC Card: CIS via Socket Services (3C589) */
+    BUS_PCI,           /* PCI config space                             */
+    BUS_CARDBUS        /* 32-bit PC Card = PCI-class (3C575)           */
 } bus_type_t;
 
 /* Capability flags — discovered at detect, drive runtime behavior AND which fragments
