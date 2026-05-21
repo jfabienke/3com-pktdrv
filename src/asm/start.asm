@@ -46,6 +46,11 @@ msg_mac     db ' MAC=', '$'
 msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
 
+; uninstall (`3cpd /u`)
+sig_pktdrvr db 'PKT DRVR'                       ; resident signature (handler + 3); 8 bytes
+msg_uninst  db 13, 10, '3com-pktdrv uninstalled', 13, 10, '$'
+msg_notinst db 13, 10, '3com-pktdrv not installed', 13, 10, '$'
+
 %ifdef CFG_FAKENIC
 fake_mac    db 0x02, 0x60, 0x8C, 0x11, 0x22, 0x33   ; test MAC (3Com OUI 00:60:8C)
 %endif
@@ -64,7 +69,6 @@ msg_inst    db 13, 10, 'INSTALLED: INT 60h, IRQ vec=0x', '$'
 ;==============================================================================
 segment _BSS public class=BSS use16
 
-psp_seg:        resw 1          ; PSP segment (saved at entry, for the TSR keep)
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
                 resb 1
 g_emitted_len:  resw 1
@@ -77,14 +81,6 @@ g_step:         resw 1
 g_imm0:         resw 1
 g_curid:        resb 1
                 resb 1
-
-; install scratch (cold: old vectors are for a future resident uninstall, not kept yet)
-irq_vec:        resb 1          ; computed NIC IRQ vector number
-                resb 1
-old_int_seg:    resw 1          ; previous INT 60h owner
-old_int_off:    resw 1
-old_irq_seg:    resw 1          ; previous NIC IRQ owner
-old_irq_off:    resw 1
 
 ;==============================================================================
 ; STACK -- COLD: the composer/init working stack (reclaimed; the ISR uses isr_stack).
@@ -114,8 +110,25 @@ segment _TEXT public class=CODE use16
 g_nic_io:       resw 1              ; detected I/O base
 g_nic_irq:      resw 1              ; detected IRQ
 g_mac:          resb 6             ; station address
-g_recv_off:     resw 1             ; registered receiver -- off,seg adjacent for call far
-g_recv_seg:     resw 1
+; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
+htable:         resb MAX_HANDLES * HANDLE_SIZE
+
+; ISR type-demux scratch
+rx_len:         resw 1             ; current packet length
+cur_handle:     resw 1             ; matched handle (slot offset)
+appbuf_off:     resw 1             ; receiver's buffer (upcall-1 result)
+appbuf_seg:     resw 1
+hdr_buf:        resb 16            ; Ethernet header peek (14 bytes + pad)
+
+; install/uninstall state (resident so the uninstall vendor fn can restore + free)
+psp_seg:        resw 1             ; our PSP segment
+old_int_off:    resw 1             ; previous INT 60h owner (off,seg for `lds`)
+old_int_seg:    resw 1
+old_irq_off:    resw 1             ; previous NIC IRQ owner
+old_irq_seg:    resw 1
+irq_vec:        resb 1             ; computed NIC IRQ vector number
+                resb 1
+
 g_off:          resw FRAG__COUNT   ; emitted-fragment offsets (handler/ISR call via these)
 g_isr_busy:     resb 1             ; ISR reentrancy guard
                 resb 1
@@ -154,6 +167,27 @@ global resident_end
         mov     ds, ax
         mov     es, ax              ; composer uses ES:DI for the emit destination
         mov     [psp_seg], bp
+
+        ; --- command tail scan: "/u" -> uninstall the resident driver and exit ---
+        mov     es, bp              ; ES = PSP for the tail scan
+        mov     cl, [es:0x80]       ; command-tail length
+        xor     ch, ch
+        jcxz    .not_uninstall
+        mov     si, 0x81
+.scan_tail:
+        cmp     byte [es:si], '/'
+        jne     .st_next
+        mov     al, [es:si + 1]
+        or      al, 0x20            ; tolower
+        cmp     al, 'u'
+        jne     .st_next
+        jmp     do_uninstall
+.st_next:
+        inc     si
+        loop    .scan_tail
+.not_uninstall:
+        mov     ax, DGROUP
+        mov     es, ax              ; restore ES = DGROUP for the composer
 
         mov     dx, msg_banner
         call    print_str
@@ -241,6 +275,45 @@ global resident_end
         mov     dx, msg_no_nic
         call    print_str
 .fail:
+        mov     ax, 0x4C01
+        int     0x21
+
+;------------------------------------------------------------------------------
+; do_uninstall -- `3cpd /u`: find the resident driver via the INT 60h vector + the
+; "PKT DRVR" signature, ask it to tear down (vendor fn 0x82 restores vectors + masks the
+; IRQ and returns its PSP in BX), then free its memory block. Separate process from the
+; resident instance, so freeing the resident block is safe.
+;------------------------------------------------------------------------------
+do_uninstall:
+        mov     ax, DGROUP
+        mov     ds, ax
+        mov     ax, 0x3500 | PKTINT     ; get INT 60h vector -> ES:BX
+        int     0x21
+        ; verify "PKT DRVR" at ES:BX+3 before trusting the vector
+        mov     di, bx
+        add     di, 3
+        mov     si, sig_pktdrvr
+        mov     cx, 8
+.sigcmp:
+        mov     al, [si]
+        cmp     al, [es:di]
+        jne     .notinst
+        inc     si
+        inc     di
+        loop    .sigcmp
+        ; it's ours -- tear down, then free the resident block
+        mov     ah, 0x82                ; PD_UNINSTALL -> BX = resident PSP
+        int     PKTINT
+        mov     es, bx
+        mov     ah, 0x49                ; free the resident memory block
+        int     0x21
+        mov     dx, msg_uninst
+        call    print_str
+        mov     ax, 0x4C00
+        int     0x21
+.notinst:
+        mov     dx, msg_notinst
+        call    print_str
         mov     ax, 0x4C01
         int     0x21
 

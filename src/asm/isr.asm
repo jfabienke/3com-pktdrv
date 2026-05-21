@@ -62,42 +62,72 @@ nic_isr:
         test    ah, 0x40                ; RX_ERROR (0x4000)
         jnz     .rxerr
         mov     cx, ax
-        and     cx, EL3_RX_LEN_MASK     ; packet length
+        and     cx, EL3_RX_LEN_MASK     ; CX = packet length
+        mov     [rx_len], cx
+        cmp     cx, 14                  ; runt: need a full Ethernet header to demux
+        jb      .drop
 
-        ; receiver registered?
-        mov     ax, [g_recv_off]
-        or      ax, [g_recv_seg]
-        jz      .drop
+        ; --- read the 14-byte header into hdr_buf (byte reads; even count keeps the
+        ;     FIFO word-aligned for the payload drain) ---
+        mov     dx, [g_nic_io]          ; io_base + EL3_W1_RX_FIFO (0)
+        mov     di, hdr_buf
+        mov     cx, 14
+.hdr:   in      al, dx
+        stosb
+        loop    .hdr
+
+        ; --- find a handle whose type matches hdr_buf[12..13] (or matches all) ---
+        mov     ax, [hdr_buf + 12]      ; EtherType, same byte order access_type stored
+        mov     si, htable
+        mov     cx, MAX_HANDLES
+.scan:  cmp     word [si + 2], 0        ; recv_seg == 0 -> free slot, skip
+        je      .scan_next
+        cmp     word [si + 4], 0        ; type 0 -> match all
+        je      .scan_hit
+        cmp     word [si + 4], ax       ; type == EtherType?
+        je      .scan_hit
+.scan_next:
+        add     si, HANDLE_SIZE
+        loop    .scan
+        jmp     .drop                   ; no handler for this type
+
+.scan_hit:
+        mov     [cur_handle], si
 
         ; --- upcall 1: AX=0 request a buffer; CX=len, BX=handle, ES:DI=0 ---
-        push    cx
         xor     ax, ax
-        mov     bx, 1
+        mov     es, ax
         xor     di, di
-        mov     es, di
-        call far [g_recv_off]           ; -> ES:DI = buffer (or 0:0)
-        pop     cx
+        mov     bx, si
+        mov     cx, [rx_len]
+        call far [bx]                   ; slot+0/+2 = recv off,seg -> ES:DI = buffer (or 0:0)
         mov     ax, es
         or      ax, di
-        jz      .drop                   ; null buffer -> drop
+        jz      .drop                   ; null buffer -> drop (RX_DISCARD flushes the frame)
+        mov     [appbuf_seg], es
+        mov     [appbuf_off], di
 
-        ; --- drain CX bytes into ES:DI via the emitted rx fragment ---
-        push    es
-        push    di
-        push    cx
+        ; --- prepend the saved header, then drain the payload into the buffer ---
+        mov     si, hdr_buf
+        mov     cx, 14
+        rep     movsb                   ; DS:SI (hdr_buf) -> ES:DI; DI advances past header
+        mov     cx, [rx_len]
+        sub     cx, 14
+        jz      .delivered              ; header-only frame
         mov     ax, [g_off + FRAG_RX_PIO * 2]
         add     ax, resident_image
-        call    ax
-        pop     cx
-        pop     si
-        pop     ds                      ; DS:SI = buffer (es->ds, di->si)
+        call    ax                      ; drain remaining bytes into ES:DI
 
+.delivered:
         ; --- upcall 2: AX=1 deliver; DS:SI=buffer, CX=len, BX=handle ---
+        mov     si, [appbuf_off]
+        mov     cx, [rx_len]
+        mov     bx, [cur_handle]
         mov     ax, 1
-        mov     bx, 1
-        call far [cs:g_recv_off]
+        mov     ds, [appbuf_seg]        ; DS:SI = buffer (set DS last)
+        call far [cs:bx]
         mov     ax, cs
-        mov     ds, ax                  ; restore DS
+        mov     ds, ax                  ; restore our DS
         inc     word [stat_rx]
 %ifdef CFG_DEBUG
         mov     al, 'R'

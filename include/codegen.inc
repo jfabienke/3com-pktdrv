@@ -41,3 +41,9 @@ FRAG_ENTRY_SIZE     equ 10
 ;   +0 dw offset (within the fragment's bytes)
 ;   +2 db kind   (PATCH_IMM8 / PATCH_IMM16)
 PATCH_ENTRY_SIZE    equ 3
+
+; ---- receiver handle table (access_type) ----
+;   entry: +0 dw recv_off, +2 dw recv_seg (0 = free slot), +4 dw type (0 = match all)
+; off,seg ordered first so `call far [slot]` works. The returned handle IS the slot offset.
+MAX_HANDLES         equ 4
+HANDLE_SIZE         equ 6

@@ -35,10 +35,13 @@ PD_VERSION      equ 0x000B      ; packet driver spec 1.11 -> 11
 PD_CLASS_ETHER  equ 1           ; DIX/Ethernet
 PD_TYPE_3C509   equ 0x0009      ; interface type (3Com EtherLink III)
 PD_FUNC_EXT     equ 2           ; basic + extended (we provide get_statistics)
+PD_ERR_BADHANDLE equ 1          ; bad handle
+PD_ERR_NOSPACE  equ 10         ; no free handle
 PD_ERR_BADCMD   equ 11          ; bad command
 PD_NFUNCS       equ 7           ; functions 1..7 handled via the table
 PD_GET_STATS    equ 24          ; get_statistics
 PD_DBG_BLOCK    equ 0x7F        ; vendor: return the debug block pointer (CFG_DEBUG)
+PD_UNINSTALL    equ 0x82        ; vendor: tear down (restore vectors, mask IRQ) -> BX = PSP
 
 ;------------------------------------------------------------------------------
 pkt_handler:
@@ -64,6 +67,8 @@ pkt_disp:
         mov     al, [bp + F_AH]
         cmp     al, PD_GET_STATS
         je      pkt_do_stats
+        cmp     al, PD_UNINSTALL
+        je      pkt_do_uninstall
 %ifdef CFG_DEBUG
         cmp     al, PD_DBG_BLOCK
         je      pkt_do_dbg
@@ -88,6 +93,9 @@ pkt_return:
         iret
 pkt_do_stats:
         call    f_get_statistics
+        jmp     pkt_return
+pkt_do_uninstall:
+        call    f_uninstall
         jmp     pkt_return
 %ifdef CFG_DEBUG
 pkt_do_dbg:
@@ -126,22 +134,55 @@ f_driver_info:
         clc
         ret
 
-;--- 2: access_type -- register the receiver (ES:DI), return a handle ---
+;--- 2: access_type -- register a receiver (ES:DI) for a type, return a handle ---
+; In: AL=if_class, BX=if_type, DL=if_number, DS:SI -> type template, CX = type length,
+;     ES:DI = receiver upcall. We demux on the 2-byte EtherType only (CX>=2 -> match
+;     SI[0..1]; CX==0 -> match all). The handle returned is the slot offset in htable.
 f_access_type:
-        mov     ax, [bp + F_ES]
-        mov     [g_recv_seg], ax
+        mov     di, htable
+        mov     cx, MAX_HANDLES
+.at_find:
+        cmp     word [di + 2], 0              ; recv_seg == 0 -> free slot
+        je      .at_got
+        add     di, HANDLE_SIZE
+        loop    .at_find
+        mov     dh, PD_ERR_NOSPACE           ; handle table full
+        stc
+        ret
+.at_got:
         mov     ax, [bp + F_DI]
-        mov     [g_recv_off], ax
-        mov     word [bp + F_AX], 1            ; handle = 1 (single-handle floor)
+        mov     [di + 0], ax                 ; recv_off
+        mov     ax, [bp + F_ES]
+        mov     [di + 2], ax                 ; recv_seg (claims the slot)
+        mov     cx, [bp + F_CX]              ; caller's type length
+        jcxz    .at_all
+        mov     bx, [bp + F_SI]              ; caller's SI -> type template
+        mov     ds, [bp + F_DS]              ; caller's DS (briefly)
+        mov     ax, [bx]                     ; the 2 EtherType bytes (wire order)
+        push    cs
+        pop     ds                           ; restore our DS
+        mov     [di + 4], ax
+        jmp     .at_done
+.at_all:
+        mov     word [di + 4], 0             ; type 0 -> match all
+.at_done:
+        mov     [bp + F_AX], di              ; handle = slot offset
         clc
         ret
 
-;--- 3: release_type ---
+;--- 3: release_type -- BX = handle (slot offset); free the slot ---
 f_release_type:
-        xor     ax, ax
-        mov     [g_recv_seg], ax
-        mov     [g_recv_off], ax
+        mov     bx, [bp + F_BX]
+        cmp     bx, htable
+        jb      .rt_bad
+        cmp     bx, htable + MAX_HANDLES * HANDLE_SIZE
+        jae     .rt_bad
+        mov     word [bx + 2], 0             ; recv_seg = 0 -> slot free
         clc
+        ret
+.rt_bad:
+        mov     dh, PD_ERR_BADHANDLE
+        stc
         ret
 
 ;--- 4: send_pkt -- DS:SI = packet, CX = length; near-call the emitted TX datapath ---
@@ -218,6 +259,53 @@ f_get_statistics:
         mov     ax, cs
         mov     [bp + F_DS], ax
         mov     word [bp + F_SI], pkt_stats
+        clc
+        ret
+
+;--- 0x82 (vendor): tear down -- restore vectors, mask the IRQ, quiet the NIC.
+; Returns BX = our PSP so the cold re-run can free the resident block. DS = our segment.
+f_uninstall:
+        ; restore the previous INT 60h owner
+        mov     dx, [old_int_off]
+        mov     ax, [old_int_seg]
+        push    ds
+        mov     ds, ax
+        mov     ax, 0x2500 | PKTINT
+        int     0x21                          ; DS:DX -> old handler
+        pop     ds
+        ; restore the previous NIC IRQ owner
+        mov     al, [irq_vec]
+        mov     dx, [old_irq_off]
+        mov     bx, [old_irq_seg]
+        push    ds
+        mov     ds, bx
+        mov     ah, 0x25
+        int     0x21
+        pop     ds
+        ; mask the NIC's IRQ at the PIC so the now-stale vector is never entered
+        mov     cl, [g_nic_irq]
+        mov     ah, 1
+        cmp     cl, 8
+        jae     .un_slave
+        shl     ah, cl
+        in      al, 0x21
+        or      al, ah
+        out     0x21, al
+        jmp     .un_card
+.un_slave:
+        sub     cl, 8
+        shl     ah, cl
+        in      al, 0xA1
+        or      al, ah
+        out     0xA1, al
+.un_card:
+        ; disable all NIC interrupt sources (leave the card otherwise idle)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SET_INTR_ENB      ; | 0 -> no sources enabled
+        out     dx, ax
+        mov     bx, [psp_seg]
+        mov     [bp + F_BX], bx               ; hand the PSP back to the caller
         clc
         ret
 
