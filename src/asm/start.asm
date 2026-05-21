@@ -43,6 +43,15 @@ g_plan_tx_imm:
 G_PLAN_N        equ 5
 PLAN_STEP_SIZE  equ 3
 
+; diagnostic strings ($-terminated for INT 21h AH=09h)
+msg_banner  db '3com-pktdrv floor (3C509 packet driver)', 13, 10, '$'
+msg_cpu     db 'CPU class=', '$'
+msg_nic     db 13, 10, '3C509 I/O=0x', '$'
+msg_irq     db ' IRQ=0x', '$'
+msg_mac     db ' MAC=', '$'
+msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
+msg_crlf    db 13, 10, '$'
+
 ;==============================================================================
 ; BSS (uninitialized) -- runtime state + the emit destination
 ;==============================================================================
@@ -96,7 +105,15 @@ segment _TEXT public class=CODE use16
         mov     es, ax              ; composer uses ES:DI for the emit destination
         mov     [psp_seg], bp
 
+        mov     dx, msg_banner
+        call    print_str
+
         call    detect_cpu          ; -> g_cpu_class
+        mov     dx, msg_cpu
+        call    print_str
+        mov     al, [g_cpu_class]
+        add     al, '0'
+        call    print_char          ; CPU class digit (0=8088,1=286,2=386)
 
         ; --- 5150 short-circuit -------------------------------------------------
         ; On an 8088/8086 the DMA capability axis collapses to PIO: no protected mode,
@@ -118,11 +135,23 @@ segment _TEXT public class=CODE use16
         ; (CFG_PNP), compiled out of the minimal floor for size -- gated by profile, not CPU.
         call    detect_nic          ; native 3Com ID-port (Tomahawk) -> g_nic_io/irq/mac
 %ifdef CFG_PNP
-        jnc     .build              ; native found a card
+        jnc     .nic_found          ; native found a card
         call    detect_nic_pnp      ; else (full profile) try ISA PnP (cache-kit isapnp)
 %endif
-        jc      .fail               ; no card found
-.build:
+        jc      .nic_none           ; no card found
+.nic_found:
+        mov     dx, msg_nic         ; "3C509 I/O=0x"
+        call    print_str
+        mov     ax, [g_nic_io]
+        call    print_hex16
+        mov     dx, msg_irq         ; " IRQ=0x"
+        call    print_str
+        mov     ax, [g_nic_irq]
+        call    print_hex16
+        call    print_mac           ; " MAC=xx:xx:.."
+        mov     dx, msg_crlf
+        call    print_str
+
         call    el3_init            ; bring the activated card to operational state
         call    build_plan          ; copy io_base into the plan's PIO steps
 
@@ -135,10 +164,12 @@ segment _TEXT public class=CODE use16
         mov     [g_keep_para], ax
 
         ; TODO(next): install INT 60h + NIC IRQ from g_off[], then DOS TSR-keep.
-        ; Deferred while the API/ISR fragments are stubs -- installing a non-functional
-        ; INT 60h handler is worse than not installing. Terminate cleanly for now.
+        ; Deferred while the API/ISR fragments are stubs. Terminate cleanly for now.
         mov     ax, 0x4C00
         int     0x21
+.nic_none:
+        mov     dx, msg_no_nic
+        call    print_str
 .fail:
         mov     ax, 0x4C01
         int     0x21
@@ -315,4 +346,55 @@ copy_down:
         add     ax, 15
         mov     cl, 4
         shr     ax, cl                  ; ceil(len / 16)
+        ret
+
+;------------------------------------------------------------------------------
+; Diagnostic print helpers (COLD; DOS INT 21h). Clobber AX/CX/DX freely.
+;------------------------------------------------------------------------------
+print_str:                              ; DS:DX -> '$'-terminated string
+        mov     ah, 9
+        int     0x21
+        ret
+print_char:                             ; AL = character
+        mov     dl, al
+        mov     ah, 2
+        int     0x21
+        ret
+print_hex16:                            ; AX = value -> 4 hex digits
+        push    ax
+        mov     al, ah
+        call    print_hex8
+        pop     ax
+        call    print_hex8
+        ret
+print_hex8:                             ; AL = byte -> 2 hex digits
+        push    ax
+        mov     cl, 4
+        shr     al, cl                  ; high nibble
+        call    print_nib
+        pop     ax                      ; low nibble (print_nib masks)
+        call    print_nib
+        ret
+print_nib:                              ; AL low nibble -> hex char
+        and     al, 0x0F
+        add     al, '0'
+        cmp     al, '9'
+        jbe     .e
+        add     al, 7                   ; 'A'..'F'
+.e:
+        mov     dl, al
+        mov     ah, 2
+        int     0x21
+        ret
+print_mac:                              ; " MAC=" + g_mac[0..5] as hex
+        mov     dx, msg_mac
+        call    print_str
+        mov     si, g_mac
+        mov     cx, 6
+.pm:
+        push    cx
+        lodsb
+        call    print_hex8
+        pop     cx
+        loop    .pm
         ret

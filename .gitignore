@@ -6,3 +6,4 @@
 /build/frags.inc
 *.bak
 /build/*.inc
+.DS_Store
