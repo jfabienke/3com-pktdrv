@@ -70,9 +70,25 @@ Orphaned, aspirational, or duplicate. Do not carry forward.
   **Default: out of scope** for the initial skeleton; stub the INT 1Ah path and lift
   later only if PCI BIOS shimming is wanted.
 
+## Bus probers (all buses fully supported — scope decision)
+
+Each bus gets a cold prober that enumerates EL3 cards and fills `nic_info_t`/caps, then
+hands off to the shared HAL + emitted datapath (docs/03). All are `full`-profile (above
+the 5150 floor).
+
+| Bus | New home | Lift source / effort |
+|-----|----------|----------------------|
+| ISA8/16 | `src/hw/bus_isa.c` | old 3c509b/3c515 detect + PnP isolation (Tier B) |
+| EISA (3C597-TX) | `src/hw/bus_eisa.c` | old `3com_eisa.c` + `nic_irq_eisa.asm` (Tier B) — slot scan, EISA ID `0xzC80` |
+| MCA (3C529) | `src/hw/bus_mca.c` | **near clean-room** (old repo only stubbed it) — POS registers, adapter-ID scan |
+| PCMCIA-16 (3C589) | `src/hw/bus_pcmcia.c` | old `pcmcia_manager/cis/ss_backend/pe_backend` + `pcmcia_isr.asm` (Tier B, large) |
+| PCI / CardBus | `src/hw/bus_pci.c` | old `pci_bios.c` + `pci_integration.c` + `3com_pci_detect.c` (Tier A/B); CardBus = PCI class scan |
+
 ## Order of work
 
-1. Tier A facts + canonical headers (`include/`) — gives the vocabulary.
-2. Tier C skeleton: HAL, boot phases, composer/copy-down stubs that emit a no-op resident.
+1. Tier A facts + canonical headers (`include/`) — gives the vocabulary.  ✅ (registers, cpu)
+2. Tier C skeleton: HAL, boot phases, composer/copy-down stubs.  ✅ (links to .EXE)
 3. Tier B PIO floor: 8088 PIO fragments → a 5150 build that links, installs, and echoes.
-4. Climb the capability ladder: 286 ring DMA + tests, 386+ cache, PCI generations.
+4. copy-down + TSR install (runnable under an emulator).
+5. Climb the ladder: 286 ISA ring DMA + busmaster test, 386+ cache tiers.
+6. Bus probers (full profile): PCI/CardBus core, then EISA, PCMCIA-16, MCA.
