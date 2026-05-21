@@ -17,8 +17,6 @@ bits 16
 ; EL3 register constants are pulled per-generation by the probe (el3_probe.asm includes
 ; el3_tomahawk.inc -> el3_core.inc); start.asm proper needs none directly.
 
-STACK_PARAS equ 64                      ; 1024-byte stack -> 64 paragraphs (TSR keep math)
-
 ;==============================================================================
 ; DATA (initialized) -- fragment palette, plan template
 ;==============================================================================
@@ -26,23 +24,17 @@ segment _DATA public class=DATA use16
 
 %include "frags_asm.inc"        ; f_*[], *_patches[], g_frags[], FRAG_TABLE_N
 
-; The emit plan for a 3C509B (PIO floor): the fragment ids to compose, each followed by its
-; immediate-0 (io_base for the PIO datapath steps; 0 for the rest). build_plan() fills the
-; io_base slots from the detected NIC. Layout per step: db id ; dw imm0  (3 bytes).
+; The emit plan for a 3C509B (PIO floor): only the DATAPATH fragments are emitted -- the
+; API dispatch and ISR are static resident code (resident.asm/isr.asm), which call the
+; emitted TX/RX via g_off[]. Each step: db id ; dw imm0 (io_base, filled by build_plan).
 g_plan:
-    db FRAG_API_DISPATCH
-    dw 0
-    db FRAG_ISR_ENTRY
-    dw 0
     db FRAG_RX_PIO
 g_plan_rx_imm:
     dw 0
     db FRAG_TX_PIO
 g_plan_tx_imm:
     dw 0
-    db FRAG_ISR_EOI
-    dw 0
-G_PLAN_N        equ 5
+G_PLAN_N        equ 2
 PLAN_STEP_SIZE  equ 3
 
 ; diagnostic strings ($-terminated for INT 21h AH=09h)
@@ -59,16 +51,13 @@ fake_mac    db 0x02, 0x60, 0x8C, 0x11, 0x22, 0x33   ; test MAC (3Com OUI 00:60:8
 %endif
 
 ;==============================================================================
-; BSS (uninitialized) -- runtime state + the emit destination
+; BSS -- COLD scratch only (above resident_end, reclaimed after install).
 ;==============================================================================
 segment _BSS public class=BSS use16
 
 psp_seg:        resw 1          ; PSP segment (saved at entry, for the TSR keep)
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_P6 (set by detect_cpu)
                 resb 1
-g_nic_io:       resw 1          ; detected 3C509B I/O base
-g_nic_irq:      resw 1          ; detected IRQ
-g_mac:          resb 6          ; station address (from EEPROM)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
 
@@ -80,29 +69,16 @@ g_imm0:         resw 1
 g_curid:        resb 1
                 resb 1
 
-; entry offset of each emitted fragment (0xFFFF if not emitted)
-g_off:          resw FRAG__COUNT
-
-; resident state for the INT 60h handler + ISR
-g_recv_off:     resw 1          ; registered receiver (access_type) -- off,seg adjacent for
-g_recv_seg:     resw 1          ;   `call far [g_recv_off]`
-old_int_seg:    resw 1          ; previous INT 60h owner (for chain/uninstall)
+; install scratch (cold: old vectors are for a future resident uninstall, not kept yet)
+irq_vec:        resb 1          ; computed NIC IRQ vector number
+                resb 1
+old_int_seg:    resw 1          ; previous INT 60h owner
 old_int_off:    resw 1
 old_irq_seg:    resw 1          ; previous NIC IRQ owner
 old_irq_off:    resw 1
-irq_vec:        resb 1          ; computed NIC IRQ vector number
-g_isr_busy:     resb 1          ; ISR reentrancy guard
-isr_save_ss:    resw 1          ; interrupted task's SS:SP (private-stack switch)
-isr_save_sp:    resw 1
-isr_stack:      resb 256        ; the ISR's private stack
-isr_stack_top:
-
-; the composed hot image (copy-down packs it; DOS-keeps up to here)
-resident_image: resb 512
 
 ;==============================================================================
-; STACK -- in DGROUP so SS == DS (small model). The cold composer's working stack;
-; the resident TSR sets up its own stack when install lands.
+; STACK -- COLD: the composer/init working stack (reclaimed; the ISR uses isr_stack).
 ;==============================================================================
 segment _STACK stack class=STACK use16
         resb 1024
@@ -117,6 +93,34 @@ segment _STACK stack class=STACK use16
 group DGROUP _TEXT _DATA _BSS _STACK
 segment _TEXT public class=CODE use16
 
+;==============================================================================
+; RESIDENT region (kept) -- laid out FIRST so the TSR keeps only up to resident_end and
+; reclaims everything after it (the cold composer / probe / init / diagnostics). Holds the
+; INT 60h handler, the ISR, the resident state they touch, and the JIT-emitted datapath.
+; resb here is stored in the file but stays resident (it must be low/kept).
+;==============================================================================
+%include "resident.asm"             ; pkt_handler (INT 60h API)
+%include "isr.asm"                  ; nic_isr (RX + receiver upcall)
+
+g_nic_io:       resw 1              ; detected I/O base
+g_nic_irq:      resw 1              ; detected IRQ
+g_mac:          resb 6             ; station address
+g_recv_off:     resw 1             ; registered receiver -- off,seg adjacent for call far
+g_recv_seg:     resw 1
+g_off:          resw FRAG__COUNT   ; emitted-fragment offsets (handler/ISR call via these)
+g_isr_busy:     resb 1             ; ISR reentrancy guard
+                resb 1
+isr_save_ss:    resw 1             ; interrupted task's SS:SP (private-stack switch)
+isr_save_sp:    resw 1
+isr_stack:      resb 128           ; the ISR's private stack
+isr_stack_top:
+resident_image: resb 128           ; the composed datapath (tx + rx drain)
+resident_end:                      ; <== TSR keep boundary
+global resident_end
+
+;==============================================================================
+; COLD region (reclaimed after install) -- entry, detection, compose, install, diagnostics.
+;==============================================================================
 ..start:
         mov     bp, es              ; ES = PSP at .EXE entry -- save for the TSR keep
         mov     ax, DGROUP
@@ -249,12 +253,6 @@ phase_validate_dma:
 
 ; el3_init -- operational bring-up of the activated card (MAC, media, RX/TX enable).
 %include "el3_init.asm"
-
-; pkt_handler -- resident Crynwr INT 60h packet-driver API (signature + dispatch).
-%include "resident.asm"
-
-; nic_isr -- resident NIC interrupt handler + receiver upcall.
-%include "isr.asm"
 
 ; install -- hook INT 60h + NIC IRQ, enable card int, free environment, DOS TSR-keep.
 %include "install.asm"

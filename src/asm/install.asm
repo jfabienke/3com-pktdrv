@@ -74,11 +74,15 @@ install:
         mov     ah, 0x49
         int     0x21
 
-        ; terminate-and-stay-resident. Keep PSP..top-of-stack = the whole tiny image:
-        ;   paragraphs = (SS - PSP) + stack_size/16
-        mov     ax, ss
-        sub     ax, [psp_seg]
-        add     ax, STACK_PARAS                 ; stack is 1024 B = 64 paragraphs
+        ; terminate-and-stay-resident. Keep PSP + the RESIDENT region only (handler, ISR,
+        ; resident state, emitted datapath); the cold composer/probe/init above resident_end
+        ; is reclaimed. resident_end is the DGROUP-relative end of the resident region.
+        ;   paragraphs = PSP(0x10) + ceil(resident_end / 16)
+        mov     ax, resident_end
+        add     ax, 15
+        mov     cl, 4
+        shr     ax, cl
+        add     ax, 0x10                        ; + PSP (256 bytes)
         mov     dx, ax
         mov     ax, 0x3100                      ; AH=31h TSR, AL=0
         int     0x21
