@@ -1,0 +1,33 @@
+# wlink directive — 3com-pktdrv
+#
+# Segment/class ordering is what makes copy-down work: the RESIDENT classes are placed
+# first (lowest), so after the composer emits the hot image and we TSR-keep up to the end
+# of the resident region, everything above (composer/fragments/cold init) is reclaimed.
+#
+# Order (low -> high address):
+#   BEGTEXT/_TEXT   resident runtime support (HOT)        \
+#   RESIDENT_DATA   resident data, ring desc, buffers      } kept by copy-down
+#   EMIT_ARENA      reserved hole the composer fills + packs/
+#   --- keep boundary lands here after copy-down ---
+#   COLD_TEXT       composer, fragment library, init        \  reclaimed
+#   COLD_DATA       detection/test scratch                   /
+
+format dos
+name build/3cpd.exe
+option quiet
+option map=build/3cpd.map
+option dosseg
+option stack=2048
+
+# resident-first ordering by class
+order &
+  clname BEGTEXT &
+  clname CODE &
+  clname RESIDENT_DATA &
+  clname EMIT_ARENA &
+  clname COLD_TEXT &
+  clname COLD_DATA
+
+# object files are supplied by the Makefile via @ this file is augmented at link time;
+# for the skeleton we list the floor set explicitly once sources exist:
+# file build/api.obj, build/packet.obj, build/hal.obj, ...
