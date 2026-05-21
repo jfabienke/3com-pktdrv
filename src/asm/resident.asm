@@ -1,13 +1,12 @@
 ; resident.asm -- Crynwr Packet Driver INT 60h handler (RESIDENT; %included by start.asm).
 ;
-; Faithfully follows the Crynwr skeleton (Nestor head.asm): the "PKT DRVR" signature at
-; offset 3, a full register save into a bp-frame, dispatch through a function table, and the
-; carry/error return done by editing the FLAGS image on the stack (so IRET restores the
-; handler's CF/DH to the caller). Functions are reached with the caller's registers and
-; return values by writing the bp-frame. Runs with DS=CS (single-segment tiny model).
+; Follows the Crynwr skeleton (Nestor head.asm): "PKT DRVR" signature at offset 3, full
+; register save into a bp-frame, table dispatch, and carry/error return via the stacked
+; FLAGS. Functions reached with the caller's registers; return values written to the frame.
+; Runs with DS=CS (single-segment tiny model). send_pkt near-calls the JIT-emitted TX.
 ;
-; Datapath: send_pkt near-calls the JIT-emitted TX at resident_image+g_off[FRAG_TX_PIO].
-; RX delivery (the ISR receiver upcall) is the next milestone (needs real 3c509 hardware).
+; Instrumentation: send_pkt bumps stat_tx and (CFG_DEBUG) logs an event; get_statistics
+; (fn 24) exposes the counters; a vendor fn (0x7F, CFG_DEBUG) hands out the debug block.
 
 PKTINT          equ 0x60        ; the packet-driver interrupt we install on
 
@@ -33,9 +32,11 @@ CY     equ 0x0001
 PD_VERSION      equ 0x000B      ; packet driver spec 1.11 -> 11
 PD_CLASS_ETHER  equ 1           ; DIX/Ethernet
 PD_TYPE_3C509   equ 0x0009      ; interface type (3Com EtherLink III)
-PD_FUNC_BASIC   equ 1           ; basic functionality
+PD_FUNC_EXT     equ 2           ; basic + extended (we provide get_statistics)
 PD_ERR_BADCMD   equ 11          ; bad command
-PD_NFUNCS       equ 7           ; highest function number handled (1..7)
+PD_NFUNCS       equ 7           ; functions 1..7 handled via the table
+PD_GET_STATS    equ 24          ; get_statistics
+PD_DBG_BLOCK    equ 0x7F        ; vendor: return the debug block pointer (CFG_DEBUG)
 
 ;------------------------------------------------------------------------------
 pkt_handler:
@@ -56,14 +57,21 @@ pkt_disp:
         push    cs
         pop     ds                      ; DS = our segment
         mov     bp, sp
-        and     word [bp + F_FLAGS], 0xFFFE   ; default success: clear caller's CY
+        and     word [bp + F_FLAGS], 0xFFFE   ; default success: clear caller CY
 
-        mov     bl, [bp + F_AH]         ; function number
-        xor     bh, bh
-        cmp     bx, PD_NFUNCS
+        mov     al, [bp + F_AH]
+        cmp     al, PD_GET_STATS
+        je      pkt_do_stats
+%ifdef CFG_DEBUG
+        cmp     al, PD_DBG_BLOCK
+        je      pkt_do_dbg
+%endif
+        cmp     al, PD_NFUNCS
         ja      pkt_bad
+        mov     bl, al
+        xor     bh, bh
         add     bx, bx                  ; *2 -> word index
-        call    [pkt_functions + bx]    ; DS=CS
+        call    [pkt_functions + bx]
         jc      pkt_error
 pkt_return:
         pop     es
@@ -76,10 +84,18 @@ pkt_return:
         pop     bx
         pop     ax
         iret
+pkt_do_stats:
+        call    f_get_statistics
+        jmp     pkt_return
+%ifdef CFG_DEBUG
+pkt_do_dbg:
+        call    f_dbg
+        jmp     pkt_return
+%endif
 pkt_error:
         mov     bp, sp
         mov     [bp + F_DH], dh         ; return error code in DH
-        or      word [bp + F_FLAGS], CY ; set caller's CY
+        or      word [bp + F_FLAGS], CY ; set caller CY
         jmp     short pkt_return
 pkt_bad:
         mov     dh, PD_ERR_BADCMD
@@ -95,16 +111,16 @@ pkt_functions:
         dw      f_get_address           ; 6
         dw      f_reset                 ; 7
 
-;--- 1: driver_info -- version/class/type/number/name/functionality (via bp-frame) ---
+;--- 1: driver_info ---
 f_driver_info:
         mov     word [bp + F_BX], PD_VERSION
         mov     byte [bp + F_CH], PD_CLASS_ETHER
         mov     byte [bp + F_CL], 0             ; interface number 0
         mov     word [bp + F_DX], PD_TYPE_3C509
         mov     ax, cs
-        mov     [bp + F_DS], ax                ; return DS:SI -> name
+        mov     [bp + F_DS], ax                ; DS:SI -> name
         mov     word [bp + F_SI], pkt_name
-        mov     byte [bp + F_AL], PD_FUNC_BASIC
+        mov     byte [bp + F_AL], PD_FUNC_EXT
         clc
         ret
 
@@ -114,11 +130,11 @@ f_access_type:
         mov     [g_recv_seg], ax
         mov     ax, [bp + F_DI]
         mov     [g_recv_off], ax
-        mov     word [bp + F_AX], 1            ; handle = 1
+        mov     word [bp + F_AX], 1            ; handle = 1 (single-handle floor)
         clc
         ret
 
-;--- 3: release_type -- drop the receiver ---
+;--- 3: release_type ---
 f_release_type:
         xor     ax, ax
         mov     [g_recv_seg], ax
@@ -128,14 +144,19 @@ f_release_type:
 
 ;--- 4: send_pkt -- DS:SI = packet, CX = length; near-call the emitted TX datapath ---
 f_send_pkt:
-        mov     cx, [bp + F_CX]               ; length
-        mov     si, [bp + F_SI]               ; caller's SI
-        mov     ax, [g_off + FRAG_TX_PIO * 2] ; emitted TX offset within resident_image
-        add     ax, resident_image            ; -> absolute offset in our segment
-        mov     ds, [bp + F_DS]               ; DS = caller's (the packet segment)
-        call    ax                            ; CS = our segment; runs emitted tx_pio
+        inc     word [stat_tx]
+%ifdef CFG_DEBUG
+        mov     al, 'T'
+        call    dbg_logb
+%endif
+        mov     cx, [bp + F_CX]
+        mov     si, [bp + F_SI]
+        mov     ax, [g_off + FRAG_TX_PIO * 2]
+        add     ax, resident_image
+        mov     ds, [bp + F_DS]               ; DS = caller's (packet segment)
+        call    ax
         push    cs
-        pop     ds                            ; restore our DS
+        pop     ds
         clc
         ret
 
@@ -143,15 +164,56 @@ f_send_pkt:
 f_get_address:
         mov     si, g_mac
         mov     cx, 6
-        rep     movsb                         ; DS:SI (g_mac) -> ES:DI (caller, ES/DI live)
+        rep     movsb                         ; DS:SI (g_mac) -> ES:DI (caller)
         mov     word [bp + F_CX], 6
         clc
         ret
 
-;--- 7: reset_interface -- floor: nothing to do ---
+;--- 7: reset_interface ---
 f_reset:
         clc
         ret
+
+;--- 24: get_statistics -- refresh + return DS:SI -> the Crynwr stats struct ---
+f_get_statistics:
+        mov     ax, [stat_rx]
+        mov     [pkt_stats + 0], ax           ; packets in
+        mov     ax, [stat_tx]
+        mov     [pkt_stats + 4], ax           ; packets out
+        mov     ax, [stat_rxerr]
+        mov     [pkt_stats + 16], ax          ; errors in
+        mov     ax, [stat_rxdrop]
+        mov     [pkt_stats + 24], ax          ; packets lost
+        mov     ax, cs
+        mov     [bp + F_DS], ax
+        mov     word [bp + F_SI], pkt_stats
+        clc
+        ret
+
+%ifdef CFG_DEBUG
+;--- 0x7F (vendor): return DS:SI -> debug block (sig, ring head, ring) ---
+f_dbg:
+        mov     ax, cs
+        mov     [bp + F_DS], ax
+        mov     word [bp + F_SI], dbg_sig
+        clc
+        ret
+
+; dbg_logb -- append AL to the event-log ring. DS = our segment. Preserves AX/BX.
+dbg_logb:
+        push    ax
+        push    bx
+        mov     bx, [dbg_log_head]
+        mov     [dbg_log + bx], al
+        inc     bx
+        cmp     bx, DBG_LOG_SIZE
+        jb      .ok
+        xor     bx, bx
+.ok:    mov     [dbg_log_head], bx
+        pop     bx
+        pop     ax
+        ret
+%endif
 
 f_bad:
         mov     dh, PD_ERR_BADCMD

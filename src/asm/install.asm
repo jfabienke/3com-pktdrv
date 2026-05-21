@@ -83,6 +83,22 @@ install:
         mov     cl, 4
         shr     ax, cl
         add     ax, 0x10                        ; + PSP (256 bytes)
+%ifdef CFG_DEBUG
+        push    ax
+        mov     dx, msg_keep
+        call    print_str
+        pop     ax
+        push    ax
+        call    print_hex16                     ; resident paragraphs
+        mov     dx, msg_inst
+        call    print_str
+        mov     al, [irq_vec]
+        xor     ah, ah
+        call    print_hex16                     ; NIC IRQ vector number
+        mov     dx, msg_crlf
+        call    print_str
+        pop     ax
+%endif
         mov     dx, ax
         mov     ax, 0x3100                      ; AH=31h TSR, AL=0
         int     0x21

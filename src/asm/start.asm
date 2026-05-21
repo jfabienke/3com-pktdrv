@@ -50,6 +50,15 @@ msg_crlf    db 13, 10, '$'
 fake_mac    db 0x02, 0x60, 0x8C, 0x11, 0x22, 0x33   ; test MAC (3Com OUI 00:60:8C)
 %endif
 
+%ifdef CFG_DEBUG
+msg_dbgon   db '[debug build]', 13, 10, '$'
+msg_eeprod  db 13, 10, 'EEPROM prod=0x', '$'
+msg_eeid    db ' mfg=0x', '$'
+msg_emit    db 'emitted=0x', '$'
+msg_keep    db ' resident para=0x', '$'
+msg_inst    db 13, 10, 'INSTALLED: INT 60h, IRQ vec=0x', '$'
+%endif
+
 ;==============================================================================
 ; BSS -- COLD scratch only (above resident_end, reclaimed after install).
 ;==============================================================================
@@ -115,6 +124,23 @@ isr_save_sp:    resw 1
 isr_stack:      resb 128           ; the ISR's private stack
 isr_stack_top:
 resident_image: resb 128           ; the composed datapath (tx + rx drain)
+
+; --- statistics (resident; updated by the ISR / send_pkt, read by get_statistics) ---
+stat_rx:        dw 0               ; packets received & delivered
+stat_tx:        dw 0               ; packets transmitted
+stat_rxerr:     dw 0               ; RX errors (card-flagged)
+stat_rxdrop:    dw 0               ; RX dropped (no receiver / no buffer)
+stat_irq:       dw 0               ; NIC interrupts serviced
+pkt_stats:      times 7 dd 0       ; Crynwr get_statistics struct (built on demand)
+
+%ifdef CFG_DEBUG
+; --- debug event-log ring (resident; appended by the ISR / handler, dumped by pktdbg) ---
+DBG_LOG_SIZE    equ 512
+dbg_sig:        db 'PKTDBG00'      ; marker the dump tool can recognise
+dbg_log_head:   dw 0               ; ring write index (wraps at DBG_LOG_SIZE)
+dbg_log:        times DBG_LOG_SIZE db 0
+%endif
+
 resident_end:                      ; <== TSR keep boundary
 global resident_end
 
@@ -130,6 +156,10 @@ global resident_end
 
         mov     dx, msg_banner
         call    print_str
+%ifdef CFG_DEBUG
+        mov     dx, msg_dbgon
+        call    print_str
+%endif
 
         call    detect_cpu          ; -> g_cpu_class
         mov     dx, msg_cpu
@@ -194,6 +224,12 @@ global resident_end
         or      ax, ax
         jz      .fail
         mov     [g_emitted_len], ax
+%ifdef CFG_DEBUG
+        mov     dx, msg_emit
+        call    print_str
+        mov     ax, [g_emitted_len]
+        call    print_hex16
+%endif
 
         call    copy_down           ; ax = paragraphs to keep
         mov     [g_keep_para], ax

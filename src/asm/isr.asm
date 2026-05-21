@@ -35,6 +35,17 @@ nic_isr:
         cmp     byte [g_isr_busy], 0
         jne     .eoi
         inc     byte [g_isr_busy]
+        inc     word [stat_irq]
+%ifdef CFG_DEBUG
+        ; visible heartbeat: cycle the top-left text cell on every serviced interrupt
+        push    es
+        mov     ax, 0xB800
+        mov     es, ax
+        inc     byte [es:0]
+        pop     es
+        mov     al, 'I'
+        call    dbg_logb
+%endif
 
 .recv_loop:
         mov     dx, [g_nic_io]
@@ -49,14 +60,14 @@ nic_isr:
         test    ah, 0x80                ; RX_INCOMPLETE (0x8000)
         jnz     .recv_done
         test    ah, 0x40                ; RX_ERROR (0x4000)
-        jnz     .discard
+        jnz     .rxerr
         mov     cx, ax
         and     cx, EL3_RX_LEN_MASK     ; packet length
 
         ; receiver registered?
         mov     ax, [g_recv_off]
         or      ax, [g_recv_seg]
-        jz      .discard
+        jz      .drop
 
         ; --- upcall 1: AX=0 request a buffer; CX=len, BX=handle, ES:DI=0 ---
         push    cx
@@ -68,7 +79,7 @@ nic_isr:
         pop     cx
         mov     ax, es
         or      ax, di
-        jz      .discard                ; null buffer -> drop
+        jz      .drop                   ; null buffer -> drop
 
         ; --- drain CX bytes into ES:DI via the emitted rx fragment ---
         push    es
@@ -87,6 +98,11 @@ nic_isr:
         call far [cs:g_recv_off]
         mov     ax, cs
         mov     ds, ax                  ; restore DS
+        inc     word [stat_rx]
+%ifdef CFG_DEBUG
+        mov     al, 'R'
+        call    dbg_logb
+%endif
 
 .discard:
         mov     dx, [g_nic_io]
@@ -94,6 +110,21 @@ nic_isr:
         mov     ax, EL3_CMD_RX_DISCARD
         out     dx, ax
         jmp     .recv_loop
+
+.rxerr:
+        inc     word [stat_rxerr]
+%ifdef CFG_DEBUG
+        mov     al, 'E'
+        call    dbg_logb
+%endif
+        jmp     .discard
+.drop:
+        inc     word [stat_rxdrop]
+%ifdef CFG_DEBUG
+        mov     al, 'D'
+        call    dbg_logb
+%endif
+        jmp     .discard
 
 .recv_done:
         mov     dx, [g_nic_io]

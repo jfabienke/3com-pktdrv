@@ -29,11 +29,29 @@ detect_nic:
         mov     al, EL3_EE_PROD_ID          ; confirm product id (word 3, masked)
         call    id_read_eeprom
         and     ax, EL3_PRODID_MASK
+%ifdef CFG_DEBUG
+        push    ax                          ; show the raw IDs even on a mismatch
+        mov     dx, msg_eeprod
+        call    print_str
+        pop     ax
+        push    ax
+        call    print_hex16
+        pop     ax
+%endif
         cmp     ax, EL3_PRODID_3C509B
         jne     .nocard
 
         mov     al, EL3_EE_MFG_ID           ; confirm manufacturer id (word 7)
         call    id_read_eeprom
+%ifdef CFG_DEBUG
+        push    ax
+        mov     dx, msg_eeid
+        call    print_str
+        pop     ax
+        push    ax
+        call    print_hex16
+        pop     ax
+%endif
         cmp     ax, EL3_MFG_ID
         jne     .nocard
 

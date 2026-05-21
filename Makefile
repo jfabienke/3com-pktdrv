@@ -49,6 +49,17 @@ fakenic: .SYMBOLIC
     @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
     $(MAKE) DEFS=-dCFG_FAKENIC all
 
+# debug: instrumented build for out-of-house HARDWARE testing -- verbose cold trace, the
+# resident event log, the video heartbeat, get_statistics, and the 0x7F debug block.
+debug: .SYMBOLIC
+    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    $(MAKE) DEFS=-dCFG_DEBUG all
+
+# debugfake: debug instrumentation + fake NIC, so the whole thing is exercisable in dosbox-x.
+debugfake: .SYMBOLIC
+    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    $(MAKE) DEFS="-dCFG_DEBUG -dCFG_FAKENIC" all
+
 clean: .SYMBOLIC
     @if exist $(BUILD)\*.obj del $(BUILD)\*.obj
     @if exist $(BUILD)\*.bin del $(BUILD)\*.bin
