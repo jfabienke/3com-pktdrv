@@ -14,17 +14,20 @@
  * frag_lookup() returns the best fragment for (id, detected CPU class). */
 extern const fragment_t *frag_lookup(frag_id_t id, cpu_class_t cls);
 
-uint16_t compose_resident(const emit_plan_t *plan, uint8_t *arena, uint16_t arena_len)
+uint16_t compose_resident(const emit_plan_t *plan, uint8_t *arena, uint16_t arena_len,
+                          compose_result_t *res)
 {
     uint16_t pos = 0;
-    uint8_t  s;
+    uint8_t  s, i;
+
+    for (i = 0; i < FRAG__COUNT; ++i) res->off[i] = FRAG_OFF_NONE;
 
     for (s = 0; s < plan->n_steps; ++s) {
         const fragment_t *f = frag_lookup(plan->steps[s], g_cpu.cls);
-        uint8_t i;
 
-        if (f == 0 || pos + f->len > arena_len) return 0;   /* over budget / missing */
+        if (f == 0 || pos + f->len > arena_len) { res->len = 0; return 0; }
 
+        res->off[plan->steps[s]] = pos;       /* record where this fragment landed */
         memcpy(arena + pos, f->bytes, f->len);
 
         /* patch immediates with this step's resolved values */
@@ -37,6 +40,7 @@ uint16_t compose_resident(const emit_plan_t *plan, uint8_t *arena, uint16_t aren
         }
         pos += f->len;
     }
+    res->len = pos;
     return pos;   /* emitted length */
 }
 

@@ -55,8 +55,20 @@ typedef struct emit_plan {
     uint8_t    n_steps;
 } emit_plan_t;
 
-/* Composer: select+stitch+patch into the emit arena; returns emitted length. */
-uint16_t compose_resident(const emit_plan_t *plan, uint8_t *arena, uint16_t arena_len);
+/* Result of composition: total emitted length + where each fragment id landed in the
+ * arena (0xFFFF if not emitted). The installer uses off[FRAG_API_DISPATCH] /
+ * off[FRAG_ISR_ENTRY] to point INT 60h and the NIC IRQ vector at the right entry. */
+typedef struct compose_result {
+    uint16_t len;
+    uint16_t off[FRAG__COUNT];
+} compose_result_t;
+
+#define FRAG_OFF_NONE 0xFFFFu
+
+/* Composer: select+stitch+patch into the emit arena; fills res; returns emitted length
+ * (0 on over-budget or missing fragment). */
+uint16_t compose_resident(const emit_plan_t *plan, uint8_t *arena, uint16_t arena_len,
+                          compose_result_t *res);
 
 /* Copy-down: pack the emitted image to its compact resident home, apply relocs.
  * Returns the resident size in paragraphs to TSR-keep. */

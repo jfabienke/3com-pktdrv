@@ -11,16 +11,17 @@ extern int el3_recv_pio(nic_info_t *, uint8_t *, uint16_t *);
 extern int el3_set_rx_mode(nic_info_t *, uint8_t);
 extern int el3_get_mac(nic_info_t *, uint8_t[6]);
 
-/* Cold: name the hot fragments the composer must emit for a 3C509B (PIO floor). */
+/* Cold: name the hot fragments the composer must emit for a 3C509B (PIO floor), and hand
+ * each its immediates. The PIO datapath fragments take io_base in patch slot 0. */
 static void c509b_emit_plan(nic_info_t *nic, emit_plan_t *plan)
 {
-    (void)nic;
-    plan->n_steps = 0;
-    plan->steps[plan->n_steps++] = FRAG_API_DISPATCH;
-    plan->steps[plan->n_steps++] = FRAG_ISR_ENTRY;
-    plan->steps[plan->n_steps++] = FRAG_RX_PIO;
-    plan->steps[plan->n_steps++] = FRAG_TX_PIO;
-    plan->steps[plan->n_steps++] = FRAG_ISR_EOI;
+    uint8_t s = 0;
+    plan->steps[s] = FRAG_API_DISPATCH;                       s++;
+    plan->steps[s] = FRAG_ISR_ENTRY;                          s++;
+    plan->steps[s] = FRAG_RX_PIO; plan->imm[s][0] = nic->io_base; s++;
+    plan->steps[s] = FRAG_TX_PIO; plan->imm[s][0] = nic->io_base; s++;
+    plan->steps[s] = FRAG_ISR_EOI;                            s++;
+    plan->n_steps = s;
 }
 
 const nic_ops_t el3_3c509b_ops = {

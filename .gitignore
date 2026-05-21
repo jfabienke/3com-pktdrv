@@ -2,4 +2,6 @@
 /build/*.exe
 /build/*.map
 /build/*.err
+/build/*.bin
+/build/frags.inc
 *.bak

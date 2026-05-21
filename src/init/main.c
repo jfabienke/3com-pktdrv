@@ -35,13 +35,19 @@ static int  phase_memory(nic_info_t *nic) { (void)nic; return 0; }
 
 static uint16_t phase_compose_and_copydown(nic_info_t *nic, uint8_t *arena, uint16_t arena_len)
 {
-    emit_plan_t plan;
-    uint16_t emitted_len;
+    emit_plan_t      plan;
+    compose_result_t res;
+    uint16_t         emitted_len;
 
     plan.n_steps = 0;
-    nic->ops->emit_plan(nic, &plan);             /* HAL names the fragments */
-    emitted_len = compose_resident(&plan, arena, arena_len);
-    return copy_down(arena, emitted_len);        /* returns paragraphs to keep */
+    nic->ops->emit_plan(nic, &plan);                          /* HAL names the fragments */
+    emitted_len = compose_resident(&plan, arena, arena_len, &res);
+    if (emitted_len == 0) return 0;
+
+    /* res.off[FRAG_API_DISPATCH] / res.off[FRAG_ISR_ENTRY] locate the emitted entry points;
+     * the installer (next milestone) hooks INT 60h + the NIC IRQ vector to them after
+     * copy-down rebases the image. */
+    return copy_down(arena, emitted_len);                     /* returns paragraphs to keep */
 }
 
 int main(void)

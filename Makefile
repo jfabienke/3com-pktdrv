@@ -18,7 +18,7 @@ TARGET  = $(BUILD)/3cpd.exe
 #   -ms small model  -0 8088  -os size-opt  -zq quiet  -zp1 pack
 # NOTE: cold/init C runs SS==DS (no -zu). The resident hot path is JIT-emitted asm that
 # manages its own stack; any future resident C would be compiled separately with -zu.
-CFLAGS_BASE = -ms -0 -os -zq -zp1 -wcd=201 -Iinclude -fr=$(BUILD)/
+CFLAGS_BASE = -ms -0 -os -zq -zp1 -wcd=201 -Iinclude -I$(BUILD) -fr=$(BUILD)/
 # NASM -> 16-bit OMF for wlink. Per-file `CPU 8086`/`CPU 386` directives gate ISA usage;
 # floor/fragment sources MUST declare `CPU 8086`. Fragment palette also builds raw bins
 # (-f bin) embedded for the JIT composer (added when the palette lands).
@@ -94,6 +94,23 @@ $(TARGET): $(ALL_OBJS) 3cpd.lnk
 
 .asm.obj:
     $(ASM) $(AFLAGS) $< -o $@
+
+# ---- JIT fragment palette (generated) ----
+# tools/mkfrag.py assembles src/asm/frag/*.asm (nasm -f bin) into position-independent
+# byte arrays + patch tables in build/frags.inc, which frag_pio.c #includes. frag_pio.obj
+# depends on the generated header so it rebuilds when any fragment changes.
+FRAG_SRC = &
+    src/asm/frag/api.asm &
+    src/asm/frag/isr_entry.asm &
+    src/asm/frag/isr_eoi.asm &
+    src/asm/frag/rx_pio.asm &
+    src/asm/frag/tx_pio.asm
+
+$(BUILD)/frags.inc : tools/mkfrag.py $(FRAG_SRC)
+    python3 tools/mkfrag.py
+
+$(BUILD)/frag_pio.obj : src/codegen/frag_pio.c $(BUILD)/frags.inc
+    $(CC) $(CFLAGS) -fo=$@ src/codegen/frag_pio.c
 
 clean: .SYMBOLIC
     @if exist $(BUILD)\*.obj del $(BUILD)\*.obj
