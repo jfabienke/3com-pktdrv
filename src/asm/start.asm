@@ -17,6 +17,8 @@ bits 16
 ; EL3 register constants are pulled per-generation by the probe (el3_probe.asm includes
 ; el3_tomahawk.inc -> el3_core.inc); start.asm proper needs none directly.
 
+STACK_PARAS equ 64                      ; 1024-byte stack -> 64 paragraphs (TSR keep math)
+
 ;==============================================================================
 ; DATA (initialized) -- fragment palette, plan template
 ;==============================================================================
@@ -52,6 +54,10 @@ msg_mac     db ' MAC=', '$'
 msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
 
+%ifdef CFG_FAKENIC
+fake_mac    db 0x02, 0x60, 0x8C, 0x11, 0x22, 0x33   ; test MAC (3Com OUI 00:60:8C)
+%endif
+
 ;==============================================================================
 ; BSS (uninitialized) -- runtime state + the emit destination
 ;==============================================================================
@@ -74,9 +80,14 @@ g_imm0:         resw 1
 g_curid:        resb 1
                 resb 1
 
-; entry offsets of each emitted fragment (0xFFFF if not emitted); install reads
-; g_off[FRAG_API_DISPATCH] and g_off[FRAG_ISR_ENTRY].
+; entry offset of each emitted fragment (0xFFFF if not emitted)
 g_off:          resw FRAG__COUNT
+
+; resident state for the INT 60h handler
+g_recv_seg:     resw 1          ; registered receiver (access_type) seg:off
+g_recv_off:     resw 1
+old_int_seg:    resw 1          ; previous INT 60h owner (for chain/uninstall)
+old_int_off:    resw 1
 
 ; the composed hot image (copy-down packs it; DOS-keeps up to here)
 resident_image: resb 512
@@ -133,10 +144,22 @@ segment _TEXT public class=CODE use16
         ; isolation -- a software PnP manager does it). PnP only matters for a 3C509B left in
         ; PnP-only mode or already claimed by a PnP BIOS, so it is a FULL-PROFILE add
         ; (CFG_PNP), compiled out of the minimal floor for size -- gated by profile, not CPU.
+%ifdef CFG_FAKENIC
+        ; test build (no emulator has a 3C509): skip the probe, inject a fake NIC so the
+        ; full el3_init -> compose -> install path runs and the resident driver is testable.
+        mov     word [g_nic_io], 0x300
+        mov     word [g_nic_irq], 0x000A
+        mov     si, fake_mac
+        mov     di, g_mac
+        mov     cx, 6
+        rep     movsb
+        clc
+%else
         call    detect_nic          ; native 3Com ID-port (Tomahawk) -> g_nic_io/irq/mac
 %ifdef CFG_PNP
         jnc     .nic_found          ; native found a card
         call    detect_nic_pnp      ; else (full profile) try ISA PnP (cache-kit isapnp)
+%endif
 %endif
         jc      .nic_none           ; no card found
 .nic_found:
@@ -163,10 +186,8 @@ segment _TEXT public class=CODE use16
         call    copy_down           ; ax = paragraphs to keep
         mov     [g_keep_para], ax
 
-        ; TODO(next): install INT 60h + NIC IRQ from g_off[], then DOS TSR-keep.
-        ; Deferred while the API/ISR fragments are stubs. Terminate cleanly for now.
-        mov     ax, 0x4C00
-        int     0x21
+        call    install             ; hook INT 60h, free env, DOS TSR-keep (never returns)
+        ; (NIC IRQ hook + ISR receiver upcall land with real 3c509 hardware)
 .nic_none:
         mov     dx, msg_no_nic
         call    print_str
@@ -220,6 +241,12 @@ phase_validate_dma:
 
 ; el3_init -- operational bring-up of the activated card (MAC, media, RX/TX enable).
 %include "el3_init.asm"
+
+; pkt_handler -- resident Crynwr INT 60h packet-driver API (signature + dispatch).
+%include "resident.asm"
+
+; install -- hook INT 60h, free environment, DOS TSR-keep.
+%include "install.asm"
 
 ;------------------------------------------------------------------------------
 ; build_plan -- the HAL hands the composer the NIC's immediates: io_base into the PIO

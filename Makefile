@@ -15,7 +15,9 @@ TARGET = $(BUILD)/3cpd.exe
 
 # -f obj: 16-bit OMF for wlink. Includes resolve codegen.inc (include/) and the generated
 # frags_asm.inc (build/). All sources declare `cpu 8086` -- the 5150 floor.
-AFLAGS = -f obj -iinclude/ -i$(BUILD)/ -isrc/asm/
+# DEFS: extra NASM -d defines (e.g. the `fakenic` target sets -dCFG_FAKENIC).
+DEFS   =
+AFLAGS = -f obj -iinclude/ -i$(BUILD)/ -isrc/asm/ $(DEFS)
 
 # Hot-path fragment palette (assembled to bins + embedded by mkfrag.py, not linked).
 FRAG_SRC = &
@@ -33,12 +35,18 @@ $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
     python3 tools/mkfrag.py
 
 $(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.asm &
-                     include/codegen.inc include/el3_tomahawk.inc include/el3_core.inc &
-                     $(BUILD)/frags_asm.inc
+                     src/asm/resident.asm src/asm/install.asm include/codegen.inc &
+                     include/el3_tomahawk.inc include/el3_core.inc $(BUILD)/frags_asm.inc
     $(ASM) $(AFLAGS) src/asm/start.asm -o $@
 
 $(TARGET) : $(BUILD)/start.obj 3cpd.lnk
     $(LINK) @3cpd.lnk
+
+# fakenic: test build that skips the probe (no emulator has a 3C509) so the install +
+# resident handler are exercisable in dosbox-x. Forces a recompile with -dCFG_FAKENIC.
+fakenic: .SYMBOLIC
+    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    $(MAKE) DEFS=-dCFG_FAKENIC all
 
 clean: .SYMBOLIC
     @if exist $(BUILD)\*.obj del $(BUILD)\*.obj

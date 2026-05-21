@@ -7,3 +7,4 @@
 *.bak
 /build/*.inc
 .DS_Store
+/build/*.com
