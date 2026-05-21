@@ -65,7 +65,7 @@ msg_inst    db 13, 10, 'INSTALLED: INT 60h, IRQ vec=0x', '$'
 segment _BSS public class=BSS use16
 
 psp_seg:        resw 1          ; PSP segment (saved at entry, for the TSR keep)
-g_cpu_class:    resb 1          ; CPU_8088 .. CPU_P6 (set by detect_cpu)
+g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
                 resb 1
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
@@ -245,9 +245,11 @@ global resident_end
         int     0x21
 
 ;------------------------------------------------------------------------------
-; detect_cpu -- classify 8086/8088 vs 286 vs 386+ via the FLAGS 12-15 test.
-; 8088-safe (no push-immediate). Sets g_cpu_class. Coarse by design: the floor only
-; needs 8088 vs >=286; finer 486/Pentium/CPUID detail is added with their fragments.
+; detect_cpu -- full non-CPUID class ladder: 8088 / 286 / 386 / 486 / CPUID-capable.
+; Sets g_cpu_class. The 8086/286 split is the 16-bit FLAGS bits 12-15 test (8088-safe);
+; the 386/486/CPUID split uses the 32-bit EFLAGS AC and ID flags (only reached on 386+, so
+; the floor never executes a 32-bit instruction). Finer family/feature detail needs the
+; CPUID-parsing layer (lifted when the cache-coherency tier lands). ~122 bytes, cold.
 ;------------------------------------------------------------------------------
 detect_cpu:
         pushf
@@ -259,7 +261,7 @@ detect_cpu:
         pushf
         pop     ax
         and     ax, 0xF000
-        cmp     ax, 0xF000          ; stuck high? -> 8086/8088
+        cmp     ax, 0xF000          ; stuck set -> 8086/8088
         je      .is8088
         or      cx, 0xF000          ; try to set bits 12-15
         push    cx
@@ -267,8 +269,36 @@ detect_cpu:
         pushf
         pop     ax
         and     ax, 0xF000
-        jz      .is286              ; stuck low -> 286
-        mov     byte [g_cpu_class], CPU_80386   ; settable -> 386+ (coarse)
+        jz      .is286              ; stuck clear (can't set in real mode) -> 286
+        ; --- 386+ : 32-bit EFLAGS tests (unreachable on 8086/286) ---
+        cpu 386
+        pushfd
+        pop     eax
+        mov     ecx, eax
+        xor     eax, 0x00040000     ; toggle AC (bit 18): 386 can't, 486+ can
+        push    eax
+        popfd
+        pushfd
+        pop     eax
+        xor     eax, ecx
+        test    eax, 0x00040000
+        jz      .is386
+        mov     eax, ecx
+        xor     eax, 0x00200000     ; toggle ID (bit 21): no-CPUID can't, CPUID can
+        push    eax
+        popfd
+        pushfd
+        pop     eax
+        xor     eax, ecx
+        test    eax, 0x00200000
+        jz      .is486
+        mov     byte [g_cpu_class], CPU_CPUID
+        ret
+.is486:
+        mov     byte [g_cpu_class], CPU_80486
+        ret
+.is386:
+        mov     byte [g_cpu_class], CPU_80386
         ret
 .is286:
         mov     byte [g_cpu_class], CPU_80286
@@ -276,6 +306,7 @@ detect_cpu:
 .is8088:
         mov     byte [g_cpu_class], CPU_8088
         ret
+        cpu 8086                    ; restore floor-safety check for the rest of the file
 
 ;------------------------------------------------------------------------------
 ; phase stubs (>=286 cold phases; real logic lands as the ladder is climbed)

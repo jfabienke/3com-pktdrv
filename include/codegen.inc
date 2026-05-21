@@ -18,9 +18,10 @@ FRAG__COUNT         equ 10
 CPU_8088            equ 0
 CPU_80286           equ 1
 CPU_80386           equ 2
-CPU_80486           equ 3
-CPU_PENTIUM         equ 4
-CPU_P6              equ 5
+CPU_80486           equ 3       ; 486 without CPUID
+CPU_CPUID           equ 4       ; CPUID present (family/model via CPUID -- future lift)
+CPU_PENTIUM         equ 5       ; reserved: set by the CPUID-parsing lift
+CPU_P6              equ 6
 
 ; ---- immediate patch kinds ----
 PATCH_IMM8          equ 0
