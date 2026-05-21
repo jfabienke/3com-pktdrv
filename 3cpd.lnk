@@ -1,33 +1,29 @@
-# wlink directive — 3com-pktdrv
+# wlink directive — 3com-pktdrv (minimal floor milestone)
 #
-# Segment/class ordering is what makes copy-down work: the RESIDENT classes are placed
-# first (lowest), so after the composer emits the hot image and we TSR-keep up to the end
-# of the resident region, everything above (composer/fragments/cold init) is reclaimed.
-#
-# Order (low -> high address):
-#   BEGTEXT/_TEXT   resident runtime support (HOT)        \
-#   RESIDENT_DATA   resident data, ring desc, buffers      } kept by copy-down
-#   EMIT_ARENA      reserved hole the composer fills + packs/
-#   --- keep boundary lands here after copy-down ---
-#   COLD_TEXT       composer, fragment library, init        \  reclaimed
-#   COLD_DATA       detection/test scratch                   /
+# Resident-first class ordering is what makes copy-down work: RESIDENT classes are placed
+# first (lowest); after the composer emits the hot image we TSR-keep up to the end of the
+# resident region, reclaiming everything above (composer/fragments/cold init).
 
-format dos
+system dos
 name build/3cpd.exe
 option quiet
 option map=build/3cpd.map
-option dosseg
 option stack=2048
 
-# resident-first ordering by class
-order &
-  clname BEGTEXT &
-  clname CODE &
-  clname RESIDENT_DATA &
-  clname EMIT_ARENA &
-  clname COLD_TEXT &
-  clname COLD_DATA
+# Class ordering: the default DOSSEG-style order already places the hot code class (CODE:
+# _TEXT) before the cold class (COLD_TEXT), which is what copy-down relies on. Verified in
+# build/3cpd.map:  _TEXT @ 0000  ->  COLD_TEXT @ 0075 (after).  An explicit ORDER directive
+# placing RESIDENT_DATA + EMIT_ARENA between them will be added when copy-down is implemented
+# (it must pack resident data adjacent to resident code so the keep-boundary is tight).
 
-# object files are supplied by the Makefile via @ this file is augmented at link time;
-# for the skeleton we list the floor set explicitly once sources exist:
-# file build/api.obj, build/packet.obj, build/hal.obj, ...
+# minimal floor object set
+file build/api.obj
+file build/packet.obj
+file build/hal.obj
+file build/compose.obj
+file build/frag_pio.obj
+file build/main.obj
+file build/el3_core.obj
+file build/el3_isa.obj
+file build/cpu_detect.obj
+file build/nic_irq.obj
