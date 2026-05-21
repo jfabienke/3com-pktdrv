@@ -25,7 +25,9 @@ FRAG_SRC = &
     src/asm/frag/isr_entry.asm &
     src/asm/frag/isr_eoi.asm &
     src/asm/frag/rx_pio.asm &
-    src/asm/frag/tx_pio.asm
+    src/asm/frag/tx_pio.asm &
+    src/asm/frag/rx_pio_286.asm &
+    src/asm/frag/tx_pio_286.asm
 
 # ---- targets ----
 

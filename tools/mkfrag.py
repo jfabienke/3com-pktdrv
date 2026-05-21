@@ -33,12 +33,17 @@ SENTINELS = [
 ]
 
 # (source file, frag_id equate, cpu_min equate, number of patch slots used)
+# Multiple fragments may share a frag_id with different cpu_min; frag_lookup selects the
+# highest cpu_min <= the detected CPU class (e.g. the 8088 unrolled loop vs the 286 rep
+# insw/outsw burst, which needs a 16-bit ISA bus).
 FRAGS = [
-    ("api.asm",       "FRAG_API_DISPATCH", "CPU_8088", 0),
-    ("isr_entry.asm", "FRAG_ISR_ENTRY",    "CPU_8088", 0),
-    ("isr_eoi.asm",   "FRAG_ISR_EOI",      "CPU_8088", 0),
-    ("rx_pio.asm",    "FRAG_RX_PIO",       "CPU_8088", 1),
-    ("tx_pio.asm",    "FRAG_TX_PIO",       "CPU_8088", 1),
+    ("api.asm",       "FRAG_API_DISPATCH", "CPU_8088",  0),
+    ("isr_entry.asm", "FRAG_ISR_ENTRY",    "CPU_8088",  0),
+    ("isr_eoi.asm",   "FRAG_ISR_EOI",      "CPU_8088",  0),
+    ("rx_pio.asm",    "FRAG_RX_PIO",       "CPU_8088",  1),  # 8088: unrolled loop
+    ("tx_pio.asm",    "FRAG_TX_PIO",       "CPU_8088",  1),
+    ("rx_pio_286.asm", "FRAG_RX_PIO",      "CPU_80286", 1),  # 286+ (16-bit ISA): rep insw
+    ("tx_pio_286.asm", "FRAG_TX_PIO",      "CPU_80286", 1),  # 286+ (16-bit ISA): rep outsw
 ]
 
 
