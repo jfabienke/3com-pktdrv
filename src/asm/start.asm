@@ -83,11 +83,19 @@ g_curid:        resb 1
 ; entry offset of each emitted fragment (0xFFFF if not emitted)
 g_off:          resw FRAG__COUNT
 
-; resident state for the INT 60h handler
-g_recv_seg:     resw 1          ; registered receiver (access_type) seg:off
-g_recv_off:     resw 1
+; resident state for the INT 60h handler + ISR
+g_recv_off:     resw 1          ; registered receiver (access_type) -- off,seg adjacent for
+g_recv_seg:     resw 1          ;   `call far [g_recv_off]`
 old_int_seg:    resw 1          ; previous INT 60h owner (for chain/uninstall)
 old_int_off:    resw 1
+old_irq_seg:    resw 1          ; previous NIC IRQ owner
+old_irq_off:    resw 1
+irq_vec:        resb 1          ; computed NIC IRQ vector number
+g_isr_busy:     resb 1          ; ISR reentrancy guard
+isr_save_ss:    resw 1          ; interrupted task's SS:SP (private-stack switch)
+isr_save_sp:    resw 1
+isr_stack:      resb 256        ; the ISR's private stack
+isr_stack_top:
 
 ; the composed hot image (copy-down packs it; DOS-keeps up to here)
 resident_image: resb 512
@@ -245,7 +253,10 @@ phase_validate_dma:
 ; pkt_handler -- resident Crynwr INT 60h packet-driver API (signature + dispatch).
 %include "resident.asm"
 
-; install -- hook INT 60h, free environment, DOS TSR-keep.
+; nic_isr -- resident NIC interrupt handler + receiver upcall.
+%include "isr.asm"
+
+; install -- hook INT 60h + NIC IRQ, enable card int, free environment, DOS TSR-keep.
 %include "install.asm"
 
 ;------------------------------------------------------------------------------

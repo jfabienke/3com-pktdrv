@@ -47,6 +47,7 @@ EL3_CMD_TX_ENABLE       equ 0x4800
 EL3_CMD_TX_RESET        equ 0x5800
 EL3_CMD_ACK_INTR        equ 0x6800
 EL3_CMD_SET_INTR_ENB    equ 0x7000
+EL3_CMD_SET_STATUS_ENB  equ 0x7800   ; which status bits are visible in the status register
 EL3_CMD_SET_RX_FILTER   equ 0x8000
 
 ; ---- status bits ----
