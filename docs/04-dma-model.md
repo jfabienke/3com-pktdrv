@@ -62,6 +62,13 @@ enabling it:
 3. Only then set `HW_CAP_BUSMASTER` "trusted" and let the composer emit the DMA path.
 4. On any doubt, emit PIO. PIO is always correct; DMA is an optimization.
 
+The **chipset identity is a confidence input**, not just the live exercise: cache-kit's
+`chipset_ops_t` carries a per-chipset `tier`/`score_x10` (its "S-TIER: Driver's Dream"
+grading) that encodes known snooping/bus-master behavior. We don't lift its 62-chipset
+desktop table, but the *pattern* — chipset detect → known-coherency/known-busmaster
+prior → fold into the test threshold — is the right shape for selecting the cache tier and
+seeding the busmaster-test confidence.
+
 Cache-coherency tier is selected per CPU/chipset:
 
 ```
@@ -71,6 +78,19 @@ tier 3  software barrier 386            manual ordering
 tier 4  none            286 / no cache  nothing to do
 disable bus master      coherency unproven → PIO
 ```
+
+**Flush primitives + ordering (lift from cache-kit `CK_HAL.C`).** WBINVD and INVD are
+emitted as raw opcodes — `0F 09` (WBINVD, 486+, write-back then invalidate) and `0F 08`
+(INVD, 386, invalidate *without* write-back — data-loss hazard, only safe on a clean or
+write-through cache). The **ordering rule is load-bearing**: on a write-back cache you must
+**flush before disabling** the cache; disabling first strands dirty lines and corrupts DMA
+buffers. (Write-through is the reverse — disable then flush.) `src/dma/cache.c` lifts these
+primitives near-verbatim; see `docs/07` Tier A′.
+
+**Hardware NC region as an alternative to per-transfer flush.** On chipsets that expose
+non-cacheable region registers, the DMA buffer region can be marked non-cacheable *once* at
+init instead of flushing on every transfer — cheaper than WBINVD per packet. This is a
+config option for the cache tier, detailed in `05-memory-buffering.md`.
 
 ## Cache-safety rule (load-time)
 

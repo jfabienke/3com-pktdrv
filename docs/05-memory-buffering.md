@@ -65,6 +65,24 @@ a cache flush (WBINVD ~250 µs on a 486). So:
 - On a 5150 there is no DMA, so every packet takes the PIO path; copybreak/threshold logic
   is simply not emitted.
 
+## DMA-safe buffers: NC region vs per-transfer flush
+
+On a non-snooping 386/486, a bus-master/ring-DMA buffer in normal cacheable memory needs a
+cache flush around every transfer (`04-dma-model.md`, tier 2 WBINVD ~250 µs). Some chipsets
+offer a cheaper path: **mark the DMA buffer region non-cacheable (NC) once at init**, and
+no per-transfer flush is needed at all.
+
+- The capability and encoding are chipset-specific (cache-kit's `nc_region_t` /
+  `nc_read/write/clear`, with per-chipset granularity and max size — OPTi 64 KB-unit base +
+  size nibble, SiS 16-bit packed, Intel/VIA PAM registers). We lift the *model and
+  primitives* (`docs/07` Tier A′), not cache-kit's 62-chipset table.
+- **Decision (cold, per machine):** if the detected chipset exposes an NC region big enough
+  for the DMA pool → allocate the pool there, mark it NC, and the composer emits the DMA
+  datapath **without** the cache-flush fragment. Otherwise fall back to the per-transfer
+  flush tier.
+- This only matters in the bus-master/ring-DMA datapath on a non-snooping cache; it is
+  irrelevant to the PIO floor (5150) and to snooping CPUs, where no flush is emitted anyway.
+
 ## Resident vs reclaimed
 
 - **Resident:** the handle/NIC state, ring descriptors, and the small conventional buffer
