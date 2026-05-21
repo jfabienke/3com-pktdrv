@@ -8,6 +8,8 @@
 ; Instrumentation: send_pkt bumps stat_tx and (CFG_DEBUG) logs an event; get_statistics
 ; (fn 24) exposes the counters; a vendor fn (0x7F, CFG_DEBUG) hands out the debug block.
 
+%include "el3_core.inc"         ; EL3 command/status constants (guarded; also used by isr.asm)
+
 PKTINT          equ 0x60        ; the packet-driver interrupt we install on
 
 ; --- bp-frame offsets (after push ax,bx,cx,dx,si,di,bp,ds,es; mov bp,sp) ---
@@ -144,6 +146,33 @@ f_release_type:
 
 ;--- 4: send_pkt -- DS:SI = packet, CX = length; near-call the emitted TX datapath ---
 f_send_pkt:
+        ; Recover any pending TX error from a prior (early-start) transmission so an
+        ; underrun/jabber doesn't leave the transmitter stuck. Bounded loop -> safe on a
+        ; floating bus. DS = our segment here (stat_* and g_nic_io are addressable).
+        mov     dx, [g_nic_io]
+        add     dx, EL3_W1_TX_STATUS
+        mov     cx, 8
+.txs:   in      al, dx
+        or      al, al
+        jz      .txs_done
+        test    al, EL3_TXS_RESET_MASK
+        jz      .txs_pop
+        inc     word [stat_txunderrun]
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_TX_RESET
+        out     dx, ax
+        mov     ax, EL3_CMD_TX_ENABLE
+        out     dx, ax
+        mov     ax, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        out     dx, ax
+        pop     dx
+.txs_pop:
+        xor     al, al
+        out     dx, al                  ; pop this entry off the TX status stack
+        loop    .txs
+.txs_done:
         inc     word [stat_tx]
 %ifdef CFG_DEBUG
         mov     al, 'T'
@@ -184,6 +213,8 @@ f_get_statistics:
         mov     [pkt_stats + 16], ax          ; errors in
         mov     ax, [stat_rxdrop]
         mov     [pkt_stats + 24], ax          ; packets lost
+        mov     ax, [stat_txunderrun]
+        mov     [pkt_stats + 20], ax          ; errors out (TX underrun/jabber)
         mov     ax, cs
         mov     [bp + F_DS], ax
         mov     word [bp + F_SI], pkt_stats

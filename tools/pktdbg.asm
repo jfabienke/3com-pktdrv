@@ -94,6 +94,10 @@ start:
         call    pstr
         mov     ax, [es:bx + 24]
         call    hex16
+        mov     dx, msg_txund
+        call    pstr
+        mov     ax, [es:bx + 20]        ; errors_out = TX underrun/jabber recoveries
+        call    hex16
         call    crlf
 
         ; --- debug event log (vendor fn 0x7F; absent in release builds) ---
@@ -172,6 +176,7 @@ msg_in     db ' in=', '$'
 msg_out    db ' out=', '$'
 msg_err    db ' err=', '$'
 msg_lost   db ' lost=', '$'
+msg_txund  db ' txund=', '$'
 msg_log    db 'log: ', '$'
 nl         db 13, 10, '$'
 cur_int    db 0

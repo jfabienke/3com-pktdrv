@@ -61,5 +61,11 @@ el3_init:
         mov     ax, EL3_CMD_TX_ENABLE
         out     dx, ax
 
+        ; TX start threshold: begin transmitting once this many bytes are queued, so the
+        ; wire transmit overlaps the CPU's PIO fill (helps 286+ where the CPU outpaces the
+        ; wire; underruns recovered + counted in send_pkt).
+        mov     ax, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        out     dx, ax
+
         ; NOTE: SET_INTR_ENB is deferred to install (no ISR wired yet).
         ret

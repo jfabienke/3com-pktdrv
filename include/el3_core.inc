@@ -49,6 +49,16 @@ EL3_CMD_ACK_INTR        equ 0x6800
 EL3_CMD_SET_INTR_ENB    equ 0x7000
 EL3_CMD_SET_STATUS_ENB  equ 0x7800   ; which status bits are visible in the status register
 EL3_CMD_SET_RX_FILTER   equ 0x8000
+EL3_CMD_SET_TX_START    equ 0x9800   ; OR with the TX start threshold (bytes)
+
+; TX start threshold: bytes that must be queued before the card begins transmitting. Lower
+; = more overlap of the wire transmit with the CPU's PIO fill, but more underrun risk on a
+; slow CPU (recovered below, and counted). Tunable; a conservative default for the floor.
+EL3_TX_START_THRESH     equ 512
+
+; TX status (W1_TX_STATUS, a byte popped off a small stack)
+EL3_TXS_COMPLETE        equ 0x80     ; a TX status entry is present
+EL3_TXS_RESET_MASK      equ 0x30     ; underrun (0x10) | jabber (0x20) -> needs TxReset
 
 ; ---- status bits ----
 EL3_ST_INT_LATCH        equ 0x0001

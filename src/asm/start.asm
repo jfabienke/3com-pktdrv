@@ -131,6 +131,7 @@ stat_tx:        dw 0               ; packets transmitted
 stat_rxerr:     dw 0               ; RX errors (card-flagged)
 stat_rxdrop:    dw 0               ; RX dropped (no receiver / no buffer)
 stat_irq:       dw 0               ; NIC interrupts serviced
+stat_txunderrun: dw 0              ; TX underrun/jabber recoveries (early-start tuning)
 pkt_stats:      times 7 dd 0       ; Crynwr get_statistics struct (built on demand)
 
 %ifdef CFG_DEBUG
