@@ -8,16 +8,19 @@
 # Small memory model (-ms): one 64KB code + one 64KB data segment. Resident is the
 # JIT-emitted hot image (copied down); cold init/composer is reclaimed after install.
 
-CC      = wcc
-ASM     = wasm
-LINK    = wlink
+CC      = wcc       # Open Watcom C V2
+ASM     = nasm      # Netwide Assembler (NASM)
+LINK    = wlink     # Open Watcom linker
 BUILD   = build
 TARGET  = $(BUILD)/3cpd.exe
 
 # 8088-safe, small model. -0 = 8088 codegen (mandatory floor for all compiled code).
 #   -ms small model  -0 8088  -os size-opt  -zq quiet  -zp1 pack  -zu SS!=DS for TSR
 CFLAGS_BASE = -ms -0 -os -zq -zp1 -zu -wcd=201 -Iinclude -fr=$(BUILD)/
-AFLAGS_BASE = -0 -mt -zq
+# NASM -> 16-bit OMF for wlink. Per-file `CPU 8086`/`CPU 386` directives gate ISA usage;
+# floor/fragment sources MUST declare `CPU 8086`. Fragment palette also builds raw bins
+# (-f bin) embedded for the JIT composer (added when the palette lands).
+AFLAGS_BASE = -f obj -iinclude/
 
 # Profile selection sets feature macros; cold support for higher tiers is compiled out
 # of the minimal image.
@@ -95,7 +98,7 @@ $(TARGET): $(ALL_OBJS) 3cpd.lnk
     $(CC) $(CFLAGS) -fo=$@ $<
 
 .asm.obj:
-    $(ASM) $(AFLAGS) -fo=$@ $<
+    $(ASM) $(AFLAGS) $< -o $@
 
 clean: .SYMBOLIC
     @if exist $(BUILD)\*.obj del $(BUILD)\*.obj
