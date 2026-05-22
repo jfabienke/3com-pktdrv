@@ -212,8 +212,13 @@ global resident_end
         cmp     al, 'q'
         je      .opt_irq
         cmp     al, '8'
-        jne     .st_next
+        jne     .chk_gen
         mov     byte [g_force8], 1  ; force 8-bit byte-loop datapath (test the 8088 fragment)
+        jmp     .st_next
+.chk_gen:
+        cmp     al, '5'
+        jne     .st_next
+        mov     byte [g_nic_gen], 1 ; /5 -> Corkscrew (3C515): EEPROM +0x2000, W1 base +0x10
 .st_next:
         inc     si
         jmp     .scan_tail
