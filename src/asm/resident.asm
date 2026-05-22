@@ -190,7 +190,7 @@ f_send_pkt:
         ; Recover any pending TX error from a prior (early-start) transmission so an
         ; underrun/jabber doesn't leave the transmitter stuck. Bounded loop -> safe on a
         ; floating bus. DS = our segment here (stat_* and g_nic_io are addressable).
-        mov     dx, [g_nic_io]
+        mov     dx, [g_w1_base]
         add     dx, EL3_W1_TX_STATUS
         mov     cx, 8
 .txs:   in      al, dx
@@ -206,7 +206,7 @@ f_send_pkt:
         out     dx, ax
         mov     ax, EL3_CMD_TX_ENABLE
         out     dx, ax
-        mov     ax, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        mov     ax, [g_tx_start]              ; per-generation TX-start (early vs store-forward)
         out     dx, ax
         pop     dx
 .txs_pop:
@@ -221,7 +221,7 @@ f_send_pkt:
         ; Bounded so a wedged card can't hang the caller; a timeout is counted, not fatal. ---
         mov     bx, [bp + F_CX]
         add     bx, 4
-        mov     dx, [g_nic_io]
+        mov     dx, [g_w1_base]
         add     dx, EL3_W1_TX_FREE
         xor     cx, cx                  ; 65536-spin ceiling
 .txfree:

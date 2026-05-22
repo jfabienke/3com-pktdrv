@@ -14,8 +14,9 @@ cpu 8086
 bits 16
 
 %include "codegen.inc"
-; EL3 register constants are pulled per-generation by the probe (el3_probe.asm includes
-; el3_tomahawk.inc -> el3_core.inc); start.asm proper needs none directly.
+; Shared EL3 register constants (guarded; also pulled by the probe). build_plan needs them
+; to compute the per-generation Window-1 base + TX-start command.
+%include "el3_core.inc"
 
 ;==============================================================================
 ; DATA (initialized) -- fragment palette, plan template
@@ -70,7 +71,7 @@ msg_inst    db 13, 10, 'INSTALLED: INT 60h, IRQ vec=0x', '$'
 segment _BSS public class=BSS use16
 
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
-                resb 1
+g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1 = Corkscrew (3C515)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
 
@@ -81,6 +82,16 @@ g_step:         resw 1
 g_imm0:         resw 1
 g_curid:        resb 1
                 resb 1
+
+%ifdef CFG_PNP
+; ISA PnP isolation scratch (cold)
+pnp_lfsr:       resb 1          ; running isolation checksum LFSR
+pnp_saw:        resb 1          ; a card drove the bus (0x55AA seen)
+pnp_next_csn:   resb 1          ; next CSN to hand out
+pnp_found_csn:  resb 1          ; CSN of the matched 3Com card
+pnp_id:         resb 9          ; isolated serial id: vendor[2] product[2] serial[4] csum[1]
+                resb 1          ; pad to even
+%endif
 
 ;==============================================================================
 ; STACK -- COLD: the composer/init working stack (reclaimed; the ISR uses isr_stack).
@@ -107,8 +118,10 @@ segment _TEXT public class=CODE use16
 %include "resident.asm"             ; pkt_handler (INT 60h API)
 %include "isr.asm"                  ; nic_isr (RX + receiver upcall)
 
-g_nic_io:       resw 1              ; detected I/O base
+g_nic_io:       resw 1              ; detected I/O base (command reg at +0x0E, windowed cfg at +0x00..)
 g_nic_irq:      resw 1              ; detected IRQ
+g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
+g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE
@@ -131,7 +144,7 @@ irq_vec:        resb 1             ; computed NIC IRQ vector number
 
 g_off:          resw FRAG__COUNT   ; emitted-fragment offsets (handler/ISR call via these)
 g_isr_busy:     resb 1             ; ISR reentrancy guard
-                resb 1
+isr_work:       resb 1             ; per-interrupt RX work cap counter (MAX_RX_WORK down to 0)
 isr_save_ss:    resw 1             ; interrupted task's SS:SP (private-stack switch)
 isr_save_sp:    resw 1
 isr_stack:      resb 128           ; the ISR's private stack
@@ -146,6 +159,7 @@ stat_rxdrop:    dw 0               ; RX dropped (no receiver / no buffer)
 stat_irq:       dw 0               ; NIC interrupts serviced
 stat_txunderrun: dw 0              ; TX underrun/jabber recoveries (early-start tuning)
 stat_txwait:    dw 0               ; TX FIFO-room waits that timed out (fast-CPU stall)
+stat_adapterfail: dw 0            ; adapter-failure RX-engine resets (ISR self-heal)
 pkt_stats:      times 7 dd 0       ; Crynwr get_statistics struct (built on demand)
 
 %ifdef CFG_DEBUG
@@ -232,10 +246,18 @@ global resident_end
         rep     movsb
         clc
 %else
-        call    detect_nic          ; native 3Com ID-port (Tomahawk) -> g_nic_io/irq/mac
 %ifdef CFG_PNP
-        jnc     .nic_found          ; native found a card
-        call    detect_nic_pnp      ; else (full profile) try ISA PnP (cache-kit isapnp)
+        ; >=286 (16-bit ISA): try ISA PnP first -- it finds a 3C515 AND a PnP-mode 3C509B --
+        ; then fall back to the legacy ID-port. On an 8088 a 3C515 can't exist (16-bit card)
+        ; so we go straight to the legacy probe and skip the PnP subsystem entirely.
+        cmp     byte [g_cpu_class], CPU_8088
+        jbe     .legacy_only
+        call    detect_nic_pnp      ; direct ISA PnP isolation -> g_nic_io/irq/mac
+        jnc     .nic_found
+.legacy_only:
+        call    detect_nic          ; legacy 3Com ID-port (Tomahawk)
+%else
+        call    detect_nic          ; floor: native 3Com ID-port (Tomahawk) only
 %endif
 %endif
         jc      .nic_none           ; no card found
@@ -252,8 +274,8 @@ global resident_end
         mov     dx, msg_crlf
         call    print_str
 
-        call    el3_init            ; bring the activated card to operational state
-        call    build_plan          ; copy io_base into the plan's PIO steps
+        call    build_plan          ; per-gen Window-1 base + TX-start cmd + PIO immediates
+        call    el3_init            ; bring the activated card to operational state (uses g_tx_start)
 
         call    compose_resident    ; ax = emitted length, fills resident_image + g_off
         or      ax, ax
@@ -397,16 +419,32 @@ phase_validate_dma:
 ; el3_init -- operational bring-up of the activated card (MAC, media, RX/TX enable).
 %include "el3_init.asm"
 
+%ifdef CFG_PNP
+; detect_nic_pnp -- direct ISA PnP isolation (3C515 / PnP-mode 3C509B). >=286-gated by caller.
+%include "isapnp.asm"
+%endif
+
 ; install -- hook INT 60h + NIC IRQ, enable card int, free environment, DOS TSR-keep.
 %include "install.asm"
 
 ;------------------------------------------------------------------------------
-; build_plan -- the HAL hands the composer the NIC's immediates: io_base into the PIO
-; datapath steps. (Equivalent of the old c509b_emit_plan.)
+; build_plan -- resolve the per-generation hardware parameters and hand the composer its
+; immediates. Two generation-dependent values: the Window-1 register base (3C509 at io_base,
+; Corkscrew at io_base+0x10) and the SET_TX_START command (3C509 early-start vs 3C515
+; store-and-forward). The PIO datapath FIFO immediate is the Window-1 base.
 ;------------------------------------------------------------------------------
 build_plan:
-        mov     ax, [g_nic_io]
-        mov     [g_plan_rx_imm], ax
+        mov     ax, EL3_W1_DELTA_3C509                       ; default: 3C509/B layout
+        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        cmp     byte [g_nic_gen], 0
+        je      .gen_done
+        mov     ax, EL3_W1_DELTA_VORTEX                      ; 3C515: registers relocated +0x10
+        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_THRESH_SF  ; 3C515: store-and-forward
+.gen_done:
+        add     ax, [g_nic_io]
+        mov     [g_w1_base], ax             ; Window-1 data-register base (FIFO/status/free)
+        mov     [g_tx_start], bx            ; precomputed SET_TX_START command
+        mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
         mov     [g_plan_tx_imm], ax
         ret
 

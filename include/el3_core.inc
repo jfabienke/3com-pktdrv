@@ -54,7 +54,20 @@ EL3_CMD_SET_TX_START    equ 0x9800   ; OR with the TX start threshold (bytes)
 ; TX start threshold: bytes that must be queued before the card begins transmitting. Lower
 ; = more overlap of the wire transmit with the CPU's PIO fill, but more underrun risk on a
 ; slow CPU (recovered below, and counted). Tunable; a conservative default for the floor.
-EL3_TX_START_THRESH     equ 512
+EL3_TX_START_THRESH     equ 512      ; early-start (overlap, low latency) -- 3C509/B @ 10 Mbit
+; Store-and-forward: a threshold above the max frame so the card never early-starts -- it
+; transmits only once the whole frame is buffered, with the CPU already done, so underrun is
+; impossible at ANY link speed. Mandatory where the wire can out-drain PIO fill (e.g. a 3C515
+; at 100 Mbit: ~12.5 MB/s wire vs ~2-4 MB/s ISA PIO). The 8 KB 3C515 FIFO is sized for this.
+EL3_TX_THRESH_SF        equ 1536
+
+; Window-1 register relocation across the lineage. On the 3C509/B the FIFO/status/free block
+; is window-relative at +0x00; the Vortex generation (3C515 "Corkscrew" onward) moved it to a
+; window-INDEPENDENT bank at +0x10 (which is also why the I/O extent grew 16 -> 32). The
+; command/status register (0x0E) and the windowed config registers (Window 0/2/4) are
+; unchanged. Applied per detected generation: g_w1_base = io_base + this delta.
+EL3_W1_DELTA_3C509      equ 0x00
+EL3_W1_DELTA_VORTEX     equ 0x10
 
 ; TX status (W1_TX_STATUS, a byte popped off a small stack)
 EL3_TXS_COMPLETE        equ 0x80     ; a TX status entry is present
@@ -62,6 +75,7 @@ EL3_TXS_RESET_MASK      equ 0x30     ; underrun (0x10) | jabber (0x20) -> needs 
 
 ; ---- status bits ----
 EL3_ST_INT_LATCH        equ 0x0001
+EL3_ST_ADAPTER_FAILURE  equ 0x0002   ; RX engine wedged -> needs RX_RESET (ISR self-heals)
 EL3_ST_TX_COMPLETE      equ 0x0004
 EL3_ST_RX_COMPLETE      equ 0x0010
 EL3_ST_CMD_BUSY         equ 0x1000
@@ -90,6 +104,12 @@ EL3_MEDIA_JABBER_ENABLE equ 0x0040   ; enable 10BaseT jabber guard
 
 ; ---- EEPROM (shared word layout + read opcode) ----
 EL3_EE_READ             equ 0x80     ; OR with word addr to issue a read
+; EEPROM access through a card already at a fixed I/O base (Window 0) -- used after a PnP
+; card is activated, where the ID-port read path no longer applies. Write (0x80|addr) to the
+; command register, poll the busy bit clear, then read the 16-bit word from the data register.
+EL3_W0_EE_CMD           equ 0x0A     ; Window 0 EEPROM command register
+EL3_W0_EE_DATA          equ 0x0C     ; Window 0 EEPROM data register
+EL3_EE_BUSY             equ 0x8000   ; command register busy bit (clear when read done)
 EL3_EE_ADDR0            equ 0        ; station address words 0..2 (big-endian)
 EL3_EE_ADDR1            equ 1
 EL3_EE_ADDR2            equ 2

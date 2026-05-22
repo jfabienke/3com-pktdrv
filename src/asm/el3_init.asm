@@ -61,11 +61,48 @@ el3_init:
         mov     ax, EL3_CMD_TX_ENABLE
         out     dx, ax
 
-        ; TX start threshold: begin transmitting once this many bytes are queued, so the
-        ; wire transmit overlaps the CPU's PIO fill (helps 286+ where the CPU outpaces the
-        ; wire; underruns recovered + counted in send_pkt).
-        mov     ax, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        ; TX start threshold (precomputed per generation in build_plan): 3C509/B early-start
+        ; for overlap/latency; 3C515 store-and-forward (the wire can out-drain PIO fill).
+        mov     ax, [g_tx_start]
         out     dx, ax
 
         ; NOTE: SET_INTR_ENB is deferred to install (no ISR wired yet).
+        ret
+
+;------------------------------------------------------------------------------
+; el3_load_mac_io -- read the station MAC (EEPROM words 0..2, big-endian) into g_mac through
+; the Window 0 EEPROM interface of a card already activated at g_nic_io. The 3C509 ID-port
+; path reads the MAC during contention; the PnP path has no ID port, so it reads here after
+; activation, before el3_init writes it back to Window 2. Clobbers AX, BX, CX, DX, SI, DI.
+;------------------------------------------------------------------------------
+el3_load_mac_io:
+        mov     bx, [g_nic_io]
+        mov     dx, bx
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W0_SETUP
+        out     dx, ax
+        xor     di, di                     ; EEPROM word index 0..2
+        xor     si, si                     ; byte offset into g_mac
+.macw:
+        mov     dx, bx
+        add     dx, EL3_W0_EE_CMD
+        mov     ax, di
+        or      ax, EL3_EE_READ            ; 0x80 | word addr -> issue read
+        out     dx, ax
+        mov     cx, 0                       ; bounded busy poll (~65536 spins)
+.busy:
+        in      ax, dx
+        test    ax, EL3_EE_BUSY
+        jz      .ready
+        loop    .busy
+.ready:
+        mov     dx, bx
+        add     dx, EL3_W0_EE_DATA
+        in      ax, dx                     ; AX = word (AH = first MAC byte, big-endian)
+        mov     [g_mac + si], ah
+        mov     [g_mac + si + 1], al
+        add     si, 2
+        inc     di
+        cmp     di, 3
+        jb      .macw
         ret

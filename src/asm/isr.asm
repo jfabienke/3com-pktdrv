@@ -11,6 +11,12 @@
 
 %include "el3_core.inc"
 
+; Per-interrupt RX work cap: process at most this many frames per ISR entry, then yield. A
+; sustained RX flood keeps RX_COMPLETE asserted, so the still-pending IRQ re-fires and the
+; next batch runs -- no frame loss, but the foreground app isn't starved. 32 covers a full
+; 8 KB FIFO of minimum-size frames.
+MAX_RX_WORK     equ 32
+
 nic_isr:
         push    ax
         push    bx
@@ -36,6 +42,7 @@ nic_isr:
         jne     .eoi
         inc     byte [g_isr_busy]
         inc     word [stat_irq]
+        mov     byte [isr_work], MAX_RX_WORK   ; bound RX frames processed this entry
 %ifdef CFG_DEBUG
         ; visible heartbeat: cycle the top-left text cell on every serviced interrupt
         push    es
@@ -51,10 +58,12 @@ nic_isr:
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         in      ax, dx                  ; adapter status
+        test    ax, EL3_ST_ADAPTER_FAILURE
+        jnz     .adapter_fail
         test    ax, EL3_ST_RX_COMPLETE
         jz      .recv_done
 
-        mov     dx, [g_nic_io]
+        mov     dx, [g_w1_base]
         add     dx, EL3_W1_RX_STATUS
         in      ax, dx                  ; RX status: length + flags
         test    ah, 0x80                ; RX_INCOMPLETE (0x8000)
@@ -69,7 +78,7 @@ nic_isr:
 
         ; --- read the 14-byte header into hdr_buf (byte reads; even count keeps the
         ;     FIFO word-aligned for the payload drain) ---
-        mov     dx, [g_nic_io]          ; io_base + EL3_W1_RX_FIFO (0)
+        mov     dx, [g_w1_base]         ; Window-1 base = RX FIFO (FIFO is at +0 of the W1 block)
         mov     di, hdr_buf
         mov     cx, 14
 .hdr:   in      al, dx
@@ -139,12 +148,22 @@ nic_isr:
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_RX_DISCARD
         out     dx, ax
+        dec     byte [isr_work]
+        jz      .recv_done              ; per-interrupt cap hit -> yield; pending IRQ re-fires
         jmp     .recv_loop
 
 .rxerr:
         inc     word [stat_rxerr]
 %ifdef CFG_DEBUG
+        ; AX still holds the RX status. Log 'E' then the raw 3-bit error sub-code (bits 11-13).
+        ; Logging raw bits avoids a hard-coded per-generation error map (the 3C515 PIO sub-code
+        ; location is unconfirmed) -- classify offline from real-hardware logs.
         mov     al, 'E'
+        call    dbg_logb                ; dbg_logb preserves AX (AH still = RX status hi byte)
+        mov     cl, 11
+        shr     ax, cl                  ; bits 11-13 -> low 3 bits
+        and     al, 7
+        add     al, '0'
         call    dbg_logb
 %endif
         jmp     .discard
@@ -155,6 +174,19 @@ nic_isr:
         call    dbg_logb
 %endif
         jmp     .discard
+
+.adapter_fail:
+        ; RX engine wedged -> self-heal: RxReset, re-apply the RX filter (RxReset clears it),
+        ; re-enable the receiver. DX is the command reg (set in .recv_loop; generation-agnostic).
+        inc     word [stat_adapterfail]
+        mov     ax, EL3_CMD_RX_RESET
+        out     dx, ax
+        call    isr_wait_cmd            ; RxReset is slow -> bounded poll on CmdInProgress
+        mov     ax, EL3_CMD_SET_RX_FILTER | EL3_RXF_STATION | EL3_RXF_BROADCAST
+        out     dx, ax
+        mov     ax, EL3_CMD_RX_ENABLE
+        out     dx, ax
+        jmp     .recv_done             ; ack + EOI; a real frame re-fires the IRQ
 
 .recv_done:
         mov     dx, [g_nic_io]
@@ -183,3 +215,19 @@ nic_isr:
         pop     bx
         pop     ax
         iret
+
+;------------------------------------------------------------------------------
+; isr_wait_cmd -- bounded poll on CmdInProgress (EL3_ST_CMD_BUSY) after a slow command.
+; in: DX = command/status register. Clobbers AX (CX preserved). Bounded so a wedged card
+; can't hang the ISR.
+;------------------------------------------------------------------------------
+isr_wait_cmd:
+        push    cx
+        xor     cx, cx                  ; 65536-spin ceiling
+.wc:    in      ax, dx
+        test    ax, EL3_ST_CMD_BUSY
+        jz      .wc_done
+        loop    .wc
+.wc_done:
+        pop     cx
+        ret

@@ -38,7 +38,9 @@ $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
 
 $(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.asm &
                      src/asm/resident.asm src/asm/isr.asm src/asm/install.asm &
+                     src/asm/isapnp.asm &
                      include/codegen.inc include/el3_tomahawk.inc include/el3_core.inc &
+                     include/el3_corkscrew.inc &
                      $(BUILD)/frags_asm.inc
     $(ASM) $(AFLAGS) src/asm/start.asm -o $@
 
@@ -61,6 +63,16 @@ debug: .SYMBOLIC
 debugfake: .SYMBOLIC
     @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
     $(MAKE) DEFS="-dCFG_DEBUG -dCFG_FAKENIC" all
+
+# pnp: full profile -- adds the direct ISA PnP probe (3C515 Corkscrew / PnP-mode 3C509B),
+# tried before the legacy ID-port on >=286. debugpnp adds the instrumentation on top.
+pnp: .SYMBOLIC
+    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    $(MAKE) DEFS=-dCFG_PNP all
+
+debugpnp: .SYMBOLIC
+    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    $(MAKE) DEFS="-dCFG_DEBUG -dCFG_PNP" all
 
 clean: .SYMBOLIC
     @if exist $(BUILD)\*.obj del $(BUILD)\*.obj
