@@ -72,6 +72,9 @@ segment _BSS public class=BSS use16
 
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
 g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1 = Corkscrew (3C515)
+g_manual:       resb 1          ; 1 = manual /b= I/O base given -> skip the ID-port probe
+g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit byte-loop) datapath
+tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
 
@@ -183,24 +186,49 @@ global resident_end
         mov     es, ax              ; composer uses ES:DI for the emit destination
         mov     [psp_seg], bp
 
-        ; --- command tail scan: "/u" -> uninstall the resident driver and exit ---
+        ; --- command tail scan ---
+        ;   /u        uninstall the resident driver and exit
+        ;   /b=NNN    manual I/O base (hex) -> skip the ID-port probe, attach at NNN
+        ;   /q=NN     manual IRQ (decimal)  -> used with /b=
+        ; Manual config lets the driver bind to a card at a known base (PnP-only cards, odd
+        ; setups, or an emulator) without the ID-port contention.
         mov     es, bp              ; ES = PSP for the tail scan
-        mov     cl, [es:0x80]       ; command-tail length
-        xor     ch, ch
-        jcxz    .not_uninstall
+        mov     al, [es:0x80]       ; command-tail length
+        xor     ah, ah
+        add     ax, 0x81            ; AX = end offset
+        mov     [tail_end], ax
         mov     si, 0x81
 .scan_tail:
+        cmp     si, [tail_end]
+        jae     .args_done
         cmp     byte [es:si], '/'
         jne     .st_next
         mov     al, [es:si + 1]
         or      al, 0x20            ; tolower
         cmp     al, 'u'
+        je      do_uninstall
+        cmp     al, 'b'
+        je      .opt_base
+        cmp     al, 'q'
+        je      .opt_irq
+        cmp     al, '8'
         jne     .st_next
-        jmp     do_uninstall
+        mov     byte [g_force8], 1  ; force 8-bit byte-loop datapath (test the 8088 fragment)
 .st_next:
         inc     si
-        loop    .scan_tail
-.not_uninstall:
+        jmp     .scan_tail
+.opt_base:
+        add     si, 3               ; skip "/b="
+        call    parse_hex16         ; ES:SI -> hex -> BX, SI advanced
+        mov     [g_nic_io], bx
+        mov     byte [g_manual], 1
+        jmp     .scan_tail
+.opt_irq:
+        add     si, 3               ; skip "/q="
+        call    parse_dec16         ; ES:SI -> decimal -> BX, SI advanced
+        mov     [g_nic_irq], bx
+        jmp     .scan_tail
+.args_done:
         mov     ax, DGROUP
         mov     es, ax              ; restore ES = DGROUP for the composer
 
@@ -212,6 +240,10 @@ global resident_end
 %endif
 
         call    detect_cpu          ; -> g_cpu_class
+        cmp     byte [g_force8], 0  ; /8 -> force the 8088-class datapath (test 8-bit PIO on a fast CPU)
+        je      .cpu_ok
+        mov     byte [g_cpu_class], CPU_8088
+.cpu_ok:
         mov     dx, msg_cpu
         call    print_str
         mov     al, [g_cpu_class]
@@ -246,6 +278,17 @@ global resident_end
         rep     movsb
         clc
 %else
+        ; manual config (/b= given): skip the ID-port probe, attach at the specified base.
+        cmp     byte [g_manual], 1
+        jne     .auto_detect
+        cmp     word [g_nic_irq], 0
+        jne     .have_irq
+        mov     word [g_nic_irq], 0x000A    ; default IRQ 10 if /q= omitted
+.have_irq:
+        call    el3_load_mac_io             ; read MAC via Window-0 EEPROM at the given base
+        clc
+        jmp     .nic_found
+.auto_detect:
 %ifdef CFG_PNP
         ; >=286 (16-bit ISA): try ISA PnP first -- it finds a 3C515 AND a PnP-mode 3C509B --
         ; then fall back to the legacy ID-port. On an 8088 a 3C515 can't exist (16-bit card)
@@ -614,4 +657,54 @@ print_mac:                              ; " MAC=" + g_mac[0..5] as hex
         call    print_hex8
         pop     cx
         loop    .pm
+        ret
+
+;------------------------------------------------------------------------------
+; parse_hex16 / parse_dec16 -- read a number from the command tail (ES:SI), stopping at the
+; first non-digit. out: BX = value, SI advanced past the digits. Clobbers AX, CX (and DX/dec).
+;------------------------------------------------------------------------------
+parse_hex16:
+        xor     bx, bx
+.ph:    mov     al, [es:si]
+        cmp     al, '0'
+        jb      .ph_done
+        cmp     al, '9'
+        jbe     .ph_d09
+        or      al, 0x20                ; tolower
+        cmp     al, 'a'
+        jb      .ph_done
+        cmp     al, 'f'
+        ja      .ph_done
+        sub     al, 'a' - 10            ; 'a'..'f' -> 10..15
+        jmp     .ph_acc
+.ph_d09:
+        sub     al, '0'                 ; '0'..'9' -> 0..9
+.ph_acc:
+        mov     cl, 4
+        shl     bx, cl                  ; bx *= 16
+        xor     ah, ah
+        add     bx, ax
+        inc     si
+        jmp     .ph
+.ph_done:
+        ret
+
+parse_dec16:
+        xor     bx, bx
+.pd:    mov     al, [es:si]
+        cmp     al, '0'
+        jb      .pd_done
+        cmp     al, '9'
+        ja      .pd_done
+        sub     al, '0'
+        mov     cx, bx                  ; bx = bx*10 + digit  (10x = ((4x)+x)*2)
+        shl     bx, 1
+        shl     bx, 1
+        add     bx, cx
+        shl     bx, 1
+        xor     ah, ah
+        add     bx, ax
+        inc     si
+        jmp     .pd
+.pd_done:
         ret
