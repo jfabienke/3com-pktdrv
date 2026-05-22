@@ -78,6 +78,8 @@ nic_isr:
 
         ; --- read the 14-byte header into hdr_buf (byte reads; even count keeps the
         ;     FIFO word-aligned for the payload drain) ---
+        push    ds
+        pop     es                      ; ES = DS = our segment, so stosb targets hdr_buf
         mov     dx, [g_w1_base]         ; Window-1 base = RX FIFO (FIFO is at +0 of the W1 block)
         mov     di, hdr_buf
         mov     cx, 14
