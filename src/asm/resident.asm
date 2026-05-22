@@ -215,6 +215,22 @@ f_send_pkt:
         loop    .txs
 .txs_done:
         inc     word [stat_tx]
+        ; --- wait for FIFO room before bursting. With early-start enabled the card may still
+        ; be draining a prior frame; a fast 286+ doing `rep outsw` can outrun a 2 KB FIFO
+        ; (an 8088 loop never does). Require TxFree >= length + 4 (the 2 preamble words).
+        ; Bounded so a wedged card can't hang the caller; a timeout is counted, not fatal. ---
+        mov     bx, [bp + F_CX]
+        add     bx, 4
+        mov     dx, [g_nic_io]
+        add     dx, EL3_W1_TX_FREE
+        xor     cx, cx                  ; 65536-spin ceiling
+.txfree:
+        in      ax, dx
+        cmp     ax, bx
+        jae     .txready
+        loop    .txfree
+        inc     word [stat_txwait]      ; FIFO never freed in time (card stalled)
+.txready:
 %ifdef CFG_DEBUG
         mov     al, 'T'
         call    dbg_logb

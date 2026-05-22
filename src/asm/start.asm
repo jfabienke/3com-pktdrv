@@ -145,6 +145,7 @@ stat_rxerr:     dw 0               ; RX errors (card-flagged)
 stat_rxdrop:    dw 0               ; RX dropped (no receiver / no buffer)
 stat_irq:       dw 0               ; NIC interrupts serviced
 stat_txunderrun: dw 0              ; TX underrun/jabber recoveries (early-start tuning)
+stat_txwait:    dw 0               ; TX FIFO-room waits that timed out (fast-CPU stall)
 pkt_stats:      times 7 dd 0       ; Crynwr get_statistics struct (built on demand)
 
 %ifdef CFG_DEBUG
@@ -204,15 +205,14 @@ global resident_end
         call    print_char          ; CPU class digit (0=8088,1=286,2=386)
 
         ; --- 5150 short-circuit -------------------------------------------------
-        ; On an 8088/8086 the DMA capability axis collapses to PIO: no protected mode,
-        ; no >1 MB / XMS, no bus-master, no VMM. So we skip the entire test-before-trust
-        ; and environment machinery (busmaster test, cache-coherency tier, VDS/V86 probe,
-        ; PCI/EISA/MCA/PCMCIA bus probers) and take the floor path straight to the PIO
-        ; compose. On >=286 those cold phases run (added as the ladder is climbed).
+        ; On an 8088/8086 the capability axis collapses to PIO: no protected mode, no
+        ; bus-master, no VMM. The >=286-only cold work (bus-master DMA validation and its
+        ; VDS/cache machinery) is deferred to the Corkscrew generation, so today both paths
+        ; fall straight through to the floor PIO compose. The split is kept as the documented
+        ; hook for that >=286 work.
         cmp     byte [g_cpu_class], CPU_8088
         jbe     .floor
-        call    phase_platform_probe    ; (>=286) V86/VDS/memory tiers      [stub]
-        call    phase_validate_dma      ; (>=286) busmaster test + cache    [stub]
+        call    phase_validate_dma      ; (>=286) bus-master DMA validation -- deferred to Corkscrew
 .floor:
         ; ISA NIC detection. The native 3Com ID-port sequence is the universal EtherLink III
         ; ISA mechanism and runs on ANY CPU -- it's just port I/O. ISA PnP is a SEPARATE
@@ -382,10 +382,12 @@ detect_cpu:
         cpu 8086                    ; restore floor-safety check for the rest of the file
 
 ;------------------------------------------------------------------------------
-; phase stubs (>=286 cold phases; real logic lands as the ladder is climbed)
+; phase_validate_dma (>=286 cold phase) -- DEFERRED to the 3C515 (Corkscrew) generation.
+; The 3C509 (Tomahawk) is pure PIO: no bus-master, so there is no DMA engine to test and no
+; cache-coherency / VDS bounce-buffer concern. The test-before-trust DMA validation (the
+; cache-kit NC-region / cache-flush lift) -- plus the V86/protected-mode detection it needs
+; (V86 is 386+-only, so gated there, not here) -- lands when the bus-master ring datapath does.
 ;------------------------------------------------------------------------------
-phase_platform_probe:
-        ret
 phase_validate_dma:
         ret
 
