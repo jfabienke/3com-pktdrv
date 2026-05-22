@@ -73,7 +73,12 @@ el3_init:
 ; el3_load_mac_io -- read the station MAC (EEPROM words 0..2, big-endian) into g_mac through
 ; the Window 0 EEPROM interface of a card already activated at g_nic_io. The 3C509 ID-port
 ; path reads the MAC during contention; the PnP path has no ID port, so it reads here after
-; activation, before el3_init writes it back to Window 2. Clobbers AX, BX, CX, DX, SI, DI.
+; activation, before el3_init writes it back to Window 2.
+;
+; Generation-aware: the 3C515 (Corkscrew) relocated the EEPROM registers to the +0x2000 ISA
+; alias (cmd io+0x200A, data +2), vs the 3C509's io+0x0A/0x0C (Linux 3c515 + iPXE). A fixed
+; io_delay (~300 us > the 162 us read latency) covers both, sidestepping the differing busy
+; bit. Cold. Clobbers AX, BX, CX, DX, SI, DI, BP.
 ;------------------------------------------------------------------------------
 el3_load_mac_io:
         mov     bx, [g_nic_io]
@@ -81,23 +86,23 @@ el3_load_mac_io:
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W0_SETUP
         out     dx, ax
+        mov     bp, EL3_W0_EE_CMD          ; 3C509: EEPROM cmd at io+0x0A
+        cmp     byte [g_nic_gen], 0
+        je      .eeoff
+        mov     bp, EL3_CS_W0_EE_CMD       ; 3C515: io+0x200A (the +0x2000 ISA alias)
+.eeoff:
         xor     di, di                     ; EEPROM word index 0..2
         xor     si, si                     ; byte offset into g_mac
 .macw:
         mov     dx, bx
-        add     dx, EL3_W0_EE_CMD
+        add     dx, bp                     ; EEPROM command register
         mov     ax, di
         or      ax, EL3_EE_READ            ; 0x80 | word addr -> issue read
         out     dx, ax
-        mov     cx, 0                       ; bounded busy poll (~65536 spins)
-.busy:
-        in      ax, dx
-        test    ax, EL3_EE_BUSY
-        jz      .ready
-        loop    .busy
-.ready:
+        call    io_delay                   ; fixed wait > 162 us EEPROM read latency
         mov     dx, bx
-        add     dx, EL3_W0_EE_DATA
+        add     dx, bp
+        add     dx, 2                      ; data register = command + 2
         in      ax, dx                     ; AX = word (AH = first MAC byte, big-endian)
         mov     [g_mac + si], ah
         mov     [g_mac + si + 1], al

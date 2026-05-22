@@ -86,10 +86,22 @@ EL3_W1_RX_FIFO          equ 0x00
 EL3_W1_RX_STATUS        equ 0x08
 EL3_W1_TX_STATUS        equ 0x0B
 EL3_W1_TX_FREE          equ 0x0C
+; Vortex/Corkscrew only: a dedicated RX error-cause register, W1-base-relative +0x04 (= the
+; 3C515's io+0x14). The 3C509 has no such register -- its error code is in RxStatus bits 11-13.
+EL3_W1_RX_ERRORS        equ 0x04
 
 EL3_RX_INCOMPLETE       equ 0x8000
 EL3_RX_ERROR            equ 0x4000
+; RX length field: 11-bit on the 3C509, 13-bit (0x1FFF) on the 3C515. 0x07FF is correct for
+; both with standard Ethernet (max 1514 < 2047); the wider 3C515 field only matters for the
+; FDDI/jumbo frames we don't support, so one mask serves both.
 EL3_RX_LEN_MASK         equ 0x07FF
+; 3C515 RxErrors register bits (read as a byte from EL3_W1_RX_ERRORS):
+EL3_RXERR_OVERRUN       equ 0x01
+EL3_RXERR_LENGTH        equ 0x02
+EL3_RXERR_FRAME         equ 0x04
+EL3_RXERR_CRC           equ 0x08
+EL3_RXERR_DRIBBLE       equ 0x10
 
 EL3_RXF_STATION         equ 0x01
 EL3_RXF_BROADCAST       equ 0x04
@@ -107,9 +119,13 @@ EL3_EE_READ             equ 0x80     ; OR with word addr to issue a read
 ; EEPROM access through a card already at a fixed I/O base (Window 0) -- used after a PnP
 ; card is activated, where the ID-port read path no longer applies. Write (0x80|addr) to the
 ; command register, poll the busy bit clear, then read the 16-bit word from the data register.
-EL3_W0_EE_CMD           equ 0x0A     ; Window 0 EEPROM command register
-EL3_W0_EE_DATA          equ 0x0C     ; Window 0 EEPROM data register
+EL3_W0_EE_CMD           equ 0x0A     ; Window 0 EEPROM command register (3C509)
+EL3_W0_EE_DATA          equ 0x0C     ; Window 0 EEPROM data register (3C509)
 EL3_EE_BUSY             equ 0x8000   ; command register busy bit (clear when read done)
+; The 3C515 (Corkscrew) relocated the Window-0 EEPROM to the +0x2000 ISA alias (cmd at
+; io+0x200A, data = cmd+2). Verified against the Linux 3c515 driver + iPXE. (We poll a fixed
+; io_delay rather than the busy bit, so the differing busy-bit position doesn't matter.)
+EL3_CS_W0_EE_CMD        equ 0x200A   ; 3C515 EEPROM command register (data at +2 = 0x200C)
 EL3_EE_ADDR0            equ 0        ; station address words 0..2 (big-endian)
 EL3_EE_ADDR1            equ 1
 EL3_EE_ADDR2            equ 2

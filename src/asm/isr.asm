@@ -155,15 +155,30 @@ nic_isr:
 .rxerr:
         inc     word [stat_rxerr]
 %ifdef CFG_DEBUG
-        ; AX still holds the RX status. Log 'E' then the raw 3-bit error sub-code (bits 11-13).
-        ; Logging raw bits avoids a hard-coded per-generation error map (the 3C515 PIO sub-code
-        ; location is unconfirmed) -- classify offline from real-hardware logs.
+        ; Log 'E' then the RX error cause as one hex nibble. The cause source differs by
+        ; generation (confirmed vs the Linux 3c515 driver): the 3C509 keeps it in RxStatus bits
+        ; 11-13; the 3C515 has a dedicated RxErrors register (W1 base +0x04 = io+0x14). The ISR
+        ; is resident (g_nic_gen is cold/reclaimed), so tell them apart by g_w1_base != g_nic_io.
         mov     al, 'E'
-        call    dbg_logb                ; dbg_logb preserves AX (AH still = RX status hi byte)
-        mov     cl, 11
-        shr     ax, cl                  ; bits 11-13 -> low 3 bits
+        call    dbg_logb                ; dbg_logb preserves AX (AH still = RX status)
+        mov     bx, [g_w1_base]
+        cmp     bx, [g_nic_io]
+        jne     .err_corkscrew
+        mov     cl, 11                  ; 3C509: RxStatus bits 11-13
+        shr     ax, cl
         and     al, 7
-        add     al, '0'
+        jmp     .err_emit
+.err_corkscrew:
+        mov     dx, bx
+        add     dx, EL3_W1_RX_ERRORS    ; 3C515: dedicated RxErrors register
+        in      al, dx
+        and     al, 0x0F                ; over/length/frame/crc (dribble 0x10 dropped)
+.err_emit:
+        add     al, '0'                 ; nibble -> hex char
+        cmp     al, '9'
+        jbe     .err_log
+        add     al, 7
+.err_log:
         call    dbg_logb
 %endif
         jmp     .discard
