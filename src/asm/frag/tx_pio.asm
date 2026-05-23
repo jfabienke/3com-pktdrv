@@ -38,7 +38,15 @@ cpu 8086
         out     dx, ax
         loop    .r1
 .tail:  test    bx, 1           ; odd trailing byte?
-        jz      .done
+        jz      .padchk
         lodsb
         out     dx, al
+.padchk:                        ; FIFO is dword-oriented: pad data to a 4-byte boundary
+        mov     cx, bx
+        neg     cx
+        and     cx, 3           ; CX = pad bytes = (-length) & 3  (0..3)
+        jcxz    .done
+        xor     al, al
+.pad:   out     dx, al          ; preamble length is unchanged, so the card ignores these
+        loop    .pad
 .done:  ret

@@ -16,10 +16,18 @@ cpu 286
         out     dx, ax
         xor     ax, ax
         out     dx, ax          ; second preamble word
-        mov     bx, cx          ; BX = byte count (odd-byte tail)
+        mov     bx, cx          ; BX = byte count (odd-byte tail + pad)
         shr     cx, 1           ; CX = word count
         rep     outsw           ; burst the frame to the TX FIFO
         test    bx, 1
-        jz      .done
+        jz      .padchk
         outsb                   ; odd trailing byte
+.padchk:                        ; FIFO is dword-oriented: pad data to a 4-byte boundary
+        mov     cx, bx
+        neg     cx
+        and     cx, 3           ; CX = pad bytes = (-length) & 3  (0..3)
+        jcxz    .done
+        xor     al, al
+.pad:   out     dx, al          ; preamble length is unchanged, so the card ignores these
+        loop    .pad
 .done:  ret
