@@ -31,7 +31,7 @@ FRAG_SRC = &
 
 # ---- targets ----
 
-all: .SYMBOLIC $(TARGET)
+all: .SYMBOLIC $(TARGET) $(BUILD)/blast.com
 
 $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
     python3 tools/mkfrag.py
@@ -46,6 +46,11 @@ $(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.as
 
 $(TARGET) : $(BUILD)/start.obj 3cpd.lnk
     $(LINK) @3cpd.lnk
+
+# blast.com -- raw-frame TX throughput probe (flat .COM, no link). Used by the host
+# flood-matrix harness with filter-dump for ground-truth datapath throughput.
+$(BUILD)/blast.com : tools/blast.asm
+    $(ASM) -f bin tools/blast.asm -o $@
 
 # fakenic: test build that skips the probe (no emulator has a 3C509) so the install +
 # resident handler are exercisable in dosbox-x. Forces a recompile with -dCFG_FAKENIC.
@@ -79,4 +84,5 @@ clean: .SYMBOLIC
     @if exist $(BUILD)\*.bin del $(BUILD)\*.bin
     @if exist $(BUILD)\frags_asm.inc del $(BUILD)\frags_asm.inc
     @if exist $(TARGET) del $(TARGET)
+    @if exist $(BUILD)\blast.com del $(BUILD)\blast.com
     @if exist $(BUILD)\3cpd.map del $(BUILD)\3cpd.map
