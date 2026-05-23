@@ -38,11 +38,30 @@ start:
         int     0x21
         ret
 .found:
-        ; --- fill the source MAC (get_address, fn 6) ---
+        ; --- register a handle (access_type, fn 2). 3Com's own driver requires a handle before
+        ; get_address/send; Crynwr tolerates its absence. Match all Ethernet types (CX=0) and
+        ; point the receiver upcall at a drop stub (TX-only tool). ---
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+        mov     ah, 2
+        mov     al, 1                   ; interface class = 1 (DIX/Blue Book Ethernet)
+        mov     bx, 0xFFFF              ; interface type = any
+        mov     dl, 0                   ; interface number 0
+        xor     si, si                  ; DS:SI = type template (unused with CX=0)
+        xor     cx, cx                  ; type length 0 = match all
+        mov     di, receiver            ; ES:DI = receiver upcall
+        int     0x60
+        jc      .noacc
+        mov     [handle], ax
+.noacc:
+        ; --- fill the source MAC (get_address, fn 6, with the handle) ---
         push    cs
         pop     es
         mov     di, frame + 6
         mov     cx, 6
+        mov     bx, [handle]
         mov     ah, 6
         int     0x60
 
@@ -110,12 +129,21 @@ crlf:   mov     dx, nl
         int     0x21
         ret
 
+; packet-driver receiver upcall (FAR). AX=0: request buffer -> return ES:DI=0:0 to drop the
+; packet (this is a TX-only probe). AX=1: packet delivered (nothing to do). Driver far-calls it.
+receiver:
+        xor     ax, ax
+        mov     es, ax
+        mov     di, ax                  ; ES:DI = 0:0 -> driver discards inbound packets
+        retf
+
 sig         db 'PKT DRVR'
 msg_none    db 'no packet driver', 13, 10, '$'
 msg_frames  db 'FRAMES=', '$'
 msg_len     db ' LEN=', '$'
 nl          db 13, 10, '$'
 cur_int     db 0
+handle      dw 0
 start_tick  dw 0
 count       dw 0, 0
 frame:      times 6 db 0xFF             ; dst = broadcast
