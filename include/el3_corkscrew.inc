@@ -34,11 +34,27 @@ EL3_PNP_DEV_3C515TXEU   equ 0x5053   ; TCM5053  3c515-TX (EU)
 
 EL3_IO_EXTENT_CORKSCREW equ 32       ; I/O port range per NIC (vs 16 on the 3C509)
 
-; ---- bus-master DMA register block (base+0x400) -- RESERVED for the bus-master milestone.
-; Untouched in PIO mode; listed so the future ring datapath has the map in one place.
-EL3_CS_DMA_BASE         equ 0x400    ; DMA register window offset from io_base
-EL3_CS_DOWN_LIST_PTR    equ 0x404    ; TX descriptor list pointer
-EL3_CS_UP_LIST_PTR      equ 0x418    ; RX descriptor list pointer
+; ---- bus-master DMA register block. On the Corkscrew (and the whole 3c59x family) the master
+; registers sit right after the windowed block at base+0x20..0x3F (so the real I/O extent is
+; 0x40, not 0x20). Offsets per the 3Com/Linux 3c515 map. Untouched in PIO mode.
+EL3_CS_DMA_BASE         equ 0x20     ; bus-master register block offset from io_base
+EL3_CS_DOWN_LIST_PTR    equ 0x24     ; TX descriptor list pointer (32-bit; two 16-bit OUTs at 0x24/0x26)
+EL3_CS_UP_LIST_PTR      equ 0x38     ; RX descriptor list pointer
+
+; ---- bus-master commands (high 5 bits select, low 11 = param; see EL3_CMD encoding).
+; StartDma is cmd 0x14 (<<11 = 0xA000): param != 0 -> down (TX), param 0 -> up (RX).
+EL3_CMD_START_DMA_DOWN  equ 0xA001   ; kick the down (TX) descriptor at DownListPtr
+EL3_CMD_START_DMA_UP    equ 0xA000   ; kick the up (RX) descriptor at UpListPtr
+
+; ---- down/up descriptor (16 bytes, little-endian). Matches the emulator EL3DownDesc:
+;   +0 next_desc (0 = single transfer)  +4 status  +8 buffer phys  +12 length
+EL3_DESC_NEXT           equ 0
+EL3_DESC_STATUS         equ 4
+EL3_DESC_ADDR           equ 8
+EL3_DESC_LEN            equ 12
+EL3_DESC_SIZE           equ 16
+EL3_DESC_DN_COMPLETE    equ 0x4000   ; card sets this in status when the down transfer is done
+EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 
 ; ---- Window 3 MAC control (Corkscrew has it; PIO floor leaves duplex at default) ----
 EL3_CS_W3_MAC_CTRL      equ 0x06     ; Window 3 MAC control register

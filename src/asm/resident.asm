@@ -215,6 +215,12 @@ f_send_pkt:
         loop    .txs
 .txs_done:
         inc     word [stat_tx]
+        cmp     byte [g_use_dma], 0     ; bus-master single-transfer TX path (3C515, >=286)?
+        je      .tx_pio
+        call    dma_tx_single           ; zero-copy DMA straight from the caller's buffer
+        clc
+        ret
+.tx_pio:
         ; --- wait for FIFO room before bursting. With early-start enabled the card may still
         ; be draining a prior frame; a fast 286+ doing `rep outsw` can outrun a 2 KB FIFO
         ; (an 8088 loop never does). Require TxFree >= length + 4 (the 2 preamble words).
@@ -244,6 +250,69 @@ f_send_pkt:
         push    cs
         pop     ds
         clc
+        ret
+
+;------------------------------------------------------------------------------
+; dma_tx_single -- bus-master single-transfer TX (3C515 Corkscrew, >=286 real mode).
+; Builds the one-entry down descriptor pointing straight at the caller's packet (zero copy),
+; writes DownListPtr, kicks StartDmaDown, polls the descriptor's DN_COMPLETE.
+; Enter: DS = CS (resident), bp -> INT 60h frame (F_DS:F_SI = packet, F_CX = length).
+; Both the descriptor and the caller's buffer live <1 MB, so phys = seg*16 + off is 24-bit safe.
+; Clobbers ax,bx,cx,dx. Leaves DS = CS.
+;------------------------------------------------------------------------------
+dma_tx_single:
+        ; caller buffer physical address (F_DS:F_SI) -> dx:ax
+        mov     bx, [bp + F_DS]
+        mov     ax, bx
+        mov     cl, 4
+        shl     ax, cl                  ; ax = low 16 of (seg << 4)
+        mov     dx, bx
+        mov     cl, 12
+        shr     dx, cl                  ; dx = high 4 of (seg << 4)
+        add     ax, [bp + F_SI]
+        adc     dx, 0                   ; dx:ax = phys(buffer)
+        mov     [dma_desc + EL3_DESC_ADDR], ax
+        mov     [dma_desc + EL3_DESC_ADDR + 2], dx
+        ; next = 0 (single transfer), status = 0, length high = 0
+        xor     ax, ax
+        mov     [dma_desc + EL3_DESC_NEXT], ax
+        mov     [dma_desc + EL3_DESC_NEXT + 2], ax
+        mov     [dma_desc + EL3_DESC_STATUS], ax
+        mov     [dma_desc + EL3_DESC_STATUS + 2], ax
+        mov     [dma_desc + EL3_DESC_LEN + 2], ax
+        mov     ax, [bp + F_CX]         ; length (<= 1514 -> fits the 13-bit field)
+        mov     [dma_desc + EL3_DESC_LEN], ax
+        ; descriptor physical address (CS:dma_desc) -> dx:ax
+        mov     bx, cs
+        mov     ax, bx
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, bx
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, dma_desc
+        adc     dx, 0                   ; dx:ax = phys(descriptor)
+        ; DownListPtr <- descriptor phys: two 16-bit OUTs (io+0x404 low, io+0x406 high)
+        push    dx                      ; save high word
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax                  ; low word
+        pop     ax                      ; high word -> ax
+        add     dx, 2
+        out     dx, ax                  ; high word
+        ; kick StartDmaDown (cmd 0x14, param != 0)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_DOWN
+        out     dx, ax
+        ; poll DN_COMPLETE in the descriptor status (bounded; the model completes synchronously)
+        xor     cx, cx                  ; 65536-spin ceiling
+.dma_poll:
+        test    word [dma_desc + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        jnz     .dma_done
+        loop    .dma_poll
+        inc     word [stat_txwait]      ; DMA never completed in time (counted, not fatal)
+.dma_done:
         ret
 
 ;--- 6: get_address -- copy our MAC to the caller's ES:DI, return CX = length ---

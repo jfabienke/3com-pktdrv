@@ -17,6 +17,9 @@ bits 16
 ; Shared EL3 register constants (guarded; also pulled by the probe). build_plan needs them
 ; to compute the per-generation Window-1 base + TX-start command.
 %include "el3_core.inc"
+; Corkscrew (3C515) delta: bus-master DMA register block + descriptor layout (guarded; also
+; pulled by isapnp). The resident TX DMA path + the dma_desc reservation need these.
+%include "el3_corkscrew.inc"
 
 ;==============================================================================
 ; DATA (initialized) -- fragment palette, plan template
@@ -74,6 +77,7 @@ g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
 g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1 = Corkscrew (3C515)
 g_manual:       resb 1          ; 1 = manual /b= I/O base given -> skip the ID-port probe
 g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit byte-loop) datapath
+g_want_dma:     resb 1          ; 1 = /d given -> request bus-master TX DMA (resolved in build_plan)
 tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
@@ -125,6 +129,12 @@ g_nic_io:       resw 1              ; detected I/O base (command reg at +0x0E, w
 g_nic_irq:      resw 1              ; detected IRQ
 g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
 g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
+g_use_dma:      resb 1             ; 1 = bus-master single-transfer TX path active (3C515, >=286)
+                resb 1             ; pad to even
+; bus-master single-transfer TX descriptor (resident -> conventional mem, card can DMA-read it).
+; dword-aligned; layout matches the emulator EL3DownDesc (next/status/addr/length).
+                alignb 4
+dma_desc:       resb EL3_DESC_SIZE
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE
@@ -212,8 +222,13 @@ global resident_end
         cmp     al, 'q'
         je      .opt_irq
         cmp     al, '8'
-        jne     .chk_gen
+        jne     .chk_dma
         mov     byte [g_force8], 1  ; force 8-bit byte-loop datapath (test the 8088 fragment)
+        jmp     .st_next
+.chk_dma:
+        cmp     al, 'd'
+        jne     .chk_gen
+        mov     byte [g_want_dma], 1 ; /d -> request bus-master TX DMA (gated to 3C515 + >=286)
         jmp     .st_next
 .chk_gen:
         cmp     al, '5'
@@ -494,6 +509,16 @@ build_plan:
         mov     [g_tx_start], bx            ; precomputed SET_TX_START command
         mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
         mov     [g_plan_tx_imm], ax
+        ; --- resolve bus-master single-transfer TX DMA: /d AND 3C515 AND >=286 (else PIO floor) ---
+        mov     byte [g_use_dma], 0
+        cmp     byte [g_want_dma], 0
+        je      .dma_resolved
+        cmp     byte [g_nic_gen], 1             ; Corkscrew (3C515) only -- has the bus-master engine
+        jne     .dma_resolved
+        cmp     byte [g_cpu_class], CPU_80286   ; >=286: real mode, phys = seg*16+off, 24-bit ISA-safe
+        jb      .dma_resolved
+        mov     byte [g_use_dma], 1
+.dma_resolved:
         ret
 
 ;------------------------------------------------------------------------------
