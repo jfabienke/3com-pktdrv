@@ -259,7 +259,9 @@ f_send_pkt:
 ; g_tx_done before returning -- so the caller can't reuse/free the buffer while the card is
 ; still DMAing from it (the old bounded DN_COMPLETE spin could falsely time out and return
 ; early once the transfer is rate-paced). INT 60h is entered with IF=0, so we sti/hlt to let
-; the NIC IRQ fire and yield the CPU we just offloaded, then restore cli.
+; the NIC IRQ fire and yield the CPU we just offloaded, then restore cli. The wait is bounded
+; by ELAPSED time (BIOS tick), not wakeup count, so RX interrupts during a TX flood can't make
+; it bail before completion.
 ; Enter: DS = CS (resident), bp -> INT 60h frame (F_DS:F_SI = packet, F_CX = length).
 ; Both the descriptor and the caller's buffer live <1 MB, so phys = seg*16 + off is 24-bit safe.
 ; Clobbers ax,bx,cx,dx. Leaves DS = CS, IF = 0.
@@ -310,16 +312,23 @@ dma_tx_single:
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_START_DMA_DOWN
         out     dx, ax
-        ; IRQ-driven wait: the TxComplete ISR sets g_tx_done. sti/hlt yields until an interrupt
-        ; (the NIC IRQ on a healthy transfer, the timer otherwise -> the loop is bounded so a
-        ; wedged card escapes instead of hanging).
-        mov     cx, EL3_DMA_TX_WAIT
+        ; IRQ-driven wait: the TxComplete ISR sets g_tx_done. sti/hlt yields until an interrupt;
+        ; spurious wakeups (RX during a TX flood) just re-loop -- the timeout is ELAPSED BIOS
+        ; ticks, not a wakeup count, so only a wedged card escapes.
+        xor     ax, ax
+        mov     es, ax                  ; ES = 0 -> BIOS data area (frame restores ES on iret)
+        mov     bx, [es:BIOS_TICK_COUNT]    ; start tick
 .dma_wait:
         cmp     byte [g_tx_done], 0
         jne     .dma_done
+        mov     ax, [es:BIOS_TICK_COUNT]
+        sub     ax, bx                  ; elapsed ticks
+        cmp     ax, EL3_DMA_TX_TICKS
+        jae     .dma_timeout
         sti                             ; (sti has a 1-instr delay: no IRQ between sti and hlt)
         hlt
-        loop    .dma_wait
+        jmp     .dma_wait
+.dma_timeout:
         inc     word [stat_txwait]      ; no TxComplete in time (wedged card) -- counted, not fatal
 .dma_done:
         cli                             ; restore the INT 60h handler's IF=0 invariant

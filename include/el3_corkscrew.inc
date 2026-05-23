@@ -56,11 +56,13 @@ EL3_DESC_SIZE           equ 16
 EL3_DESC_DN_COMPLETE    equ 0x4000   ; card sets this in status when the down transfer is done
 EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 
-; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done.
-; Each hlt yields until the next interrupt (the >=18.2 Hz timer guarantees progress), so a
-; healthy transfer wakes on its own NIC IRQ in well under one tick; this many ticks is the
-; ceiling that lets a wedged card escape (~8 * 55 ms) instead of hanging the caller forever.
-EL3_DMA_TX_WAIT         equ 8
+; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done,
+; bounded by ELAPSED time via the BIOS 18.2 Hz tick (0040:006C) -- NOT by a wakeup count, since
+; RX (TCP-ACK) interrupts during a TX flood would otherwise drain a small spin budget and bail
+; before TxComplete. A healthy transfer's drain IRQ fires in well under one tick; this many
+; ticks is just the wedged-card escape (~9 * 55 ms) so the caller can't hang forever.
+EL3_DMA_TX_TICKS        equ 9
+BIOS_TICK_COUNT         equ 0x046C   ; 0040:006C -- low word of the BIOS timer-tick counter
 
 ; ---- Window 3 MAC control (Corkscrew has it; PIO floor leaves duplex at default) ----
 EL3_CS_W3_MAC_CTRL      equ 0x06     ; Window 3 MAC control register
