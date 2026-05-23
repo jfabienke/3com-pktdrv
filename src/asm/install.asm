@@ -60,10 +60,14 @@ install:
         and     al, 0xFB
         out     0x21, al
 .pic_done:
-        ; --- enable the card's RX-complete interrupt (card left in Window 1 by el3_init) ---
+        ; --- enable the card's interrupts (card left in Window 1 by el3_init) ---
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH
+        cmp     byte [g_use_dma], 0     ; bus-master TX completes via TxComplete IRQ
+        je      .intr_set
+        or      ax, EL3_ST_TX_COMPLETE
+.intr_set:
         out     dx, ax
         mov     ax, EL3_CMD_SET_STATUS_ENB | 0x00FF
         out     dx, ax

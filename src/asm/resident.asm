@@ -255,10 +255,14 @@ f_send_pkt:
 ;------------------------------------------------------------------------------
 ; dma_tx_single -- bus-master single-transfer TX (3C515 Corkscrew, >=286 real mode).
 ; Builds the one-entry down descriptor pointing straight at the caller's packet (zero copy),
-; writes DownListPtr, kicks StartDmaDown, polls the descriptor's DN_COMPLETE.
+; writes DownListPtr, kicks StartDmaDown, then waits IRQ-driven for the TxComplete ISR to flag
+; g_tx_done before returning -- so the caller can't reuse/free the buffer while the card is
+; still DMAing from it (the old bounded DN_COMPLETE spin could falsely time out and return
+; early once the transfer is rate-paced). INT 60h is entered with IF=0, so we sti/hlt to let
+; the NIC IRQ fire and yield the CPU we just offloaded, then restore cli.
 ; Enter: DS = CS (resident), bp -> INT 60h frame (F_DS:F_SI = packet, F_CX = length).
 ; Both the descriptor and the caller's buffer live <1 MB, so phys = seg*16 + off is 24-bit safe.
-; Clobbers ax,bx,cx,dx. Leaves DS = CS.
+; Clobbers ax,bx,cx,dx. Leaves DS = CS, IF = 0.
 ;------------------------------------------------------------------------------
 dma_tx_single:
         ; caller buffer physical address (F_DS:F_SI) -> dx:ax
@@ -300,19 +304,25 @@ dma_tx_single:
         pop     ax                      ; high word -> ax
         add     dx, 2
         out     dx, ax                  ; high word
-        ; kick StartDmaDown (cmd 0x14, param != 0)
+        ; arm completion, then kick StartDmaDown (cmd 0x14, param != 0)
+        mov     byte [g_tx_done], 0     ; cleared with IF=0, so the ISR can't race ahead
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_START_DMA_DOWN
         out     dx, ax
-        ; poll DN_COMPLETE in the descriptor status (bounded; the model completes synchronously)
-        xor     cx, cx                  ; 65536-spin ceiling
-.dma_poll:
-        test    word [dma_desc + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
-        jnz     .dma_done
-        loop    .dma_poll
-        inc     word [stat_txwait]      ; DMA never completed in time (counted, not fatal)
+        ; IRQ-driven wait: the TxComplete ISR sets g_tx_done. sti/hlt yields until an interrupt
+        ; (the NIC IRQ on a healthy transfer, the timer otherwise -> the loop is bounded so a
+        ; wedged card escapes instead of hanging).
+        mov     cx, EL3_DMA_TX_WAIT
+.dma_wait:
+        cmp     byte [g_tx_done], 0
+        jne     .dma_done
+        sti                             ; (sti has a 1-instr delay: no IRQ between sti and hlt)
+        hlt
+        loop    .dma_wait
+        inc     word [stat_txwait]      ; no TxComplete in time (wedged card) -- counted, not fatal
 .dma_done:
+        cli                             ; restore the INT 60h handler's IF=0 invariant
         ret
 
 ;--- 6: get_address -- copy our MAC to the caller's ES:DI, return CX = length ---

@@ -58,6 +58,10 @@ nic_isr:
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         in      ax, dx                  ; adapter status
+        test    ax, EL3_ST_TX_COMPLETE  ; bus-master TX DMA done -> flag send_pkt's IRQ wait
+        jz      .no_txdone
+        mov     byte [g_tx_done], 1
+.no_txdone:
         test    ax, EL3_ST_ADAPTER_FAILURE
         jnz     .adapter_fail
         test    ax, EL3_ST_RX_COMPLETE

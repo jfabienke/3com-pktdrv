@@ -130,7 +130,7 @@ g_nic_irq:      resw 1              ; detected IRQ
 g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
 g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
 g_use_dma:      resb 1             ; 1 = bus-master single-transfer TX path active (3C515, >=286)
-                resb 1             ; pad to even
+g_tx_done:      resb 1             ; set by the ISR on TxComplete; dma_tx_single waits on it
 ; bus-master single-transfer TX descriptor (resident -> conventional mem, card can DMA-read it).
 ; dword-aligned; layout matches the emulator EL3DownDesc (next/status/addr/length).
                 alignb 4
