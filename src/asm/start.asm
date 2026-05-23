@@ -194,6 +194,15 @@ global resident_end
         mov     ax, DGROUP
         mov     ds, ax
         mov     es, ax              ; composer uses ES:DI for the emit destination
+        ; Clear the cold parse/detect flags. They live in _BSS, which DOS does NOT zero on
+        ; .EXE load: a fresh boot happens to hand us zeroed memory, but a RELOAD (3cpd /u
+        ; then 3cpd again) lands in dirty freed memory -- a stale g_force8 there forces the
+        ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
+        cld
+        mov     di, g_cpu_class
+        mov     cx, 5               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_want_dma
+        xor     al, al
+        rep     stosb
         mov     [psp_seg], bp
 
         ; --- command tail scan ---
