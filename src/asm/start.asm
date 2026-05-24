@@ -134,15 +134,8 @@ g_use_dma:      resb 1             ; 1 = bus-master single-transfer TX path acti
 g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; dma_tx_single waits on it
-; bus-master single-transfer TX descriptor (resident -> conventional mem, card can DMA-read it).
-; dword-aligned; layout matches the emulator EL3DownDesc (next/status/addr/length).
-                alignb 4
-dma_desc:       resb EL3_DESC_SIZE
-; bus-master RX up-descriptor + landing buffer (resident conv mem; the card DMAs the frame into
-; rx_dma_buf and writes UP_COMPLETE|length into dma_updesc's status). Posted via post_rx_dma.
-                alignb 4
-dma_updesc:     resb EL3_DESC_SIZE
-rx_dma_buf:     resb RXDMA_BUFSZ
+; (the bus-master DMA structures -- dma_desc / dma_updesc / rx_dma_buf -- are placed LAST, just
+;  before resident_end, so the TSR drops their ~4.6 KB on the PIO floor; see resident_end_pio.)
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE
@@ -191,7 +184,22 @@ dbg_log_head:   dw 0               ; ring write index (wraps at DBG_LOG_SIZE)
 dbg_log:        times DBG_LOG_SIZE db 0
 %endif
 
-resident_end:                      ; <== TSR keep boundary
+; --- end of the always-resident (PIO floor) region. When the bus-master DMA path is inactive
+;     (g_use_dma == 0) the TSR keeps only up to here, reclaiming the DMA region below (~4.6 KB).
+resident_end_pio:
+global resident_end_pio
+
+; bus-master DMA structures -- kept ONLY when the DMA path is active. The PIO floor never touches
+; these (the ISR .rx_dma branch and the dma_tx_single TX path are gated on g_use_dma), so they
+; sit past resident_end_pio and are dropped from the resident image on the floor. dword-aligned;
+; descriptor layout matches the emulator EL3 Down/Up desc (next/status/addr/length).
+                alignb 4
+dma_desc:       resb EL3_DESC_SIZE ; single-transfer TX descriptor (card DMA-reads it)
+                alignb 4
+dma_updesc:     resb EL3_DESC_SIZE ; RX up-descriptor (card writes UP_COMPLETE|length); posted via post_rx_dma
+rx_dma_buf:     resb RXDMA_BUFSZ   ; RX-DMA landing buffer (covers FDDI-sized frames)
+
+resident_end:                      ; <== TSR keep boundary when DMA is active
 global resident_end
 
 ;==============================================================================

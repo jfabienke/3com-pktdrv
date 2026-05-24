@@ -2,8 +2,10 @@
 ;
 ; Follows the Crynwr/tail.asm discipline: save the previous INT 60h vector (for chaining /
 ; uninstall), install ours, free the environment block to reclaim memory, then DOS
-; terminate-and-stay-resident keeping the (tiny) image. Cold-section reclaim via copy-down
-; is a later optimization; the floor keeps the whole image (~2.5 KB).
+; terminate-and-stay-resident keeping PSP + the resident region only. The cold section
+; (probe / ISA-PnP / composer / init) is linked above resident_end and reclaimed by keeping
+; just ceil(resident_end/16)+PSP paragraphs -- currently ~6.4 KB resident (resident_end
+; 0x18bc; ~1.4 KB of cold code reclaimed). Copy-down interleaving could trim further later.
 
 install:
         ; save the previous owner of the packet interrupt
@@ -86,10 +88,15 @@ install:
         int     0x21
 
         ; terminate-and-stay-resident. Keep PSP + the RESIDENT region only (handler, ISR,
-        ; resident state, emitted datapath); the cold composer/probe/init above resident_end
-        ; is reclaimed. resident_end is the DGROUP-relative end of the resident region.
-        ;   paragraphs = PSP(0x10) + ceil(resident_end / 16)
-        mov     ax, resident_end
+        ; resident state, emitted datapath); the cold composer/probe/init is reclaimed. The
+        ; bus-master DMA region (dma_desc/dma_updesc/rx_dma_buf, ~4.6 KB) sits past
+        ; resident_end_pio and is kept ONLY when the DMA path is active -- the PIO floor drops it.
+        ;   paragraphs = PSP(0x10) + ceil(boundary / 16)
+        mov     ax, resident_end_pio            ; PIO floor: drop the unused bus-master DMA region
+        cmp     byte [g_use_dma], 0
+        je      .keep_calc
+        mov     ax, resident_end                ; DMA active: keep through rx_dma_buf
+.keep_calc:
         add     ax, 15
         mov     cl, 4
         shr     ax, cl
