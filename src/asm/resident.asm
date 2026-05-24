@@ -334,6 +334,57 @@ dma_tx_single:
         cli                             ; restore the INT 60h handler's IF=0 invariant
         ret
 
+;------------------------------------------------------------------------------
+; post_rx_dma -- (re)post the bus-master RX up-descriptor and arm StartDmaUp. Builds dma_updesc
+; pointing at rx_dma_buf (capacity RXDMA_BUFSZ), writes UpListPtr (two 16-bit OUTs at io+0x38/0x3A),
+; kicks StartDmaUp. The card DMAs the next received frame straight into rx_dma_buf and writes
+; UP_COMPLETE|length into the descriptor status. Enter DS=CS. Clobbers AX,BX,CX,DX. Used at install
+; and after each RX-DMA delivery in the ISR.
+;------------------------------------------------------------------------------
+post_rx_dma:
+        xor     ax, ax
+        mov     [dma_updesc + EL3_DESC_NEXT], ax
+        mov     [dma_updesc + EL3_DESC_NEXT + 2], ax
+        mov     [dma_updesc + EL3_DESC_STATUS], ax
+        mov     [dma_updesc + EL3_DESC_STATUS + 2], ax
+        ; addr = phys(rx_dma_buf) = cs*16 + offset
+        mov     bx, cs
+        mov     ax, bx
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, bx
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, rx_dma_buf
+        adc     dx, 0
+        mov     [dma_updesc + EL3_DESC_ADDR], ax
+        mov     [dma_updesc + EL3_DESC_ADDR + 2], dx
+        mov     word [dma_updesc + EL3_DESC_LEN], RXDMA_BUFSZ
+        mov     word [dma_updesc + EL3_DESC_LEN + 2], 0
+        ; UpListPtr <- phys(dma_updesc)
+        mov     bx, cs
+        mov     ax, bx
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, bx
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, dma_updesc
+        adc     dx, 0
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        ; StartDmaUp
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        ret
+
 ;--- 6: get_address -- copy our MAC to the caller's ES:DI, return CX = length ---
 f_get_address:
         mov     si, g_mac

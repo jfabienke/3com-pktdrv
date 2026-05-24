@@ -54,7 +54,9 @@ EL3_DESC_ADDR           equ 8
 EL3_DESC_LEN            equ 12
 EL3_DESC_SIZE           equ 16
 EL3_DESC_DN_COMPLETE    equ 0x4000   ; card sets this in status when the down transfer is done
+EL3_DESC_UP_COMPLETE    equ 0x4000   ; card sets this in status when the up (RX) transfer is done
 EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
+RXDMA_BUFSZ             equ 4608     ; resident RX-DMA landing buffer (covers FDDI-sized frames)
 
 ; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done,
 ; bounded by ELAPSED time via the BIOS 18.2 Hz tick (0040:006C) -- NOT by a wakeup count, since

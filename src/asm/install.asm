@@ -72,6 +72,13 @@ install:
         mov     ax, EL3_CMD_SET_STATUS_ENB | 0x00FF
         out     dx, ax
 
+        ; arm bus-master RX-DMA: post the up-descriptor + StartDmaUp so received frames are DMA'd
+        ; straight into rx_dma_buf (the ISR's .rx_dma path delivers them). DMA mode only.
+        cmp     byte [g_use_dma], 0
+        je      .no_rxdma
+        call    post_rx_dma
+.no_rxdma:
+
         ; free our environment block (PSP[2Ch] = environment segment)
         mov     es, [psp_seg]
         mov     es, [es:0x2C]

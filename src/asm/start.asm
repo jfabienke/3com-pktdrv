@@ -138,6 +138,11 @@ g_tx_done:      resb 1             ; set by the ISR on TxComplete; dma_tx_single
 ; dword-aligned; layout matches the emulator EL3DownDesc (next/status/addr/length).
                 alignb 4
 dma_desc:       resb EL3_DESC_SIZE
+; bus-master RX up-descriptor + landing buffer (resident conv mem; the card DMAs the frame into
+; rx_dma_buf and writes UP_COMPLETE|length into dma_updesc's status). Posted via post_rx_dma.
+                alignb 4
+dma_updesc:     resb EL3_DESC_SIZE
+rx_dma_buf:     resb RXDMA_BUFSZ
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE

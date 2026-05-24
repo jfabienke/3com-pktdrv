@@ -66,6 +66,8 @@ nic_isr:
         jnz     .adapter_fail
         test    ax, EL3_ST_RX_COMPLETE
         jz      .recv_done
+        cmp     byte [g_use_dma], 0
+        jne     .rx_dma                 ; bus-master RX-DMA: frame already in rx_dma_buf
 
         mov     dx, [g_w1_base]
         add     dx, EL3_W1_RX_STATUS
@@ -195,6 +197,75 @@ nic_isr:
         call    dbg_logb
 %endif
         jmp     .discard
+
+;--- bus-master RX-DMA delivery: the card has DMA'd the frame into rx_dma_buf and written
+;    UP_COMPLETE|length into dma_updesc. Demux + Crynwr two-call upcall (memcpy from rx_dma_buf
+;    instead of a PIO drain), then re-post (re-arm) + drain any frame that raced into the PIO FIFO.
+.rx_dma:
+        mov     ax, [dma_updesc + EL3_DESC_STATUS]
+        test    ax, EL3_DESC_UP_COMPLETE
+        jz      .rx_dma_rearm                   ; not complete -> re-arm (spurious / raced to PIO)
+        and     ax, [g_rx_len_mask]             ; received length
+        mov     [rx_len], ax
+        cmp     ax, 14
+        jb      .rx_dma_rearm                   ; runt -> drop, re-arm
+        push    ds
+        pop     es                              ; ES = DS = our segment
+        mov     si, rx_dma_buf
+        mov     di, hdr_buf
+        mov     cx, 14
+        rep     movsb                           ; header into hdr_buf for the demux
+        mov     ax, [hdr_buf + 12]              ; EtherType
+        mov     si, htable
+        mov     cx, MAX_HANDLES
+.rxd_scan:
+        cmp     word [si + 2], 0                ; recv_seg == 0 -> free slot
+        je      .rxd_next
+        cmp     word [si + 4], 0                ; type 0 -> match all
+        je      .rxd_hit
+        cmp     word [si + 4], ax
+        je      .rxd_hit
+.rxd_next:
+        add     si, HANDLE_SIZE
+        loop    .rxd_scan
+        jmp     .rx_dma_rearm                   ; no handler -> drop, re-arm
+.rxd_hit:
+        mov     [cur_handle], si
+        ; upcall 1: AX=0 request buffer; CX=len, BX=handle, ES:DI=0 -> ES:DI = app buffer (or 0:0)
+        xor     ax, ax
+        mov     es, ax
+        xor     di, di
+        mov     bx, si
+        mov     cx, [rx_len]
+        call far [bx]
+        mov     ax, es
+        or      ax, di
+        jz      .rx_dma_rearm                   ; null buffer -> drop, re-arm
+        mov     [appbuf_seg], es
+        mov     [appbuf_off], di
+        ; copy the whole frame rx_dma_buf -> app buffer (ES:DI), rx_len bytes
+        push    cs
+        pop     ds                              ; ensure DS = CS after the upcall
+        mov     si, rx_dma_buf
+        mov     cx, [rx_len]
+        rep     movsb
+        ; upcall 2: AX=1 deliver; DS:SI=buffer, CX=len, BX=handle
+        mov     si, [appbuf_off]
+        mov     cx, [rx_len]
+        mov     bx, [cur_handle]
+        mov     ax, 1
+        mov     ds, [appbuf_seg]
+        call far [cs:bx]
+        mov     ax, cs
+        mov     ds, ax                          ; restore DS = our segment
+        inc     word [stat_rx]
+.rx_dma_rearm:
+        call    post_rx_dma                     ; rebuild up-descriptor + StartDmaUp (re-arm)
+        mov     dx, [g_nic_io]                  ; drop any frame that raced into the PIO FIFO
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_RX_DISCARD
+        out     dx, ax
+        jmp     .recv_done
 
 .adapter_fail:
         ; RX engine wedged -> self-heal: RxReset, re-apply the RX filter (RxReset clears it),
