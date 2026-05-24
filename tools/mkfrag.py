@@ -44,6 +44,7 @@ FRAGS = [
     ("tx_pio.asm",    "FRAG_TX_PIO",       "CPU_8088",  1),
     ("rx_pio_286.asm", "FRAG_RX_PIO",      "CPU_80286", 1),  # 286+ (16-bit ISA): rep insw
     ("tx_pio_286.asm", "FRAG_TX_PIO",      "CPU_80286", 1),  # 286+ (16-bit ISA): rep outsw
+    ("rx_pio_386.asm", "FRAG_RX_PIO",      "CPU_80386", 1),  # 386+ : 32-bit rep insd (dword FIFO)
     ("tx_pio_386.asm", "FRAG_TX_PIO",      "CPU_80386", 1),  # 386+ : 32-bit rep outsd (dword FIFO)
 ]
 
