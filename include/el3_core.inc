@@ -93,8 +93,10 @@ EL3_W1_RX_ERRORS        equ 0x04
 EL3_RX_INCOMPLETE       equ 0x8000
 EL3_RX_ERROR            equ 0x4000
 ; RX length field: 11-bit on the 3C509, 13-bit (0x1FFF) on the 3C515. 0x07FF is correct for
-; both with standard Ethernet (max 1514 < 2047); the wider 3C515 field only matters for the
-; FDDI/jumbo frames we don't support, so one mask serves both.
+; both with standard Ethernet (max 1514 < 2047); the wider 13-bit field exists for FDDI-sized
+; large packets -- a hardware feature enabled via allowLargePackets in MacControl on the PCI/EISA
+; bus-master parts (<=4494 B; 3C515 unverified), which this driver deliberately does NOT enable
+; (Ethernet-only, like Linux 3c59x). So one mask serves both.
 EL3_RX_LEN_MASK         equ 0x07FF
 ; 3C515 RxErrors register bits (read as a byte from EL3_W1_RX_ERRORS):
 EL3_RXERR_OVERRUN       equ 0x01
