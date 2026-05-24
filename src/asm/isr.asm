@@ -75,7 +75,7 @@ nic_isr:
         test    ah, 0x40                ; RX_ERROR (0x4000)
         jnz     .rxerr
         mov     cx, ax
-        and     cx, EL3_RX_LEN_MASK     ; CX = packet length
+        and     cx, [g_rx_len_mask]     ; CX = packet length (0x07FF std / 0x1FFF large)
         mov     [rx_len], cx
         cmp     cx, 14                  ; runt: need a full Ethernet header to demux
         jb      .drop

@@ -78,6 +78,7 @@ g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1
 g_manual:       resb 1          ; 1 = manual /b= I/O base given -> skip the ID-port probe
 g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit byte-loop) datapath
 g_want_dma:     resb 1          ; 1 = /d given -> request bus-master TX DMA (resolved in build_plan)
+g_want_large:   resb 1          ; 1 = /j given -> request FDDI-sized large frames (gated to 3C515)
 tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
@@ -130,6 +131,8 @@ g_nic_irq:      resw 1              ; detected IRQ
 g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
 g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
 g_use_dma:      resb 1             ; 1 = bus-master single-transfer TX path active (3C515, >=286)
+g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
+g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; dma_tx_single waits on it
 ; bus-master single-transfer TX descriptor (resident -> conventional mem, card can DMA-read it).
 ; dword-aligned; layout matches the emulator EL3DownDesc (next/status/addr/length).
@@ -236,8 +239,13 @@ global resident_end
         jmp     .st_next
 .chk_dma:
         cmp     al, 'd'
-        jne     .chk_gen
+        jne     .chk_large
         mov     byte [g_want_dma], 1 ; /d -> request bus-master TX DMA (gated to 3C515 + >=286)
+        jmp     .st_next
+.chk_large:
+        cmp     al, 'j'
+        jne     .chk_gen
+        mov     byte [g_want_large], 1 ; /j -> request FDDI-sized large frames (gated to 3C515)
         jmp     .st_next
 .chk_gen:
         cmp     al, '5'
@@ -528,6 +536,18 @@ build_plan:
         jb      .dma_resolved
         mov     byte [g_use_dma], 1
 .dma_resolved:
+        ; --- resolve FDDI-sized large frames: /j AND 3C515 (else standard Ethernet). Sets the RX
+        ;     length mask to the 13-bit Corkscrew field so a >2047 B frame's length isn't truncated.
+        ;     el3_init sets allowLargePackets in MacControl when g_use_large. ---
+        mov     byte [g_use_large], 0
+        mov     word [g_rx_len_mask], 0x07FF     ; default: standard Ethernet (11-bit-safe)
+        cmp     byte [g_want_large], 0
+        je      .large_resolved
+        cmp     byte [g_nic_gen], 1              ; Corkscrew (3C515) only
+        jne     .large_resolved
+        mov     byte [g_use_large], 1
+        mov     word [g_rx_len_mask], 0x1FFF     ; 13-bit length field (FDDI-sized RX)
+.large_resolved:
         ret
 
 ;------------------------------------------------------------------------------

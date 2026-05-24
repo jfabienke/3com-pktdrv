@@ -67,5 +67,6 @@ BIOS_TICK_COUNT         equ 0x046C   ; 0040:006C -- low word of the BIOS timer-t
 ; ---- Window 3 MAC control (Corkscrew has it; PIO floor leaves duplex at default) ----
 EL3_CS_W3_MAC_CTRL      equ 0x06     ; Window 3 MAC control register
 EL3_CS_FULL_DUPLEX      equ 0x20     ; set = full duplex (optional; not set by the PIO floor)
+EL3_MAC_CTRL_ALLOW_LARGE equ 0x40    ; bit 6 = allowLargePackets: oversize at >=4491 B not 1515 (FDDI)
 
 %endif ; EL3_CORKSCREW_INC

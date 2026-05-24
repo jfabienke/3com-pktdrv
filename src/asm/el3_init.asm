@@ -43,6 +43,21 @@ el3_init:
         out     dx, ax
         pop     dx
 
+        ; --- large frames: set allowLargePackets in MacControl (Window 3, off 6, bit 6) so the MAC
+        ;     accepts FDDI-sized (<=4490 B excl FCS) RX instead of flagging oversize at 1518.
+        ;     3C515 only (gated in build_plan); MacControl is cleared on reset, so write just the bit.
+        cmp     byte [g_use_large], 0
+        je      .no_large
+        mov     ax, EL3_CMD_SELECT_WINDOW | 3        ; Window 3 (MAC control)
+        out     dx, ax
+        push    dx
+        mov     dx, bx
+        add     dx, EL3_CS_W3_MAC_CTRL               ; io_base + 0x06 = MacControl
+        mov     ax, EL3_MAC_CTRL_ALLOW_LARGE         ; bit 6 = allowLargePackets
+        out     dx, ax
+        pop     dx
+.no_large:
+
         ; --- operating: Window 1 (where the PIO datapath runs) ---
         mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W1_OPERATING
         out     dx, ax
