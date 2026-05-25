@@ -136,8 +136,8 @@ g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
 g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking TX ring (movsd copy); 0 = 286 -> blocking zero-copy single-transfer
-; (the bus-master DMA structures -- tx_descs / dma_updesc / rx_dma_buf / tx_slots -- are placed LAST,
-;  past resident_end_pio, so the TSR drops them on the PIO floor; the 286 path also drops tx_slots.)
+; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
+;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE
@@ -191,20 +191,17 @@ dbg_log:        times DBG_LOG_SIZE db 0
 resident_end_pio:
 global resident_end_pio
 
-; bus-master DMA structures -- kept ONLY when the DMA path is active. The PIO floor never touches
-; these (the ISR .rx_dma branch and the DMA TX paths are gated on g_use_dma), so they sit past
-; resident_end_pio and are dropped from the resident image on the floor. dword-aligned; descriptor
-; layout matches the emulator EL3 Down/Up desc (next/status/addr/length). tx_descs[0] doubles as the
-; 286 single-transfer down descriptor (the ring is 386+ only); the TX slots below the single boundary
+; bus-master TX-DMA structures -- kept ONLY when the DMA path is active (gated on g_use_dma), so
+; they sit past resident_end_pio and the PIO floor drops them. RX is always PIO (no RX-DMA buffer/
+; descriptor), so only the TX descriptors + ring slots live here. dword-aligned; descriptor layout
+; matches the emulator EL3 Down desc (next/status/addr/length). tx_descs[0] doubles as the 286
+; single-transfer down descriptor (the ring is 386+ only); the TX slots below the single boundary
 ; exist only for the 386+ ring, so the 286 path drops them too.
                 alignb 4
 tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-reads them); [0] also serves the 286 single-transfer
                 alignb 4
-dma_updesc:     resb EL3_DESC_SIZE ; RX up-descriptor (card writes UP_COMPLETE|length); posted via post_rx_dma
-rx_dma_buf:     resb RXDMA_BUFSZ   ; RX-DMA landing buffer (covers FDDI-sized frames)
-                alignb 4
 
-resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (no ring slots)
+resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (descriptors only)
 global resident_end_single
 
 tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ ring frame slots (dma_tx_enqueue copies the frame in)

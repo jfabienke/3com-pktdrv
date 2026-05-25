@@ -56,7 +56,6 @@ EL3_DESC_SIZE           equ 16
 EL3_DESC_DN_COMPLETE    equ 0x4000   ; card sets this in status when the down transfer is done
 EL3_DESC_UP_COMPLETE    equ 0x4000   ; card sets this in status when the up (RX) transfer is done
 EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
-RXDMA_BUFSZ             equ 4608     ; resident RX-DMA landing buffer (covers FDDI-sized frames)
 
 ; ---- non-blocking TX descriptor ring (software ring driven by single-transfer DMA + the
 ; TxComplete ISR). send_pkt copies the frame into a free slot and returns; the ISR frees the

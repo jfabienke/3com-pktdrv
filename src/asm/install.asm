@@ -74,15 +74,13 @@ install:
         mov     ax, EL3_CMD_SET_STATUS_ENB | 0x00FF
         out     dx, ax
 
-        ; arm bus-master DMA (DMA mode only): init the non-blocking TX ring, then post the RX
-        ; up-descriptor + StartDmaUp so received frames are DMA'd straight into rx_dma_buf.
+        ; arm bus-master TX DMA (386+ ring only): init the TX descriptors/slots. RX is PIO in all
+        ; modes (no RX-DMA arm) -- bidirectional RX-DMA dropped ACKs; see the ISR RX-COMPLETE path.
         cmp     byte [g_use_dma], 0
         je      .no_dma
         cmp     byte [g_tx_ring], 0
-        je      .skip_ringinit          ; 286 single-transfer: zero-copy, no ring slots to init
-        call    tx_ring_init
-.skip_ringinit:
-        call    post_rx_dma
+        je      .no_dma                 ; 286 single-transfer: nothing to arm (RX is PIO, no ring)
+        call    tx_ring_init            ; 386+ ring: init the TX descriptors/slots
 .no_dma:
 
         ; free our environment block (PSP[2Ch] = environment segment)
@@ -93,9 +91,9 @@ install:
 
         ; terminate-and-stay-resident. Keep PSP + the RESIDENT region only (handler, ISR,
         ; resident state, emitted datapath); the cold composer/probe/init is reclaimed. Three keep
-        ; boundaries: PIO floor (no DMA) drops the whole bus-master region; 286 single-transfer DMA
-        ; keeps tx_descs/dma_updesc/rx_dma_buf but drops the ring's TX slots (zero-copy, ~6 KB saved);
-        ; 386+ ring DMA keeps everything through the TX slots + ring vars.
+        ; boundaries: PIO floor (no DMA) drops the whole TX-DMA region; 286 single-transfer DMA keeps
+        ; only tx_descs and drops the ring's TX slots (zero-copy, ~6 KB saved); 386+ ring DMA keeps
+        ; everything through the TX slots + ring vars. (RX is PIO in all modes -- no RX-DMA buffer.)
         ;   paragraphs = PSP(0x10) + ceil(boundary / 16)
         mov     ax, resident_end_pio            ; PIO floor: drop the whole bus-master DMA region
         cmp     byte [g_use_dma], 0
