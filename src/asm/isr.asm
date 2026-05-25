@@ -58,9 +58,34 @@ nic_isr:
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         in      ax, dx                  ; adapter status
-        test    ax, EL3_ST_TX_COMPLETE  ; bus-master TX DMA done -> flag send_pkt's IRQ wait
+        test    ax, EL3_ST_TX_COMPLETE  ; bus-master TX DMA done
         jz      .no_txdone
-        mov     byte [g_tx_done], 1
+        cmp     byte [g_use_dma], 0
+        je      .no_txdone              ; PIO mode: no DMA (TxComplete just acked at .recv_done)
+        cmp     byte [g_tx_ring], 0
+        jne     .tx_ring_adv            ; 386+: advance the non-blocking TX ring
+        mov     byte [g_tx_done], 1     ; 286 single-transfer: flag dma_tx_single's blocking wait
+        jmp     .no_txdone
+.tx_ring_adv:
+        push    ax                      ; preserve adapter status (tx_kick clobbers ax)
+        cmp     word [tx_ring_count], 0
+        je      .tx_idle                ; spurious -- nothing queued
+        dec     word [tx_ring_count]    ; the tail slot's DMA finished
+        mov     ax, [tx_ring_tail]
+        inc     ax
+        cmp     ax, TX_RING_N
+        jb      .tx_twrap
+        xor     ax, ax
+.tx_twrap:
+        mov     [tx_ring_tail], ax
+        cmp     word [tx_ring_count], 0
+        je      .tx_idle                ; ring drained
+        call    tx_kick                 ; more queued -> start the next slot's DMA
+        jmp     .tx_acpop
+.tx_idle:
+        mov     byte [tx_dma_busy], 0
+.tx_acpop:
+        pop     ax                      ; restore adapter status
 .no_txdone:
         test    ax, EL3_ST_ADAPTER_FAILURE
         jnz     .adapter_fail

@@ -74,12 +74,16 @@ install:
         mov     ax, EL3_CMD_SET_STATUS_ENB | 0x00FF
         out     dx, ax
 
-        ; arm bus-master RX-DMA: post the up-descriptor + StartDmaUp so received frames are DMA'd
-        ; straight into rx_dma_buf (the ISR's .rx_dma path delivers them). DMA mode only.
+        ; arm bus-master DMA (DMA mode only): init the non-blocking TX ring, then post the RX
+        ; up-descriptor + StartDmaUp so received frames are DMA'd straight into rx_dma_buf.
         cmp     byte [g_use_dma], 0
-        je      .no_rxdma
+        je      .no_dma
+        cmp     byte [g_tx_ring], 0
+        je      .skip_ringinit          ; 286 single-transfer: zero-copy, no ring slots to init
+        call    tx_ring_init
+.skip_ringinit:
         call    post_rx_dma
-.no_rxdma:
+.no_dma:
 
         ; free our environment block (PSP[2Ch] = environment segment)
         mov     es, [psp_seg]
@@ -88,14 +92,18 @@ install:
         int     0x21
 
         ; terminate-and-stay-resident. Keep PSP + the RESIDENT region only (handler, ISR,
-        ; resident state, emitted datapath); the cold composer/probe/init is reclaimed. The
-        ; bus-master DMA region (dma_desc/dma_updesc/rx_dma_buf, ~4.6 KB) sits past
-        ; resident_end_pio and is kept ONLY when the DMA path is active -- the PIO floor drops it.
+        ; resident state, emitted datapath); the cold composer/probe/init is reclaimed. Three keep
+        ; boundaries: PIO floor (no DMA) drops the whole bus-master region; 286 single-transfer DMA
+        ; keeps tx_descs/dma_updesc/rx_dma_buf but drops the ring's TX slots (zero-copy, ~6 KB saved);
+        ; 386+ ring DMA keeps everything through the TX slots + ring vars.
         ;   paragraphs = PSP(0x10) + ceil(boundary / 16)
-        mov     ax, resident_end_pio            ; PIO floor: drop the unused bus-master DMA region
+        mov     ax, resident_end_pio            ; PIO floor: drop the whole bus-master DMA region
         cmp     byte [g_use_dma], 0
         je      .keep_calc
-        mov     ax, resident_end                ; DMA active: keep through rx_dma_buf
+        mov     ax, resident_end_single         ; 286 single-transfer DMA: zero-copy, no ring slots
+        cmp     byte [g_tx_ring], 0
+        je      .keep_calc
+        mov     ax, resident_end                ; 386+ ring DMA: keep through the TX slots + ring vars
 .keep_calc:
         add     ax, 15
         mov     cl, 4
@@ -120,3 +128,38 @@ install:
         mov     dx, ax
         mov     ax, 0x3100                      ; AH=31h TSR, AL=0
         int     0x21
+
+;------------------------------------------------------------------------------
+; tx_ring_init -- one-time init of the non-blocking TX ring (DMA mode). Each slot's descriptor
+; gets a fixed buffer phys (= slot phys) and NEXT/STATUS=0; head/tail/count/busy are zeroed.
+; send_pkt only fills LEN per frame thereafter. Cold (called from install); DS=CS. Clobbers regs.
+;------------------------------------------------------------------------------
+tx_ring_init:
+        mov     word [tx_ring_head], 0
+        mov     word [tx_ring_tail], 0
+        mov     word [tx_ring_count], 0
+        mov     byte [tx_dma_busy], 0
+        mov     si, tx_descs                    ; descriptor walker
+        mov     di, tx_slots                    ; slot walker
+        mov     bx, TX_RING_N                   ; remaining slots
+.tri_loop:
+        mov     ax, cs                          ; phys(CS:di) -> dx:ax
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, di
+        adc     dx, 0
+        mov     [si + EL3_DESC_ADDR], ax
+        mov     [si + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [si + EL3_DESC_NEXT], ax
+        mov     [si + EL3_DESC_NEXT + 2], ax
+        mov     [si + EL3_DESC_STATUS], ax
+        mov     [si + EL3_DESC_STATUS + 2], ax
+        add     si, EL3_DESC_SIZE
+        add     di, TX_SLOT_SZ
+        dec     bx
+        jnz     .tri_loop
+        ret

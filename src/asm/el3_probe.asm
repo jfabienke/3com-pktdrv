@@ -136,13 +136,18 @@ id_read_eeprom:
         ret
 
 ;------------------------------------------------------------------------------
-; io_delay -- ~300 reads of the POST port (0x80), ~1 us each on ISA: bus-bound, so the
-; delay is independent of CPU speed (works on a 4.77 MHz 8088 and a Pentium alike).
+; io_delay -- busy-wait covering the EEPROM read latency (~162 us) + ID-port settle. It reads the
+; POST port (0x80) in a loop; each read is an ISA bus cycle, so wall-time is bus-bound (~inversely
+; proportional to the ISA clock) plus a small per-iteration CPU cost. It is therefore NOT
+; CPU/bus-speed-independent: on a fast CPU + fast bus (Pentium on a 16 MHz ISA bus) a too-short
+; count clears before the EEPROM is ready and the driver reads the 0x8000 busy value as the MAC.
+; The count is sized for the fast end (>=162 us even on a 16 MHz bus); on a slow CPU/8 MHz bus it
+; merely over-waits, harmless for one-time cold init.
 ; reset_delay -- ~8x that, for the post-global-reset settle.
 ;------------------------------------------------------------------------------
 io_delay:
         push    cx
-        mov     cx, 300
+        mov     cx, 1024
 .dly:
         in      al, 0x80
         loop    .dly

@@ -215,9 +215,15 @@ f_send_pkt:
         loop    .txs
 .txs_done:
         inc     word [stat_tx]
-        cmp     byte [g_use_dma], 0     ; bus-master single-transfer TX path (3C515, >=286)?
+        cmp     byte [g_use_dma], 0     ; bus-master DMA TX path (3C515, >=286)?
         je      .tx_pio
-        call    dma_tx_single           ; zero-copy DMA straight from the caller's buffer
+        cmp     byte [g_tx_ring], 0     ; 386+ -> non-blocking ring; 286 -> zero-copy single-transfer
+        je      .tx_single
+        call    dma_tx_enqueue          ; 386+: copy to a ring slot, ISR drains the card (non-blocking)
+        clc
+        ret
+.tx_single:
+        call    dma_tx_single           ; 286: zero-copy DMA straight from the caller's buffer (blocking)
         clc
         ret
 .tx_pio:
@@ -253,15 +259,129 @@ f_send_pkt:
         ret
 
 ;------------------------------------------------------------------------------
-; dma_tx_single -- bus-master single-transfer TX (3C515 Corkscrew, >=286 real mode).
-; Builds the one-entry down descriptor pointing straight at the caller's packet (zero copy),
-; writes DownListPtr, kicks StartDmaDown, then waits IRQ-driven for the TxComplete ISR to flag
-; g_tx_done before returning -- so the caller can't reuse/free the buffer while the card is
-; still DMAing from it (the old bounded DN_COMPLETE spin could falsely time out and return
-; early once the transfer is rate-paced). INT 60h is entered with IF=0, so we sti/hlt to let
-; the NIC IRQ fire and yield the CPU we just offloaded, then restore cli. The wait is bounded
-; by ELAPSED time (BIOS tick), not wakeup count, so RX interrupts during a TX flood can't make
-; it bail before completion.
+; dma_tx_enqueue -- non-blocking bus-master TX via a software ring (3C515, 386+ real mode).
+; Copies the caller's frame into a free ring slot (so the caller can reuse its buffer per the
+; Crynwr ABI), fills that slot's descriptor, bumps the ring, and -- if the card is idle -- kicks
+; the DMA for the oldest queued slot. It does NOT wait for completion: the TxComplete ISR frees
+; finished slots and kicks the next, so the CPU's frame-prep overlaps the card's DMA. Only blocks
+; (sti/hlt, bounded by BIOS ticks) when the ring is full. INT 60h runs at IF=0, so the count/busy
+; critical section is atomic wrt the ISR (which only fires once the caller restores IF=1).
+; Enter: DS = CS, bp -> INT 60h frame (F_DS:F_SI = packet, F_CX = length <= TX_SLOT_SZ).
+; Clobbers ax,bx,cx,dx,si,di,es. Leaves DS = CS, IF = 0.
+;------------------------------------------------------------------------------
+dma_tx_enqueue:
+        ; wait for a free slot if the ring is full (bounded by elapsed BIOS ticks)
+        xor     ax, ax
+        mov     es, ax
+        mov     bx, [es:BIOS_TICK_COUNT]        ; start tick for the full-wait timeout
+.eq_wait:
+        cmp     word [tx_ring_count], TX_RING_N
+        jb      .eq_have
+        mov     ax, [es:BIOS_TICK_COUNT]
+        sub     ax, bx
+        cmp     ax, EL3_DMA_TX_TICKS
+        jae     .eq_full                        ; ring still full after the timeout -> drop
+        sti                                     ; let the TxComplete ISR drain a slot
+        hlt
+        cli
+        jmp     .eq_wait
+.eq_full:
+        inc     word [stat_txwait]              ; dropped: ring never drained (wedged card)
+        ret
+.eq_have:
+        ; copy caller frame (F_DS:F_SI, F_CX bytes) into slot[head] = tx_slots + head*TX_SLOT_SZ
+        mov     ax, [tx_ring_head]
+        mov     dx, TX_SLOT_SZ
+        mul     dx                              ; dx:ax = head * TX_SLOT_SZ  (< 64 KB -> ax)
+        mov     di, ax
+        add     di, tx_slots
+        mov     ax, cs
+        mov     es, ax                          ; ES:DI = slot
+        mov     cx, [bp + F_CX]
+        push    ds
+        mov     ds, [bp + F_DS]
+        mov     si, [bp + F_SI]
+        cld
+        ; slot copy: the ring is 386+ only (286 uses the zero-copy single-transfer path), so always
+        ; the 32-bit rep movsd. The per-element copy cost dominated the ring under -icount; wider wins.
+        mov     bx, cx                          ; bx = byte count (for the 0..3-byte remainder)
+        cpu     386
+        shr     cx, 2                           ; dword count
+        rep     movsd
+        cpu     8086
+        mov     cx, bx
+        and     cx, 3                           ; trailing bytes
+        rep     movsb
+        pop     ds                              ; DS = CS again
+        ; fill slot[head]'s descriptor: LEN = len, STATUS = 0 (ADDR/NEXT set at install)
+        mov     bx, [tx_ring_head]
+        mov     cl, 4
+        shl     bx, cl                          ; head * 16
+        add     bx, tx_descs
+        mov     ax, [bp + F_CX]
+        mov     [bx + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [bx + EL3_DESC_LEN + 2], ax
+        mov     [bx + EL3_DESC_STATUS], ax
+        mov     [bx + EL3_DESC_STATUS + 2], ax
+        ; advance head (mod N), count++  (IF=0 here -> atomic wrt the ISR)
+        mov     ax, [tx_ring_head]
+        inc     ax
+        cmp     ax, TX_RING_N
+        jb      .eq_hwrap
+        xor     ax, ax
+.eq_hwrap:
+        mov     [tx_ring_head], ax
+        inc     word [tx_ring_count]
+        ; if the card is idle, kick the oldest queued slot
+        cmp     byte [tx_dma_busy], 0
+        jne     .eq_done
+        call    tx_kick
+.eq_done:
+        ret
+
+;------------------------------------------------------------------------------
+; tx_kick -- start the bus-master DMA for the tail (oldest queued) slot: write its descriptor
+; phys to DownListPtr and issue StartDmaDown. Sets tx_dma_busy. Enter DS=CS. Clobbers ax,bx,cx,dx.
+;------------------------------------------------------------------------------
+tx_kick:
+        mov     bx, [tx_ring_tail]
+        mov     cl, 4
+        shl     bx, cl                          ; tail * 16
+        add     bx, tx_descs                    ; bx = &desc[tail]
+        ; phys(CS:bx) -> dx:ax
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, bx
+        adc     dx, 0                           ; dx:ax = phys(desc[tail])
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax                          ; DownListPtr low
+        pop     ax
+        add     dx, 2
+        out     dx, ax                          ; DownListPtr high
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_DOWN
+        out     dx, ax
+        mov     byte [tx_dma_busy], 1
+        ret
+
+;------------------------------------------------------------------------------
+; dma_tx_single -- blocking zero-copy bus-master TX (3C515 Corkscrew, 286 real mode). The ring's
+; per-frame slot copy costs more than a 286 can hide (no movsd; nothing to overlap in a flood), so
+; the 286 instead DMAs straight from the caller's buffer: ~+47% at 100 Mbit vs the ring (28668 vs
+; 19570 kbit/s). Builds the one-entry down descriptor (reusing tx_descs[0]; the ring is unused on a
+; 286), writes DownListPtr, kicks StartDmaDown, then waits IRQ-driven for the TxComplete ISR to set
+; g_tx_done before returning -- so the caller can't reuse/free the buffer while the card is still
+; DMAing from it. INT 60h is entered with IF=0, so we sti/hlt to let the NIC IRQ fire, then cli. The
+; wait is bounded by ELAPSED time (BIOS tick), not wakeup count, so RX IRQs during a TX flood can't
+; make it bail before completion.
 ; Enter: DS = CS (resident), bp -> INT 60h frame (F_DS:F_SI = packet, F_CX = length).
 ; Both the descriptor and the caller's buffer live <1 MB, so phys = seg*16 + off is 24-bit safe.
 ; Clobbers ax,bx,cx,dx. Leaves DS = CS, IF = 0.
@@ -277,18 +397,18 @@ dma_tx_single:
         shr     dx, cl                  ; dx = high 4 of (seg << 4)
         add     ax, [bp + F_SI]
         adc     dx, 0                   ; dx:ax = phys(buffer)
-        mov     [dma_desc + EL3_DESC_ADDR], ax
-        mov     [dma_desc + EL3_DESC_ADDR + 2], dx
+        mov     [tx_descs + EL3_DESC_ADDR], ax
+        mov     [tx_descs + EL3_DESC_ADDR + 2], dx
         ; next = 0 (single transfer), status = 0, length high = 0
         xor     ax, ax
-        mov     [dma_desc + EL3_DESC_NEXT], ax
-        mov     [dma_desc + EL3_DESC_NEXT + 2], ax
-        mov     [dma_desc + EL3_DESC_STATUS], ax
-        mov     [dma_desc + EL3_DESC_STATUS + 2], ax
-        mov     [dma_desc + EL3_DESC_LEN + 2], ax
+        mov     [tx_descs + EL3_DESC_NEXT], ax
+        mov     [tx_descs + EL3_DESC_NEXT + 2], ax
+        mov     [tx_descs + EL3_DESC_STATUS], ax
+        mov     [tx_descs + EL3_DESC_STATUS + 2], ax
+        mov     [tx_descs + EL3_DESC_LEN + 2], ax
         mov     ax, [bp + F_CX]         ; length (<= 1514 -> fits the 13-bit field)
-        mov     [dma_desc + EL3_DESC_LEN], ax
-        ; descriptor physical address (CS:dma_desc) -> dx:ax
+        mov     [tx_descs + EL3_DESC_LEN], ax
+        ; descriptor physical address (CS:tx_descs) -> dx:ax
         mov     bx, cs
         mov     ax, bx
         mov     cl, 4
@@ -296,7 +416,7 @@ dma_tx_single:
         mov     dx, bx
         mov     cl, 12
         shr     dx, cl
-        add     ax, dma_desc
+        add     ax, tx_descs
         adc     dx, 0                   ; dx:ax = phys(descriptor)
         ; DownListPtr <- descriptor phys: two 16-bit OUTs (io+0x404 low, io+0x406 high)
         push    dx                      ; save high word

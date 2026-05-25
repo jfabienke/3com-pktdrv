@@ -58,6 +58,12 @@ EL3_DESC_UP_COMPLETE    equ 0x4000   ; card sets this in status when the up (RX)
 EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 RXDMA_BUFSZ             equ 4608     ; resident RX-DMA landing buffer (covers FDDI-sized frames)
 
+; ---- non-blocking TX descriptor ring (software ring driven by single-transfer DMA + the
+; TxComplete ISR). send_pkt copies the frame into a free slot and returns; the ISR frees the
+; finished slot and kicks the next, overlapping CPU frame-prep with the card's DMA.
+TX_RING_N               equ 4        ; ring slots (frames that can be queued in flight)
+TX_SLOT_SZ              equ 1536     ; per-slot buffer (holds a max standard frame; FDDI later)
+
 ; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done,
 ; bounded by ELAPSED time via the BIOS 18.2 Hz tick (0040:006C) -- NOT by a wakeup count, since
 ; RX (TCP-ACK) interrupts during a TX flood would otherwise drain a small spin budget and bail

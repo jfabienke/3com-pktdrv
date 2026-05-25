@@ -18,7 +18,7 @@ bits 16
 ; to compute the per-generation Window-1 base + TX-start command.
 %include "el3_core.inc"
 ; Corkscrew (3C515) delta: bus-master DMA register block + descriptor layout (guarded; also
-; pulled by isapnp). The resident TX DMA path + the dma_desc reservation need these.
+; pulled by isapnp). The resident TX DMA paths + the descriptor/ring reservations need these.
 %include "el3_corkscrew.inc"
 
 ;==============================================================================
@@ -77,6 +77,7 @@ g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
 g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1 = Corkscrew (3C515)
 g_manual:       resb 1          ; 1 = manual /b= I/O base given -> skip the ID-port probe
 g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit byte-loop) datapath
+g_force286:     resb 1          ; 1 = /2 given -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
 g_want_dma:     resb 1          ; 1 = /d given -> request bus-master TX DMA (resolved in build_plan)
 g_want_large:   resb 1          ; 1 = /j given -> request FDDI-sized large frames (gated to 3C515)
 tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
@@ -130,12 +131,13 @@ g_nic_io:       resw 1              ; detected I/O base (command reg at +0x0E, w
 g_nic_irq:      resw 1              ; detected IRQ
 g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
 g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
-g_use_dma:      resb 1             ; 1 = bus-master single-transfer TX path active (3C515, >=286)
+g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286): single-transfer on 286, ring on 386+
 g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
-g_tx_done:      resb 1             ; set by the ISR on TxComplete; dma_tx_single waits on it
-; (the bus-master DMA structures -- dma_desc / dma_updesc / rx_dma_buf -- are placed LAST, just
-;  before resident_end, so the TSR drops their ~4.6 KB on the PIO floor; see resident_end_pio.)
+g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
+g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking TX ring (movsd copy); 0 = 286 -> blocking zero-copy single-transfer
+; (the bus-master DMA structures -- tx_descs / dma_updesc / rx_dma_buf / tx_slots -- are placed LAST,
+;  past resident_end_pio, so the TSR drops them on the PIO floor; the 286 path also drops tx_slots.)
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE
@@ -190,16 +192,29 @@ resident_end_pio:
 global resident_end_pio
 
 ; bus-master DMA structures -- kept ONLY when the DMA path is active. The PIO floor never touches
-; these (the ISR .rx_dma branch and the dma_tx_single TX path are gated on g_use_dma), so they
-; sit past resident_end_pio and are dropped from the resident image on the floor. dword-aligned;
-; descriptor layout matches the emulator EL3 Down/Up desc (next/status/addr/length).
+; these (the ISR .rx_dma branch and the DMA TX paths are gated on g_use_dma), so they sit past
+; resident_end_pio and are dropped from the resident image on the floor. dword-aligned; descriptor
+; layout matches the emulator EL3 Down/Up desc (next/status/addr/length). tx_descs[0] doubles as the
+; 286 single-transfer down descriptor (the ring is 386+ only); the TX slots below the single boundary
+; exist only for the 386+ ring, so the 286 path drops them too.
                 alignb 4
-dma_desc:       resb EL3_DESC_SIZE ; single-transfer TX descriptor (card DMA-reads it)
+tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-reads them); [0] also serves the 286 single-transfer
                 alignb 4
 dma_updesc:     resb EL3_DESC_SIZE ; RX up-descriptor (card writes UP_COMPLETE|length); posted via post_rx_dma
 rx_dma_buf:     resb RXDMA_BUFSZ   ; RX-DMA landing buffer (covers FDDI-sized frames)
+                alignb 4
 
-resident_end:                      ; <== TSR keep boundary when DMA is active
+resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (no ring slots)
+global resident_end_single
+
+tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ ring frame slots (dma_tx_enqueue copies the frame in)
+tx_ring_head:   resw 1             ; next slot to fill (producer: send_pkt)
+tx_ring_tail:   resw 1             ; oldest in-flight slot (consumer: TxComplete ISR)
+tx_ring_count:  resw 1             ; frames currently queued (0..TX_RING_N)
+tx_dma_busy:    resb 1             ; 1 while a slot's DMA is in flight
+                resb 1             ; pad to even
+
+resident_end:                      ; <== TSR keep boundary for the 386+ ring DMA path
 global resident_end
 
 ;==============================================================================
@@ -216,7 +231,7 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 5               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_want_dma
+        mov     cx, 6               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma
         xor     al, al
         rep     stosb
         mov     [psp_seg], bp
@@ -247,8 +262,13 @@ global resident_end
         cmp     al, 'q'
         je      .opt_irq
         cmp     al, '8'
-        jne     .chk_dma
+        jne     .chk_286
         mov     byte [g_force8], 1  ; force 8-bit byte-loop datapath (test the 8088 fragment)
+        jmp     .st_next
+.chk_286:
+        cmp     al, '2'
+        jne     .chk_dma
+        mov     byte [g_force286], 1 ; force 286-class datapath (test 286 16-bit PIO + single-transfer DMA)
         jmp     .st_next
 .chk_dma:
         cmp     al, 'd'
@@ -291,8 +311,13 @@ global resident_end
 
         call    detect_cpu          ; -> g_cpu_class
         cmp     byte [g_force8], 0  ; /8 -> force the 8088-class datapath (test 8-bit PIO on a fast CPU)
-        je      .cpu_ok
+        je      .chk_force286
         mov     byte [g_cpu_class], CPU_8088
+        jmp     .cpu_ok
+.chk_force286:
+        cmp     byte [g_force286], 0 ; /2 -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
+        je      .cpu_ok
+        mov     byte [g_cpu_class], CPU_80286
 .cpu_ok:
         mov     dx, msg_cpu
         call    print_str
@@ -528,14 +553,18 @@ phase_validate_dma:
 ;------------------------------------------------------------------------------
 build_plan:
         mov     ax, EL3_W1_DELTA_3C509                       ; default: 3C509/B layout
-        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
         cmp     byte [g_nic_gen], 0
         je      .gen_done
         mov     ax, EL3_W1_DELTA_VORTEX                      ; 3C515: registers relocated +0x10
-        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_THRESH_SF  ; 3C515: store-and-forward
 .gen_done:
         add     ax, [g_nic_io]
         mov     [g_w1_base], ax             ; Window-1 data-register base (FIFO/status/free)
+        ; PIO TX uses early-start on BOTH generations: the wire overlaps the FIFO fill, keeping a
+        ; slow CPU near wire rate at 10 Mbit. The 3C515's former store-and-forward threshold (1536)
+        ; exceeds a standard frame, so the wire never early-started -- serialized fill+transmit,
+        ; ~16x slower at 286/10M (598 vs 9717 kbit/s). 100 Mbit uses DMA (PIO@100 is impractical),
+        ; so SF bought nothing here; and DMA TX bypasses this FIFO threshold entirely.
+        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
         mov     [g_tx_start], bx            ; precomputed SET_TX_START command
         mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
         mov     [g_plan_tx_imm], ax
@@ -549,6 +578,14 @@ build_plan:
         jb      .dma_resolved
         mov     byte [g_use_dma], 1
 .dma_resolved:
+        ; resident TX DMA path: 386+ uses the non-blocking ring (movsd slot copy); a 286 can't hide
+        ; that per-frame copy (no movsd, nothing to overlap in a flood), so it uses the blocking
+        ; zero-copy single-transfer instead -- ~+47% at 100 Mbit (28668 vs 19570 kbit/s).
+        mov     byte [g_tx_ring], 0
+        cmp     byte [g_cpu_class], CPU_80386
+        jb      .ring_resolved
+        mov     byte [g_tx_ring], 1
+.ring_resolved:
         ; --- resolve FDDI-sized large frames: /j AND 3C515 (else standard Ethernet). Sets the RX
         ;     length mask to the 13-bit Corkscrew field so a >2047 B frame's length isn't truncated.
         ;     el3_init sets allowLargePackets in MacControl when g_use_large. ---
