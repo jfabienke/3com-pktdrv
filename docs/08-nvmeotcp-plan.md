@@ -34,6 +34,7 @@ Design docs: `dos-nvmeotcp/docs/nvmetcp-design.md` (the lift plan), and Claude m
 | 5 | Write-back cache (`nvmc_write_sector`, `nvmc_flush`, dirty eviction) + keep-alive (`nvt_keepalive` via `kbhit` loop) + `nvmedisk` write/flush commands | **DONE** | `8597b2b` |
 | 6 | FDDI-sized MSS end-to-end: `TCP_MSS` 4096→4446, `memcpy`/`memmove` RX path, `io_maxh2cdata` stored + H2CData chunking | **DONE** | `77f66b0` |
 | 7 | INT 13h TSR (`nvmetsr.exe`): hooks INT 13h + INT 2Fh (mux 0xE5), registers BIOS hard disk, `/u` unload | **DONE** | `f31cadf` |
+| 8 | XMS buffer migration + memory-policy JIT fragments: move TCP/cache buffers out of load image → `LOADHIGH`-capable TSR | **PLANNED** | — |
 
 Harness/emulator side (`elink-qemu`): connect harness `tests/nvme-connect.sh` + threaded
 spec-faithful target stub `tests/nvmetgt.py` (latest `d67c91e`, includes NVM Read/Write
@@ -55,6 +56,87 @@ Current green output (`nvmecon.exe`): `NVME=READY` + `IDENT mdts=5 nsze=16384 bl
 `nvmedisk.exe` commands: `r <lba>` (hex+ASCII dump), `w <lba> <fill_hex>` (fill sector, cache dirty), `f` (flush all dirty), `q` (flush + disconnect).
 
 `nvmetsr.exe` install output: `NVME=READY` + `IOQ=READY` + `GEOM: C=N H=255 S=63 total=N sectors` + `DRIVE: 0x81 (~D:)` + `TSR: resident (N paragraphs)`. Then `nvmetsr /u` to unload.
+
+## Phase 8 — XMS buffer migration + memory-policy JIT (PLANNED)
+
+### Problem
+
+`nvmetsr.exe` TSR resident footprint is ~110 KB:
+
+| Region | Size |
+|--------|------|
+| TCP RX buffers × 2 (`__far`, 16 KB each) | 32 KB |
+| TCP TX rings × 2 (`__far`, 16 KB each) | 32 KB |
+| NVMe page cache × 4 (`__far`, 4 KB each) | 16 KB |
+| Code + DGROUP | ~30 KB |
+
+Too large for `LOADHIGH` into a UMB (typical contiguous UMB ≤ 64 KB under EMM386).
+
+### Architecture
+
+The driver assumes V86 mode within a VMM implementing VDS (INT 4Bh). The cold-phase init
+detects the memory environment and selects a policy; that policy drives JIT fragment
+composition — no runtime branching in the resident hotpath.
+
+**Memory policy hierarchy (detected once at install, baked into resident image):**
+
+| Policy | Mechanism | RX copies | TX copies | TSR size |
+|--------|-----------|-----------|-----------|----------|
+| `MEM_VCPI` | XMS EMB + VCPI DE05h page mapping into V86 space | 0 | 0 | ~30 KB |
+| `MEM_DPMI` | XMS EMB + DPMI 1.0 INT 31h AX=0508h page mapping | 0 | 0 | ~30 KB |
+| `MEM_XMS_COPY` | XMS EMB + INT 15h AH=87h staging copy | 1 | 1 | ~30 KB |
+| `MEM_CONVENTIONAL` | `__far` buffers in load image (current) | 2 | 2 | ~110 KB |
+
+**Detection sequence (cold phase, in order):**
+
+1. VCPI present? `INT 67h AX=DE00h` → `AL=0` → try `DE05h` page mapping
+2. DPMI 1.0? `INT 2Fh AX=1687h` → `AX=0`, version ≥ 1.0 → try `INT 31h AX=0508h`
+3. XMS present? `INT 2Fh AX=4300h` → `AL=80h` (HIMEM.SYS) → allocate EMB, VDS lock,
+   verify physical < 16 MB (ISA DMA 24-bit limit), verify contiguous
+4. Fallback → `MEM_CONVENTIONAL` (no XMS, or VDS lock failed)
+
+**ISA DMA addressing note:** AT-class ISA DMA uses 24-bit physical addresses (8237A 16-bit
+counter + 8-bit page register) — full 16 MB range. All realistic XMS on DOS machines is
+below 16 MB, so 3C515 bus-master DMA can target XMS directly. VDS (INT 4Bh AX=8103h)
+provides the locked physical address; write it into `UP_LIST_PTR` / `DOWN_LIST_PTR`.
+
+**XMS shared between 3cpd.exe and nvmetsr.exe:**
+`nvmetsr.exe` allocates and locks the XMS EMB, obtains the physical address via VDS, and
+passes it to `3cpd.exe` via a custom INT 60h extension. `3cpd.exe` programs the 3C515 DMA
+ring with that physical address. At unload: stop DMA → VDS unlock → VCPI/DPMI unmap →
+XMS unlock → XMS free → restore vectors → freemem.
+
+**Fragment palette extension in `3cpd.exe`:**
+
+The memory policy adds a third JIT axis alongside CPU generation and DMA tier:
+
+```
+CPU frag  +  DMA/PIO frag  +  mem-policy frag
+               └──── JIT compose at install ────┘
+```
+
+New receive fragments (`src/asm/frag/`):
+- `rx_recv_vcpi.asm` — signal DMA-complete, data at VCPI-mapped linear addr (zero copy)
+- `rx_recv_dpmi.asm` — same, via DPMI mapping
+- `rx_recv_xms.asm`  — INT 15h AH=87h staging → XMS rcvbuf
+- `rx_recv_conv.asm` — Crynwr upcall into conventional `__far` rcvbuf (current behaviour)
+
+`3cpd.exe` owns the receive fragment and the memory-policy detection. `nvmetsr.exe`
+consumes from wherever the fragment deposited data — it does not need to know which path
+was taken.
+
+**Zero-copy RX path (MEM_VCPI / MEM_DPMI):**
+
+In V86 mode the VMM's page tables are live. VCPI `DE05h` (or DPMI `0508h`) maps the XMS
+physical pages into an unused V86 linear address range (UMB holes). The mapped linear
+address is stored as a `__far` pointer in resident state. The NIC DMA's into the physical
+address; the CPU reads via the `__far` pointer. No INT 15h required — the copy disappears.
+
+**Unload (`nvmetsr /u`) cleanup order:**
+```
+stop DMA → VDS unlock → VCPI/DPMI unmap → XMS unlock → XMS free
+         → restore INT 13h/INT 2Fh vectors → _dos_freemem(psp_seg)
+```
 
 ## Gotchas banked
 
