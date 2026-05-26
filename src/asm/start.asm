@@ -165,7 +165,7 @@ isr_save_ss:    resw 1             ; interrupted task's SS:SP (private-stack swi
 isr_save_sp:    resw 1
 isr_stack:      resb 128           ; the ISR's private stack
 isr_stack_top:
-resident_image: resb 128           ; the composed datapath (tx + rx drain)
+resident_image: resb 256           ; the composed datapath (tx + rx drain)
 
 ; --- statistics (resident; updated by the ISR / send_pkt, read by get_statistics) ---
 stat_rx:        dw 0               ; packets received & delivered
@@ -203,6 +203,25 @@ tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-
 
 resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (descriptors only)
 global resident_end_single
+
+; XMS DMA receive ring state -- present whenever g_use_dma=1 (286 or 386+).
+; 286: kept through resident_end_xms_single (drops tx_slots / ring vars).
+; 386+: kept through resident_end (includes tx_slots for the TX ring).
+xms_dma_armed:  resb 1             ; 0 = PIO / not configured; 1 = XMS ring armed
+xms_rx_policy:  resb 1             ; xms_mem_policy_t (VCPI=0, DPMI=1, XMS_COPY=2)
+xms_slot_idx:   resb 1             ; current ping-pong slot index (0 or 1)
+                resb 1             ; pad to word alignment
+xms_cfg_off:    resw 1             ; far ptr to caller's xms_rx_cfg_t (offset)
+xms_cfg_seg:    resw 1             ; far ptr to caller's xms_rx_cfg_t (segment)
+xms_slot_sz:    resw 1             ; bytes per XMS slot
+                resw 1             ; pad to dword alignment
+                alignb 16
+xms_rx_desc0:   resb EL3_DESC_SIZE ; RX up-descriptor slot 0 (16 bytes, 16-byte aligned)
+xms_rx_desc1:   resb EL3_DESC_SIZE ; RX up-descriptor slot 1
+xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; access bytes pre-set)
+
+resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
+global resident_end_xms_single
 
 tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ ring frame slots (dma_tx_enqueue copies the frame in)
 tx_ring_head:   resw 1             ; next slot to fill (producer: send_pkt)

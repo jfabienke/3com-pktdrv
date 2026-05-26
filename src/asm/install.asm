@@ -91,14 +91,14 @@ install:
 
         ; terminate-and-stay-resident. Keep PSP + the RESIDENT region only (handler, ISR,
         ; resident state, emitted datapath); the cold composer/probe/init is reclaimed. Three keep
-        ; boundaries: PIO floor (no DMA) drops the whole TX-DMA region; 286 single-transfer DMA keeps
-        ; only tx_descs and drops the ring's TX slots (zero-copy, ~6 KB saved); 386+ ring DMA keeps
+        ; boundaries: PIO floor (no DMA) drops the whole TX-DMA region; 286 DMA keeps tx_descs +
+        ; XMS state (resident_end_xms_single) and drops the ring's TX slots; 386+ ring DMA keeps
         ; everything through the TX slots + ring vars. (RX is PIO in all modes -- no RX-DMA buffer.)
         ;   paragraphs = PSP(0x10) + ceil(boundary / 16)
         mov     ax, resident_end_pio            ; PIO floor: drop the whole bus-master DMA region
         cmp     byte [g_use_dma], 0
         je      .keep_calc
-        mov     ax, resident_end_single         ; 286 single-transfer DMA: zero-copy, no ring slots
+        mov     ax, resident_end_xms_single     ; 286 single-transfer DMA: keep XMS state, drop TX ring slots
         cmp     byte [g_tx_ring], 0
         je      .keep_calc
         mov     ax, resident_end                ; 386+ ring DMA: keep through the TX slots + ring vars

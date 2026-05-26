@@ -9,6 +9,8 @@
 ; (fn 24) exposes the counters; a vendor fn (0x7F, CFG_DEBUG) hands out the debug block.
 
 %include "el3_core.inc"         ; EL3 command/status constants (guarded; also used by isr.asm)
+%include "el3_corkscrew.inc"    ; 3C515 DMA registers + descriptor constants (guarded)
+%include "xms_dma.inc"          ; XMS DMA extension constants (guarded)
 
 PKTINT          equ 0x60        ; the packet-driver interrupt we install on
 
@@ -73,6 +75,8 @@ pkt_disp:
         cmp     al, PD_DBG_BLOCK
         je      pkt_do_dbg
 %endif
+        cmp     al, XMS_DMA_FUNC        ; proprietary XMS DMA extension (AH=0xF0)
+        je      pkt_do_xms
         cmp     al, PD_NFUNCS
         ja      pkt_bad
         mov     bl, al
@@ -102,6 +106,26 @@ pkt_do_dbg:
         call    f_dbg
         jmp     pkt_return
 %endif
+pkt_do_xms:
+        mov     al, [bp + F_AL]         ; sub-function in AL
+        cmp     al, XMS_DMA_QUERY
+        je      .xq
+        cmp     al, XMS_DMA_CONFIGURE
+        je      .xc
+        cmp     al, XMS_DMA_RELEASE
+        je      .xr
+        mov     dh, PD_ERR_BADCMD
+        stc
+        jmp     pkt_error
+.xq:    call    f_xms_query
+        jmp     pkt_xms_ret
+.xc:    call    f_xms_configure
+        jmp     pkt_xms_ret
+.xr:    call    f_xms_release
+        jmp     pkt_xms_ret
+pkt_xms_ret:
+        jc      pkt_error
+        jmp     pkt_return
 pkt_error:
         mov     bp, sp
         mov     [bp + F_DH], dh         ; return error code in DH
@@ -557,6 +581,236 @@ dbg_logb:
         pop     ax
         ret
 %endif
+
+;--- XMS DMA QUERY: return capability flags in BX, max slot size in DX ---
+f_xms_query:
+        mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE
+        cmp     byte [g_tx_ring], 0
+        je      .no_ring
+        or      bx, XMS_CAP_RING | XMS_CAP_VCPI | XMS_CAP_DPMI
+.no_ring:
+        mov     [bp + F_BX], bx
+        mov     ax, EL3_MAX_FRAME
+        cmp     byte [g_use_large], 0
+        je      .done
+        mov     ax, TX_SLOT_SZ          ; 1536 (FDDI-sized slot limit)
+.done:
+        mov     [bp + F_DX], ax
+        clc
+        ret
+
+;--- XMS DMA CONFIGURE: ES:DI -> xms_rx_cfg_t; build descriptors + arm UP_LIST_PTR ---
+f_xms_configure:
+        ; check not already armed
+        cmp     byte [xms_dma_armed], 0
+        jne     .ecfg
+        ; ES:DI from caller's frame
+        mov     bx, [bp + F_DI]         ; cfg offset
+        mov     es, [bp + F_ES]         ; cfg segment  (ES saved on bp-frame)
+        ; validate version
+        cmp     byte [es:bx + XMS_CFG_version], XMS_CFG_VERSION
+        jne     .ever
+        ; validate policy
+        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_COPY
+        ja      .epol
+        ; validate phys0 < 16 MB: byte[3] of the 32-bit physical address must be 0
+        ; (if phys[31:24]=0 then phys ≤ 0x00FFFFFF = 16MB-1, within ISA DMA range)
+        cmp     byte [es:bx + XMS_CFG_phys0 + 3], 0
+        jne     .ephys
+        ; validate phys1 < 16 MB
+        cmp     byte [es:bx + XMS_CFG_phys1 + 3], 0
+        jne     .ephys
+        ; validate slot_size
+        cmp     byte [g_use_large], 0
+        je      .slotchk_std
+        mov     ax, TX_SLOT_SZ
+        jmp     .slotchk_cmp
+.slotchk_std:
+        mov     ax, EL3_MAX_FRAME
+.slotchk_cmp:
+        cmp     [es:bx + XMS_CFG_slot_size], ax
+        ja      .esz
+        ; save config pointer + fields
+        mov     ax, [es:bx + XMS_CFG_slot_size]
+        mov     [xms_slot_sz], ax
+        mov     al, [es:bx + XMS_CFG_policy]
+        mov     [xms_rx_policy], al
+        mov     [xms_cfg_off], bx
+        mov     ax, es
+        mov     [xms_cfg_seg], ax
+        ; build descriptor 0: ADDR=phys0, LEN=slot_size, STATUS=0, NEXT set below
+        mov     ax, [es:bx + XMS_CFG_phys0]
+        mov     [xms_rx_desc0 + EL3_DESC_ADDR], ax
+        mov     ax, [es:bx + XMS_CFG_phys0 + 2]
+        mov     [xms_rx_desc0 + EL3_DESC_ADDR + 2], ax
+        mov     ax, [xms_slot_sz]
+        mov     [xms_rx_desc0 + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [xms_rx_desc0 + EL3_DESC_LEN + 2], ax
+        mov     [xms_rx_desc0 + EL3_DESC_STATUS], ax
+        mov     [xms_rx_desc0 + EL3_DESC_STATUS + 2], ax
+        ; build descriptor 1: ADDR=phys1, LEN=slot_size, STATUS=0
+        mov     ax, [es:bx + XMS_CFG_phys1]
+        mov     [xms_rx_desc1 + EL3_DESC_ADDR], ax
+        mov     ax, [es:bx + XMS_CFG_phys1 + 2]
+        mov     [xms_rx_desc1 + EL3_DESC_ADDR + 2], ax
+        mov     ax, [xms_slot_sz]
+        mov     [xms_rx_desc1 + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [xms_rx_desc1 + EL3_DESC_LEN + 2], ax
+        mov     [xms_rx_desc1 + EL3_DESC_STATUS], ax
+        mov     [xms_rx_desc1 + EL3_DESC_STATUS + 2], ax
+        ; set NEXT fields based on g_tx_ring (ring vs single-transfer)
+        cmp     byte [g_tx_ring], 0
+        je      .single_next
+        ; 386+ ring: phys(CS:xms_rx_desc1) -> desc0.NEXT; phys(CS:xms_rx_desc0) -> desc1.NEXT
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        push    dx
+        push    ax
+        ; desc0.NEXT = phys(xms_rx_desc1)
+        pop     ax
+        pop     dx
+        push    dx
+        push    ax
+        add     ax, xms_rx_desc1
+        adc     dx, 0
+        mov     [xms_rx_desc0 + EL3_DESC_NEXT], ax
+        mov     [xms_rx_desc0 + EL3_DESC_NEXT + 2], dx
+        ; desc1.NEXT = phys(xms_rx_desc0)
+        pop     ax
+        pop     dx
+        add     ax, xms_rx_desc0
+        adc     dx, 0
+        mov     [xms_rx_desc1 + EL3_DESC_NEXT], ax
+        mov     [xms_rx_desc1 + EL3_DESC_NEXT + 2], dx
+        jmp     .next_done
+.single_next:
+        ; 286 single-transfer: NEXT = 0 (no chain; ISR re-arms manually)
+        xor     ax, ax
+        mov     [xms_rx_desc0 + EL3_DESC_NEXT], ax
+        mov     [xms_rx_desc0 + EL3_DESC_NEXT + 2], ax
+        mov     [xms_rx_desc1 + EL3_DESC_NEXT], ax
+        mov     [xms_rx_desc1 + EL3_DESC_NEXT + 2], ax
+.next_done:
+        ; pre-set GDT access bytes for INT 15h AH=87h (entries 2 and 3, src and dst)
+        mov     byte [xms_gdt + 21], 0x93   ; source descriptor access byte (present, read/write)
+        mov     byte [xms_gdt + 29], 0x93   ; destination descriptor access byte
+        ; zero all other GDT bytes (entries 0,1,4,5)
+        xor     ax, ax
+        mov     [xms_gdt +  0], ax
+        mov     [xms_gdt +  2], ax
+        mov     [xms_gdt +  4], ax
+        mov     [xms_gdt +  6], ax
+        mov     [xms_gdt +  8], ax
+        mov     [xms_gdt + 10], ax
+        mov     [xms_gdt + 12], ax
+        mov     [xms_gdt + 14], ax
+        mov     word [xms_gdt + 16], 0   ; src limit
+        mov     [xms_gdt + 18], ax       ; src base 0-15
+        mov     [xms_gdt + 20], al       ; src base 16-23
+        ; access byte [21] already set above
+        mov     [xms_gdt + 22], ax       ; src base 24-31 / reserved
+        mov     word [xms_gdt + 24], 0   ; dst limit
+        mov     [xms_gdt + 26], ax       ; dst base 0-15
+        mov     [xms_gdt + 28], al       ; dst base 16-23
+        ; access byte [29] already set above
+        mov     [xms_gdt + 30], ax       ; dst base 24-31 / reserved
+        mov     [xms_gdt + 32], ax
+        mov     [xms_gdt + 34], ax
+        mov     [xms_gdt + 36], ax
+        mov     [xms_gdt + 38], ax
+        mov     [xms_gdt + 40], ax
+        mov     [xms_gdt + 42], ax
+        mov     [xms_gdt + 44], ax
+        mov     [xms_gdt + 46], ax
+        ; slot index = 0
+        mov     byte [xms_slot_idx], 0
+        ; arm UP_LIST_PTR <- phys(CS:xms_rx_desc0)
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, xms_rx_desc0
+        adc     dx, 0
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        ; issue StartDmaUp
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        ; enable UP_COMPLETE interrupt (add to existing interrupt mask)
+        mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH | EL3_ST_UP_COMPLETE
+        cmp     byte [g_use_dma], 0
+        je      .intr_no_tx
+        or      ax, EL3_ST_TX_COMPLETE
+.intr_no_tx:
+        out     dx, ax
+        ; mark armed
+        mov     byte [xms_dma_armed], 1
+        mov     ax, cs
+        mov     es, ax                  ; restore ES = our segment
+        clc
+        ret
+.ever:  mov     dh, XMS_ERR_BAD_VERSION
+        jmp     .err
+.epol:  mov     dh, XMS_ERR_BAD_POLICY
+        jmp     .err
+.ephys: mov     dh, XMS_ERR_PHYS_RANGE
+        jmp     .err
+.esz:   mov     dh, XMS_ERR_SLOT_SIZE
+        jmp     .err
+.ecfg:  mov     dh, XMS_ERR_ALREADY_CFG
+.err:   mov     ax, cs
+        mov     es, ax
+        stc
+        ret
+
+;--- XMS DMA RELEASE: stop DMA, clear UP_LIST_PTR, disarm ---
+f_xms_release:
+        cmp     byte [xms_dma_armed], 0
+        je      .enot
+        ; zero UP_LIST_PTR (two 16-bit OUTs)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        xor     ax, ax
+        out     dx, ax
+        add     dx, 2
+        out     dx, ax
+        ; StartDmaUp with null pointer halts the RX DMA engine
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        ; remove UP_COMPLETE from interrupt enable
+        mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH
+        cmp     byte [g_use_dma], 0
+        je      .rel_intr
+        or      ax, EL3_ST_TX_COMPLETE
+.rel_intr:
+        out     dx, ax
+        ; clear state
+        mov     byte [xms_dma_armed], 0
+        xor     ax, ax
+        mov     [xms_cfg_off], ax
+        mov     [xms_cfg_seg], ax
+        clc
+        ret
+.enot:  mov     dh, XMS_ERR_NOT_CFG
+        stc
+        ret
 
 f_bad:
         mov     dh, PD_ERR_BADCMD

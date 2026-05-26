@@ -10,6 +10,8 @@
 ; structurally verified (assembles + disassembles) and awaits hardware validation.
 
 %include "el3_core.inc"
+%include "el3_corkscrew.inc"
+%include "xms_dma.inc"
 
 ; Per-interrupt RX work cap: process at most this many frames per ISR entry, then yield. A
 ; sustained RX flood keeps RX_COMPLETE asserted, so the still-pending IRQ re-fires and the
@@ -87,6 +89,14 @@ nic_isr:
 .tx_acpop:
         pop     ax                      ; restore adapter status
 .no_txdone:
+        test    ax, EL3_ST_UP_COMPLETE
+        jz      .no_updone
+        cmp     byte [xms_dma_armed], 0
+        je      .no_updone
+        push    ax                      ; preserve card status across xms_rx_deliver
+        call    xms_rx_deliver
+        pop     ax
+.no_updone:
         test    ax, EL3_ST_ADAPTER_FAILURE
         jnz     .adapter_fail
         test    ax, EL3_ST_RX_COMPLETE
@@ -266,6 +276,273 @@ nic_isr:
         pop     bx
         pop     ax
         iret
+
+;------------------------------------------------------------------------------
+; xms_rx_deliver -- handle an XMS up-descriptor completion (UP_COMPLETE interrupt).
+; Reads the completed slot's descriptor status to get frame length, delivers to the
+; registered receiver, clears the descriptor, and advances the ping-pong index.
+; On 286 (single-transfer, g_tx_ring=0): re-arms the OTHER slot and issues StartDmaUp
+; before processing -- minimises the gap during which the NIC has no armed descriptor.
+; Clobbers AX, BX, CX, DX, SI, DI, ES. DS = our segment on entry and exit.
+;------------------------------------------------------------------------------
+xms_rx_deliver:
+; Deliver one XMS up-DMA received frame. Near-called from ISR.
+; DS = CS on entry and exit. May clobber AX, BX, CX, DX, SI, DI, ES.
+; BP frame: [bp-2]=phys_lo, [bp-4]=phys_hi, [bp-6]=lin_seg, [bp-8]=desc_ptr(SI).
+        push    bp
+        mov     bp, sp
+        sub     sp, 8
+
+        ; --- 1. Select completed slot's descriptor into SI ---
+        mov     si, xms_rx_desc0
+        cmp     byte [xms_slot_idx], 0
+        je      .gd
+        mov     si, xms_rx_desc1
+.gd:    mov     [bp-8], si              ; save for STATUS clear + phys/lin select
+
+        ; --- 2. Verify UP_COMPLETE in descriptor STATUS ---
+        mov     ax, [si + EL3_DESC_STATUS]
+        test    ax, EL3_DESC_UP_COMPLETE
+        jz      .done
+
+        ; --- 3. Frame length from STATUS[12:0] ---
+        and     ax, EL3_DESC_LEN_MASK
+        mov     [rx_len], ax
+        cmp     ax, 14
+        jb      .discard
+
+        ; --- 4. 286 single-transfer: pre-arm OTHER slot before processing ---
+        cmp     byte [g_tx_ring], 0
+        jne     .no_prearm
+        xor     byte [xms_slot_idx], 1  ; toggle to the OTHER (new) slot
+        mov     di, xms_rx_desc0
+        cmp     byte [xms_slot_idx], 0
+        je      .arm_new
+        mov     di, xms_rx_desc1
+.arm_new:
+        xor     ax, ax
+        mov     [di + EL3_DESC_STATUS], ax
+        mov     [di + EL3_DESC_STATUS + 2], ax
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, di
+        adc     dx, 0                   ; dx:ax = phys(new descriptor)
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        ; SI still points to the COMPLETED (old) slot
+
+.no_prearm:
+        ; --- 5. Load phys + lin for the completed slot from cfg ---
+        push    es
+        mov     es, [xms_cfg_seg]
+        mov     bx, [xms_cfg_off]
+        mov     si, [bp-8]              ; completed descriptor ptr
+        cmp     si, xms_rx_desc0
+        jne     .addrs1
+        mov     ax, [es:bx + XMS_CFG_phys0]
+        mov     cx, [es:bx + XMS_CFG_phys0 + 2]
+        mov     di, [es:bx + XMS_CFG_lin0]
+        mov     dx, [es:bx + XMS_CFG_lin0 + 2]
+        jmp     .addrs_got
+.addrs1:
+        mov     ax, [es:bx + XMS_CFG_phys1]
+        mov     cx, [es:bx + XMS_CFG_phys1 + 2]
+        mov     di, [es:bx + XMS_CFG_lin1]
+        mov     dx, [es:bx + XMS_CFG_lin1 + 2]
+.addrs_got:
+        pop     es
+        ; ax=phys_lo, cx=phys_hi, di=lin_lo, dx=lin_hi (for lin<1MB: dx=0)
+        mov     [bp-2], ax              ; phys_lo
+        mov     [bp-4], cx              ; phys_hi
+        ; lin_seg = ((dx << 12) | (di >> 4))  -- valid because lin_N is page-aligned
+        push    dx
+        mov     cl, 12
+        shl     dx, cl
+        mov     cl, 4
+        shr     di, cl
+        or      di, dx
+        pop     dx                      ; (restore dx; value discarded -- used only as scratch above)
+        mov     [bp-6], di              ; lin_seg
+
+        ; --- 6. Read 14-byte Ethernet header into hdr_buf ---
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        jae     .hdr_int15
+
+        ; VCPI/DPMI: read 14 bytes from lin_seg:0 into hdr_buf
+        mov     es, [bp-6]              ; ES = lin_seg
+        xor     bx, bx                  ; source offset = 0
+        mov     di, hdr_buf
+        mov     cx, 14
+.vcpi_hdr:
+        mov     al, [es:bx]
+        mov     [di], al
+        inc     bx
+        inc     di
+        dec     cx
+        jnz     .vcpi_hdr
+        push    cs
+        pop     es
+        jmp     .scan
+
+.hdr_int15:
+        ; XMS_COPY: INT 15h AH=87h: 7 words, phys_N -> phys(hdr_buf)
+        ; src descriptor at xms_gdt+16
+        mov     ax, [bp-2]
+        mov     cl, [bp-4]              ; phys[23:16] in cl
+        mov     word [xms_gdt + 16], 13
+        mov     [xms_gdt + 18], ax
+        mov     [xms_gdt + 20], cl
+        xor     al, al
+        mov     [xms_gdt + 22], al
+        mov     [xms_gdt + 23], al
+        ; dst descriptor at xms_gdt+24: phys(hdr_buf)
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     bx, cs
+        mov     cl, 12
+        shr     bx, cl
+        add     ax, hdr_buf
+        adc     bx, 0
+        mov     word [xms_gdt + 24], 13
+        mov     [xms_gdt + 26], ax
+        mov     [xms_gdt + 28], bl
+        xor     al, al
+        mov     [xms_gdt + 30], al
+        mov     [xms_gdt + 31], al
+        push    ds
+        pop     es
+        mov     si, xms_gdt
+        mov     cx, 7
+        mov     ah, 0x87
+        int     0x15
+        push    cs
+        pop     es
+
+.scan:
+        ; --- 7. Scan htable for EtherType ---
+        mov     ax, [hdr_buf + 12]
+        mov     si, htable
+        mov     cx, MAX_HANDLES
+.scan_loop:
+        cmp     word [si + 2], 0
+        je      .scan_next
+        cmp     word [si + 4], 0
+        je      .scan_hit
+        cmp     word [si + 4], ax
+        je      .scan_hit
+.scan_next:
+        add     si, HANDLE_SIZE
+        loop    .scan_loop
+        jmp     .discard
+
+.scan_hit:
+        mov     [cur_handle], si
+
+        ; --- 8. Upcall 1 (AX=0): request buffer ---
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        jae     .up1_no_hint
+        mov     es, [bp-6]              ; VCPI/DPMI hint: lin_seg:0
+        xor     di, di
+        jmp     .up1_call
+.up1_no_hint:
+        xor     ax, ax
+        mov     es, ax
+        xor     di, di
+.up1_call:
+        xor     ax, ax
+        mov     bx, [cur_handle]
+        mov     cx, [rx_len]
+        call far [bx]
+        mov     ax, es
+        or      ax, di
+        jz      .discard
+        mov     [appbuf_seg], es
+        mov     [appbuf_off], di
+
+        ; --- 9. XMS_COPY: INT 15h to copy full frame into appbuf ---
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        jb      .no_copy
+        ; src: phys_N, limit = rx_len - 1
+        mov     ax, [bp-2]
+        mov     cl, [bp-4]
+        mov     bx, [rx_len]
+        dec     bx
+        mov     [xms_gdt + 16], bx
+        mov     [xms_gdt + 18], ax
+        mov     [xms_gdt + 20], cl
+        xor     al, al
+        mov     [xms_gdt + 22], al
+        mov     [xms_gdt + 23], al
+        ; dst: phys(appbuf) = appbuf_seg*16 + appbuf_off
+        mov     ax, [appbuf_seg]
+        mov     cl, 4
+        shl     ax, cl
+        mov     bx, [appbuf_seg]
+        mov     cl, 12
+        shr     bx, cl
+        add     ax, [appbuf_off]
+        adc     bx, 0
+        mov     cx, [rx_len]
+        dec     cx
+        mov     [xms_gdt + 24], cx
+        mov     [xms_gdt + 26], ax
+        mov     [xms_gdt + 28], bl
+        xor     al, al
+        mov     [xms_gdt + 30], al
+        mov     [xms_gdt + 31], al
+        ; CX = ceil(rx_len / 2) words
+        mov     cx, [rx_len]
+        shr     cx, 1
+        adc     cx, 0
+        push    ds
+        pop     es
+        mov     si, xms_gdt
+        mov     ah, 0x87
+        int     0x15
+        push    cs
+        pop     es
+
+.no_copy:
+        ; --- 10. Upcall 2 (AX=1): deliver ---
+        mov     si, [appbuf_off]
+        mov     cx, [rx_len]
+        mov     bx, [cur_handle]
+        mov     ax, 1
+        mov     ds, [appbuf_seg]
+        call far [cs:bx]
+        mov     ax, cs
+        mov     ds, ax
+        inc     word [stat_rx]
+
+.discard:
+        ; --- 11. Clear completed slot STATUS ---
+        mov     si, [bp-8]              ; completed descriptor ptr (saved at start)
+        xor     ax, ax
+        mov     [si + EL3_DESC_STATUS], ax
+        mov     [si + EL3_DESC_STATUS + 2], ax
+        ; 386+ ring: toggle slot index AFTER delivery
+        cmp     byte [g_tx_ring], 0
+        je      .done                   ; 286: already toggled during pre-arm
+        xor     byte [xms_slot_idx], 1
+
+.done:
+        mov     sp, bp
+        pop     bp
+        ret
 
 ;------------------------------------------------------------------------------
 ; isr_wait_cmd -- bounded poll on CmdInProgress (EL3_ST_CMD_BUSY) after a slow command.
