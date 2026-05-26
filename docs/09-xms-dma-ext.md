@@ -115,9 +115,7 @@ Out (CF=1):  DH = XMS_ERR_*  (ring not started; caller may retry or fall back)
 2. `cfg.policy` in `[XMS_POLICY_VCPI, XMS_POLICY_XMS_COPY]`
 3. `cfg.phys0` and `cfg.phys1` both `< DMA_ISA_16M_LIMIT` (0x1000000) — ISA
    bus-master 24-bit addressing limit
-4. Neither `phys0` nor `phys1` crosses a 64 KB boundary
-   (`dma_crosses_64k(phys, slot_size)`)
-5. `cfg.slot_size ≤ TX_SLOT_SZ`
+4. `cfg.slot_size ≤ TX_SLOT_SZ`
 
 On success, `3cpd.exe` builds two 16-byte descriptors in its resident data
 (`ALIGNB 16`). The `EL3_DESC_NEXT` field is set by the JIT based on CPU tier:
