@@ -19,7 +19,7 @@ half. The plan below is the umbrella roadmap so any repo can see where the whole
 Design docs: `dos-nvmeotcp/docs/nvmetcp-design.md` (the lift plan), and Claude memory
 `project_dos_nvmetcp_design.md` / `project_nvmeotcp_goal.md`.
 
-## Phase roadmap & status (2026-05-25)
+## Phase roadmap & status (2026-05-26)
 
 | Phase | What | Status | Commit (dos-nvmeotcp) |
 |-------|------|--------|------------------------|
@@ -28,14 +28,16 @@ Design docs: `dos-nvmeotcp/docs/nvmetcp-design.md` (the lift plan), and Claude m
 | 2.2 | Session layer + connect-to-ready (`nvmesess.c/.h`): framing, ICReq→Connect→CC enable→CSTS.RDY | **DONE** | `67527ba` |
 | 2.3 | Identify Controller + Namespace; parse MDTS / NSZE / block size (via C2HData) | **DONE** | `f9fb852` |
 | 3a | Multi-connection TCP (`TCP_NCONN=2`, `tcp_use`); open I/O queue (qid 1) as a 2nd TCP connection | **DONE** | `fa05bbb` |
-| 3b | **NVM Read** on the I/O queue (opcode 0x02, SLBA/NLB in CDW10-12, transport SGL → C2HData) | **NEXT** | — |
-| 3c | NVM Write (CapsuleCmd in-capsule or R2T → H2CData) | planned | — |
-| 4 | Read-only block-device personality (INT 13h or similar) — mirrors the macOS Phase 1 | planned | — |
-| 5 | Read/write + page cache (512 B DOS ↔ 4 KB NVMe) + keep-alive | planned | — |
-| 6 | FDDI-sized MSS end-to-end (el3 large-frame TX + driver `/j` already done) | partial | — |
+| 3b | NVM Read on the I/O queue (opcode 0x02, SLBA/NLB in CDW10-12, transport SGL → C2HData) | **DONE** | `cf6b07f` |
+| 3c | NVM Write (CapsuleCmd → R2T → H2CData → CapsuleResp) | **DONE** | `8a7e0cd` |
+| 4 | Read-only block-device personality: `nvmecache` (4-slot direct-mapped 512 B↔4 KB cache, `__far` data) + `nvmedisk.exe` (interactive sector browser: `r <lba>`) | **DONE** | `fd80eb1` |
+| 5 | Write-back cache (`nvmc_write_sector`, `nvmc_flush`, dirty eviction) + keep-alive (`nvt_keepalive` via `kbhit` loop) + `nvmedisk` write/flush commands | **DONE** | `8597b2b` |
+| 6 | FDDI-sized MSS end-to-end: `TCP_MSS` 4096→4446, `memcpy`/`memmove` RX path, `io_maxh2cdata` stored + H2CData chunking | **DONE** | `77f66b0` |
+| 7 | INT 13h TSR: hook INT 13h, present the NVMe namespace as a DOS drive letter | **NEXT** | — |
 
 Harness/emulator side (`elink-qemu`): connect harness `tests/nvme-connect.sh` + threaded
-spec-faithful target stub `tests/nvmetgt.py` (latest `b97cd3f`).
+spec-faithful target stub `tests/nvmetgt.py` (latest `d67c91e`, includes NVM Read/Write
+with in-memory backing store).
 
 ## How it's validated
 
@@ -48,19 +50,35 @@ spec-faithful target stub `tests/nvmetgt.py` (latest `b97cd3f`).
   data-fabric SSH `.25.100` works). Then `TARGET_IP=192.168.25.100 ./tests/nvme-connect.sh`. The full
   DOS→slirp→NAS TCP path is already proven (handshake reaches the real NAS).
 
-Current green output: `NVME=READY` + `IDENT mdts=5 nsze=16384 blocksize=4096 capacity=64MB` + `IOQ=READY qid=1`.
+Current green output (`nvmecon.exe`): `NVME=READY` + `IDENT mdts=5 nsze=16384 blocksize=4096 capacity=64MB` + `IOQ=READY qid=1` + `WRITE lba=0 OK` + `READ lba=0 got=4096: A0 A1 A2 ...`
+
+`nvmedisk.exe` commands: `r <lba>` (hex+ASCII dump), `w <lba> <fill_hex>` (fill sector, cache dirty), `f` (flush all dirty), `q` (flush + disconnect).
 
 ## Gotchas banked
 
 - **16-bit large-model stack overflow:** `nvt_connect` crashed because ~2.3 KB of PDU buffers lived
   on the stack and the packet-driver RX callback borrows the same stack. Big PDU/identify buffers must
   be `static`/file-scope.
-- **DGROUP 64 KB cap:** the 4 × 16 KB per-connection TCP buffers must be `__far` or they overflow the
-  near `_DATA` segment.
+- **DGROUP 64 KB cap:** per-connection TCP buffers (4 × 16 KB) and cache data (4 × 4 KB) must be
+  `__far` or they overflow the near `_DATA` segment. Use separate named `__far` objects + a
+  `__far * const` pointer array — Watcom does not compose `__far` with 2D array syntax cleanly.
 - **One TCP connection per NVMe queue** (spec): I/O cannot share the admin connection; hence `TCP_NCONN`.
+- **`fgets` blocks keep-alive:** the interactive `nvmedisk` loop must use `kbhit()`/`getch()` so
+  `tcp_pump()` and `nvt_keepalive()` can fire while waiting for keystrokes; `fgets` holds the CPU.
+- **`io_maxh2cdata` per queue:** the I/O queue ICResp `MAXH2CDATA` is independent of the admin
+  queue's. Storing only the admin value (and silently sending oversized H2CData on the I/O queue)
+  would break targets with a tight per-PDU limit; store both separately in `nvt_conn`.
 
-## Next concrete step — Phase 3b (NVM Read)
+## Next step — Phase 7 (INT 13h TSR)
 
-On the I/O queue (`tcp_use(1)`): build an NVM Read SQE (opcode 0x02, NSID=1, SLBA in CDW10/11, NLB
-in CDW12 (0-based), transport SGL), wrap in a CapsuleCmd, send; receive the block via C2HData into a
-caller buffer; verify byte-for-byte against a known pattern written to the stub's backing store.
+The full initiator stack is complete through Phase 6. The remaining gap to the north star is
+surfacing it as a real DOS drive:
+
+1. **INT 13h hook** — intercept function 02h (read sectors) and 03h (write sectors); dispatch to
+   `nvmc_read_sector` / `nvmc_write_sector`; return the standard BIOS status byte.
+2. **BPB / geometry** — synthesise a plausible BIOS Parameter Block from `nsze` and `block_size`
+   so DOS can mount the volume (fake CHS geometry, or use LBA extensions INT 13h AH=42h/43h).
+3. **TSR packaging** — integrate the TCP/IP stack + NVMe session + cache into a resident image,
+   connect at load time, stay resident; unload hook (`/u`) closes both TCP connections cleanly.
+4. **Drive letter assignment** — register with DOS via the drive table or a fake BPB boot sector
+   so `DIR D:` and file I/O work against the remote namespace.
