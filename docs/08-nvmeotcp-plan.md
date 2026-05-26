@@ -33,7 +33,7 @@ Design docs: `dos-nvmeotcp/docs/nvmetcp-design.md` (the lift plan), and Claude m
 | 4 | Read-only block-device personality: `nvmecache` (4-slot direct-mapped 512 B↔4 KB cache, `__far` data) + `nvmedisk.exe` (interactive sector browser: `r <lba>`) | **DONE** | `fd80eb1` |
 | 5 | Write-back cache (`nvmc_write_sector`, `nvmc_flush`, dirty eviction) + keep-alive (`nvt_keepalive` via `kbhit` loop) + `nvmedisk` write/flush commands | **DONE** | `8597b2b` |
 | 6 | FDDI-sized MSS end-to-end: `TCP_MSS` 4096→4446, `memcpy`/`memmove` RX path, `io_maxh2cdata` stored + H2CData chunking | **DONE** | `77f66b0` |
-| 7 | INT 13h TSR: hook INT 13h, present the NVMe namespace as a DOS drive letter | **NEXT** | — |
+| 7 | INT 13h TSR (`nvmetsr.exe`): hooks INT 13h + INT 2Fh (mux 0xE5), registers BIOS hard disk, `/u` unload | **DONE** | `f31cadf` |
 
 Harness/emulator side (`elink-qemu`): connect harness `tests/nvme-connect.sh` + threaded
 spec-faithful target stub `tests/nvmetgt.py` (latest `d67c91e`, includes NVM Read/Write
@@ -54,6 +54,8 @@ Current green output (`nvmecon.exe`): `NVME=READY` + `IDENT mdts=5 nsze=16384 bl
 
 `nvmedisk.exe` commands: `r <lba>` (hex+ASCII dump), `w <lba> <fill_hex>` (fill sector, cache dirty), `f` (flush all dirty), `q` (flush + disconnect).
 
+`nvmetsr.exe` install output: `NVME=READY` + `IOQ=READY` + `GEOM: C=N H=255 S=63 total=N sectors` + `DRIVE: 0x81 (~D:)` + `TSR: resident (N paragraphs)`. Then `nvmetsr /u` to unload.
+
 ## Gotchas banked
 
 - **16-bit large-model stack overflow:** `nvt_connect` crashed because ~2.3 KB of PDU buffers lived
@@ -69,16 +71,31 @@ Current green output (`nvmecon.exe`): `NVME=READY` + `IDENT mdts=5 nsze=16384 bl
   queue's. Storing only the admin value (and silently sending oversized H2CData on the I/O queue)
   would break targets with a tight per-PDU limit; store both separately in `nvt_conn`.
 
-## Next step — Phase 7 (INT 13h TSR)
+## Usage — nvmetsr.exe
 
-The full initiator stack is complete through Phase 6. The remaining gap to the north star is
-surfacing it as a real DOS drive:
+```
+nvmetsr [ip] [port]   install: connect + hook INT 13h + go resident
+nvmetsr /u            unload:  flush cache + close TCP + restore vectors + free memory
+```
 
-1. **INT 13h hook** — intercept function 02h (read sectors) and 03h (write sectors); dispatch to
-   `nvmc_read_sector` / `nvmc_write_sector`; return the standard BIOS status byte.
-2. **BPB / geometry** — synthesise a plausible BIOS Parameter Block from `nsze` and `block_size`
-   so DOS can mount the volume (fake CHS geometry, or use LBA extensions INT 13h AH=42h/43h).
-3. **TSR packaging** — integrate the TCP/IP stack + NVMe session + cache into a resident image,
-   connect at load time, stay resident; unload hook (`/u`) closes both TCP connections cleanly.
-4. **Drive letter assignment** — register with DOS via the drive table or a fake BPB boot sector
-   so `DIR D:` and file I/O work against the remote namespace.
+**First-time setup (one-time):**
+1. Add `nvmetsr 192.168.25.100 4420` to `AUTOEXEC.BAT` (before any programs that use the drive).
+2. Reboot — DOS assigns a drive letter (e.g. `D:`) to the new BIOS hard disk at boot.
+3. Run `FDISK` to create a primary partition, then `FORMAT D: /S` to lay down a FAT filesystem.
+4. From then on, `DIR D:`, `COPY`, and all standard DOS file I/O work against the NVMe namespace.
+
+**Direct access without a filesystem:** `DEBUG` can call INT 13h AH=02h/03h directly to read/write
+raw 512-byte sectors as soon as the TSR is installed, before any partition or format step.
+
+**INT 13h functions handled:**
+
+| AH | Name | Notes |
+|----|------|-------|
+| 00h | Reset | flushes write-back cache |
+| 02h | Read sectors | CHS addressing; loops via `nvmc_read_sector` |
+| 03h | Write sectors | CHS addressing; loops via `nvmc_write_sector` (write-back) |
+| 08h | Get drive params | reports 255H / 63S / nC geometry |
+| 15h | Get disk type | returns 03h (fixed disk) + sector count |
+| other | — | returns AH=01h invalid command |
+
+Non-owned drive numbers are forwarded to the previous INT 13h handler unchanged.
