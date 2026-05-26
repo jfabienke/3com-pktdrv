@@ -13,14 +13,15 @@ Phase 8 roadmap context: `docs/08-nvmeotcp-plan.md § Phase 8`.
 
 ## Prerequisites
 
-| Requirement | Reason |
-|-------------|--------|
-| CPU ≥ 386 | V86 mode, paging, VCPI/DPMI all require 386+ |
+| Requirement | Applies to |
+|-------------|-----------|
+| CPU ≥ 286 | `XMS_POLICY_XMS_COPY` — ISA bus-master DMA + INT 15h AH=87h move |
+| CPU ≥ 386 | `XMS_POLICY_VCPI` and `XMS_POLICY_DPMI` — require V86 mode paging |
 | VMM present (EMM386 / Windows 3.x enhanced) | VDS (INT 4Bh) for physical address translation |
-| HIMEM.SYS loaded | XMS EMB allocation |
+| HIMEM.SYS loaded | XMS EMB allocation (both 286 and 386+) |
 | 3C515 Corkscrew NIC | Bus-master DMA; `UP_LIST_PTR` / `EL3_DESC_*` registers |
 
-On sub-386 hardware or when the QUERY call returns CF=1 (old driver), the
+On 8088/8086 hardware or when the QUERY call returns CF=1 (old driver), the
 caller falls back to `MEM_CONVENTIONAL` — standard Crynwr PIO path, no change
 from Phase 7 behaviour.
 
@@ -30,29 +31,47 @@ from Phase 7 behaviour.
 
 Detected once during `nvmetsr.exe` cold-phase install, in this order:
 
-| Policy | Detection | RX copies | TSR size |
-|--------|-----------|-----------|----------|
-| `XMS_POLICY_VCPI` | `INT 67h AX=DE00h` → AL=0; `DE05h` page map succeeds | 0 | ~30 KB |
-| `XMS_POLICY_DPMI` | `INT 2Fh AX=1687h` → AX=0, version ≥ 1.0; `INT 31h AX=0508h` succeeds | 0 | ~30 KB |
-| `XMS_POLICY_XMS_COPY` | `INT 2Fh AX=4300h` → AL=80h (HIMEM.SYS present) | 1 | ~30 KB |
-| `MEM_CONVENTIONAL` | fallback (sub-386 / no XMS / QUERY CF=1) | 2 | ~110 KB |
+| Policy | Min CPU | Detection | RX copies | TSR size |
+|--------|---------|-----------|-----------|----------|
+| `XMS_POLICY_VCPI` | 386+ | `INT 67h AX=DE00h` → AL=0; `DE05h` page map succeeds | 0 | ~30 KB |
+| `XMS_POLICY_DPMI` | 386+ | `INT 2Fh AX=1687h` → AX=0, version ≥ 1.0; `INT 31h AX=0508h` succeeds | 0 | ~30 KB |
+| `XMS_POLICY_XMS_COPY` | 286+ | `INT 2Fh AX=4300h` → AL=80h (HIMEM.SYS present) | 1 | ~30 KB |
+| `MEM_CONVENTIONAL` | 8088+ | fallback (no XMS / QUERY CF=1) | 2 | ~110 KB |
 
 `MEM_CONVENTIONAL` never reaches the extension — no INT 60h call is made.
 
+On a 286, VCPI and DPMI are skipped (no 386 paging); detection goes directly
+to `XMS_POLICY_XMS_COPY`.
+
 ---
 
-## Ring mode and CPU floor
+## DMA descriptor mode vs. CPU tier
 
-DMA RX always uses the **2-slot ping-pong ring** (`EL3_DESC_NEXT` chains the
-two descriptors into a circle). The NIC advances automatically on each
-completion with zero inter-frame gap.
+Both DMA modes use the same two-slot ping-pong layout (`phys0`/`phys1`).
+The mode is an internal detail of `3cpd.exe`'s JIT — the caller provides
+both slot addresses identically regardless.
 
-This is unconditional: all three XMS policies require 386+, and 386+ = ring
-mode for RX. Single-transfer DMA is a TX concern only.
+| CPU | RX DMA mode | `EL3_DESC_NEXT` |
+|-----|-------------|-----------------|
+| 286 | Single-transfer | 0 (no chain) — ISR re-arms immediately after each completion |
+| 386+ | Ring | → descriptor 1 / → descriptor 0 (circular) — NIC auto-advances |
+
+**Single-transfer ping-pong (286):** on completion the ISR immediately arms
+the *other* slot and kicks `START_DMA_UP` before processing the current frame,
+minimising the gap during which a new frame could be dropped.
+
+**Ring mode (386+):** `EL3_DESC_NEXT` chains the two descriptors into a
+circle. The NIC advances to slot 1 the moment slot 0 completes, with zero
+inter-frame gap. The ISR clears the completed descriptor's status; no
+explicit re-arm is needed.
 
 ```
-TX: CPU frag  ×  DMA tier  (PIO / single-xfer 286 / ring 386+)
-RX: CPU frag  ×  mem policy (CONVENTIONAL-PIO / ring-DMA 386+)
+TX: CPU frag  ×  DMA tier    (PIO / single-xfer 286 / ring 386+)
+RX: CPU frag  ×  mem policy  (CONVENTIONAL-PIO /
+                               XMS_COPY-single 286 /
+                               XMS_COPY-ring 386+ /
+                               VCPI-ring 386+ /
+                               DPMI-ring 386+)
 ```
 
 ---
@@ -101,19 +120,19 @@ Out (CF=1):  DH = XMS_ERR_*  (ring not started; caller may retry or fall back)
 5. `cfg.slot_size ≤ TX_SLOT_SZ`
 
 On success, `3cpd.exe` builds two 16-byte descriptors in its resident data
-(`ALIGNB 16`) and programs the ring:
+(`ALIGNB 16`). The `EL3_DESC_NEXT` field is set by the JIT based on CPU tier:
 
 ```
 ; descriptor 0
-EL3_DESC_NEXT   → physical address of descriptor 1   (ring link)
-EL3_DESC_STATUS → 0                                  (NIC sets UP_COMPLETE)
-EL3_DESC_ADDR   → cfg.phys0                          (XMS slot 0)
+EL3_DESC_NEXT   → desc1_phys  (386+ ring) / 0  (286 single-transfer)
+EL3_DESC_STATUS → 0           (NIC sets UP_COMPLETE on completion)
+EL3_DESC_ADDR   → cfg.phys0   (XMS slot 0)
 EL3_DESC_LEN    → cfg.slot_size
 
 ; descriptor 1
-EL3_DESC_NEXT   → physical address of descriptor 0   (ring link back)
+EL3_DESC_NEXT   → desc0_phys  (386+ ring) / 0  (286 single-transfer)
 EL3_DESC_STATUS → 0
-EL3_DESC_ADDR   → cfg.phys1                          (XMS slot 1)
+EL3_DESC_ADDR   → cfg.phys1   (XMS slot 1)
 EL3_DESC_LEN    → cfg.slot_size
 ```
 
@@ -160,17 +179,31 @@ toggle slot index  (0 ↔ 1)
 ; ring auto-advances; no need to reprogram UP_LIST_PTR
 ```
 
-### `rx_recv_xms.asm`  (one copy)
+### `rx_recv_xms_ring.asm`  (one copy — 386+ ring mode)
 
 ```
 INT 15h AH=87h: phys_N → resident staging buffer (conventional, one FDDI frame)
 call Crynwr upcall AX=0, ES:DI=staging_buf, CX=frame_len
 clear descriptor status
 toggle slot index  (0 ↔ 1)
+; ring auto-advances — no re-arm needed
 ```
 
-The staging buffer lives in `3cpd.exe`'s resident data — sized to one FDDI
-frame (4500 bytes). `nvmetsr.exe` does not need to allocate or track it.
+### `rx_recv_xms_single.asm`  (one copy — 286 single-transfer mode)
+
+```
+toggle slot index  (0 ↔ 1)               ; select OTHER slot
+arm descriptor{new_slot} EL3_DESC_NEXT=0  ; re-arm immediately — minimise gap
+OUT UP_LIST_PTR ← desc{new_slot}_phys
+OUT CMD ← EL3_CMD_START_DMA_UP            ; kick NIC before processing old frame
+INT 15h AH=87h: phys_{old_slot} → resident staging buffer
+call Crynwr upcall AX=0, ES:DI=staging_buf, CX=frame_len
+clear old descriptor status
+```
+
+Re-arming the NIC *before* the INT 15h copy and upcall minimises the window
+during which the NIC has no armed descriptor. The staging buffer lives in
+`3cpd.exe`'s resident data — sized to one FDDI frame (4500 bytes).
 
 ### `rx_recv_conv.asm`  (two copies — current behaviour, unchanged)
 
@@ -219,8 +252,11 @@ The `3cpd.exe` ISR reads `lin0`/`lin1` on every received frame.
 
 ```
 nvmetsr.exe cold phase:
-  1. Detect CPU ≥ 386 (existing cpu_detect)
-  2. Detect memory policy: VCPI → DPMI → XMS_COPY → CONVENTIONAL
+  1. Detect CPU tier (existing cpu_detect)
+  2. Detect memory policy:
+       If CPU ≥ 386: try VCPI → DPMI → XMS_COPY → CONVENTIONAL
+       If CPU = 286: try XMS_COPY → CONVENTIONAL  (skip VCPI/DPMI)
+       If CPU < 286: CONVENTIONAL (no XMS, no DMA)
   3. If policy != CONVENTIONAL:
        a. Allocate two XMS EMBs (slot_size each) via HIMEM.SYS XMS API
        b. XMS Lock both EMBs → pin physical positions
@@ -229,7 +265,7 @@ nvmetsr.exe cold phase:
           If DPMI: INT 31h AX=0508h × 2 → lin0, lin1
           If XMS_COPY: lin0 = lin1 = 0
        e. Fill xms_rx_cfg_t
-       f. INT 60h AH=F0h AL=00h → QUERY  (verify CAP_RING set, slot_size ≤ DX)
+       f. INT 60h AH=F0h AL=00h → QUERY  (verify XMS_CAP_XMS_COPY set, slot_size ≤ DX)
        g. INT 60h AH=F0h AL=01h → CONFIGURE
   4. netif_init → nvt_connect → nvt_open_ioqueue → hook INT 13h → _dos_keep
 ```

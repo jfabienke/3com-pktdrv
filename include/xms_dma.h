@@ -25,10 +25,11 @@
 
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
 
-#define XMS_CAP_VCPI        0x0001u /* VCPI DE05h page mapping supported    */
-#define XMS_CAP_DPMI        0x0002u /* DPMI 1.0 AX=0508h mapping supported  */
-#define XMS_CAP_XMS_COPY    0x0004u /* INT 15h AH=87h copy path supported   */
-#define XMS_CAP_RING        0x0008u /* 2-slot ping-pong ring (set on 386+)  */
+#define XMS_CAP_VCPI        0x0001u /* VCPI DE05h page mapping (386+)       */
+#define XMS_CAP_DPMI        0x0002u /* DPMI 1.0 AX=0508h mapping (386+)     */
+#define XMS_CAP_XMS_COPY    0x0004u /* INT 15h AH=87h copy path (286+)      */
+#define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)           */
+#define XMS_CAP_SINGLE      0x0010u /* single-transfer descriptor mode (286) */
 
 /* ---- memory policy ----------------------------------------------------- */
 
