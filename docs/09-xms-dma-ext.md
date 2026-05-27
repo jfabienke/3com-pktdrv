@@ -1,10 +1,18 @@
 # 09 — Proprietary INT 60h XMS DMA extension
 
-Allows `nvmetsr.exe` to hand `3cpd.exe` the physical and linear addresses of
-XMS-resident receive buffers, so the 3C515 bus-master can DMA directly into
-extended memory — eliminating conventional memory from the RX hotpath and
-shrinking the `nvmetsr.exe` TSR load image from ~110 KB to ~30 KB, making
-`LOADHIGH` viable.
+Allows `nvmetsr.exe` to hand `3cpd.exe` the physical address of XMS-resident
+receive buffers, so the 3C515 bus-master can DMA directly into extended memory.
+The NIC DMA ring runs in XMS; the ISR copies received frames into conventional
+memory via INT 15h AH=87h (one CPU copy per frame).
+
+**Note on linear addresses:** `xms_rx_cfg_t` has `lin0`/`lin1` fields for
+zero-copy VCPI/DPMI delivery. These are always 0 in the current implementation.
+VCPI page mapping (DE04h/DE05h allocate/free pages; there is no VCPI call to
+map an arbitrary physical page to a V86 linear address from real/V86 mode — that
+requires the protected-mode VCPI entry point and direct page-table manipulation).
+DPMI AX=0800h maps physical→linear but returns a protected-mode linear address
+above 1 MB, not a V86-accessible real-mode segment. `XMS_COPY` (lin0=lin1=0)
+with INT 15h delivery is the correct implementation for real-mode DOS.
 
 Constants and struct definitions: `include/xms_dma.h`.  
 Phase 8 roadmap context: `docs/08-nvmeotcp-plan.md § Phase 8`.
@@ -33,15 +41,17 @@ Detected once during `nvmetsr.exe` cold-phase install, in this order:
 
 | Policy | Min CPU | Detection | RX copies | TSR size |
 |--------|---------|-----------|-----------|----------|
-| `XMS_POLICY_VCPI` | 386+ | `INT 67h AX=DE00h` → AL=0; `DE05h` page map succeeds | 0 | ~30 KB |
-| `XMS_POLICY_DPMI` | 386+ | `INT 2Fh AX=1687h` → AX=0, version ≥ 1.0; `INT 31h AX=0508h` succeeds | 0 | ~30 KB |
-| `XMS_POLICY_XMS_COPY` | 286+ | `INT 2Fh AX=4300h` → AL=80h (HIMEM.SYS present) | 1 | ~30 KB |
+| `XMS_POLICY_XMS_COPY` | 286+ | `INT 2Fh AX=4300h` → AL=80h (HIMEM.SYS present) | 1 | ~110 KB |
 | `MEM_CONVENTIONAL` | 8088+ | fallback (no XMS / QUERY CF=1) | 2 | ~110 KB |
 
 `MEM_CONVENTIONAL` never reaches the extension — no INT 60h call is made.
 
-On a 286, VCPI and DPMI are skipped (no 386 paging); detection goes directly
-to `XMS_POLICY_XMS_COPY`.
+**VCPI/DPMI note:** `XMS_POLICY_VCPI` and `XMS_POLICY_DPMI` are defined in
+`xms_dma.h` and reserved for a future zero-copy path. The `lin0`/`lin1` fields
+in `xms_rx_cfg_t` are intended for mapped V86 linear addresses (so the ISR can
+deliver without a copy), but no mechanism exists to map XMS physical pages into
+the V86 real-mode address range from user code. Both policies fall back to
+`XMS_POLICY_XMS_COPY` (lin0=lin1=0) in the current implementation.
 
 ---
 

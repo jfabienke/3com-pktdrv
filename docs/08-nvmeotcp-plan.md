@@ -78,22 +78,26 @@ The driver assumes V86 mode within a VMM implementing VDS (INT 4Bh). The cold-ph
 detects the memory environment and selects a policy; that policy drives JIT fragment
 composition — no runtime branching in the resident hotpath.
 
-**Memory policy hierarchy (detected once at install, baked into resident image):**
+**Memory policy hierarchy (detected once at install):**
 
-| Policy | Mechanism | RX copies | TX copies | TSR size |
-|--------|-----------|-----------|-----------|----------|
-| `MEM_VCPI` | XMS EMB + VCPI DE05h page mapping into V86 space | 0 | 0 | ~30 KB |
-| `MEM_DPMI` | XMS EMB + DPMI 1.0 INT 31h AX=0508h page mapping | 0 | 0 | ~30 KB |
-| `MEM_XMS_COPY` | XMS EMB + INT 15h AH=87h staging copy | 1 | 1 | ~30 KB |
-| `MEM_CONVENTIONAL` | `__far` buffers in load image (current) | 2 | 2 | ~110 KB |
+| Policy | Mechanism | RX copies | TSR size |
+|--------|-----------|-----------|----------|
+| `MEM_XMS_COPY` | XMS EMB + INT 15h AH=87h staging copy | 1 | ~110 KB |
+| `MEM_CONVENTIONAL` | `__far` buffers in load image | 2 | ~110 KB |
 
-**Detection sequence (cold phase, in order):**
+`MEM_CONVENTIONAL` is the fallback when HIMEM.SYS is absent or XMS lock fails.
 
-1. VCPI present? `INT 67h AX=DE00h` → `AL=0` → try `DE05h` page mapping
-2. DPMI 1.0? `INT 2Fh AX=1687h` → `AX=0`, version ≥ 1.0 → try `INT 31h AX=0508h`
-3. XMS present? `INT 2Fh AX=4300h` → `AL=80h` (HIMEM.SYS) → allocate EMB, VDS lock,
-   verify physical < 16 MB (ISA DMA 24-bit limit), verify contiguous
-4. Fallback → `MEM_CONVENTIONAL` (no XMS, or VDS lock failed)
+**VCPI/DPMI zero-copy (deferred):** `XMS_POLICY_VCPI` and `XMS_POLICY_DPMI` are
+reserved in `xms_dma.h` but not implementable from real-mode/V86 user code.
+VCPI page-table manipulation requires the protected-mode VCPI entry point (DE01h).
+DPMI AX=0800h returns a protected-mode linear address above 1 MB (not a V86
+real-mode segment). The TSR stays ~110 KB in both XMS_COPY and CONVENTIONAL mode.
+
+**Detection sequence (cold phase):**
+
+1. XMS present? `INT 2Fh AX=4300h` → `AL=80h` (HIMEM.SYS) → allocate EMB, lock,
+   verify physical < 16 MB (ISA bus-master 24-bit limit)
+2. Fallback → `MEM_CONVENTIONAL` (no XMS, or lock failed)
 
 **ISA DMA addressing note:** AT-class ISA DMA uses 24-bit physical addresses (8237A 16-bit
 counter + 8-bit page register) — full 16 MB range. All realistic XMS on DOS machines is
