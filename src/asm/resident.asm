@@ -584,6 +584,9 @@ dbg_logb:
 
 ;--- XMS DMA QUERY: return capability flags in BX, max slot size in DX ---
 f_xms_query:
+        ; DMA extension requires bus-master NIC (3C515); 3C509 is PIO-only
+        cmp     byte [g_use_dma], 0
+        je      .no_dma
         ; Caps are fixed by JIT fragment selection at install time.
         ; 286: CONV_SINGLE only — XMS single-transfer excluded (INT 15h ~1200 us > inter-frame)
         ; 386+: XMS_RING + RING + CONV_SINGLE + CONV_RING
@@ -600,6 +603,9 @@ f_xms_query:
 .done:
         mov     [bp + F_DX], ax
         clc
+        ret
+.no_dma:
+        stc
         ret
 
 ;--- XMS DMA CONFIGURE: ES:DI -> xms_rx_cfg_t; build descriptors + arm UP_LIST_PTR ---
