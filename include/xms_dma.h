@@ -1,12 +1,15 @@
 /*
- * xms_dma.h — Proprietary INT 60h extension: XMS DMA receive ring.
+ * xms_dma.h — Proprietary INT 60h extension: DMA receive ring configuration.
  *
  * Allows nvmetsr.exe to hand 3cpd.exe the physical/linear addresses of
- * XMS-resident receive buffers so the 3C515 bus-master can DMA directly
- * into extended memory, bypassing conventional memory entirely.
+ * receive buffers so the 3C515 bus-master can DMA directly into them.
  *
- * Requires 386+ (V86 mode under a VMM implementing VDS). On sub-386 or
- * when the query call returns CF=1, caller falls back to MEM_CONVENTIONAL.
+ * Two buffer classes are supported:
+ *   CONV_SINGLE  conventional memory, one slot, single-transfer (386 / 10 Mbps)
+ *   CONV_RING    conventional memory, two slots, ring mode      (486+ / 100 Mbps)
+ *   XMS_COPY     XMS extended memory, two slots, ring + INT 15h copy (286+)
+ *
+ * On sub-286 or when the query call returns CF=1, caller falls back to PIO.
  *
  * See docs/09-xms-dma-ext.md for the full design.
  */
@@ -25,20 +28,20 @@
 
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
 
-#define XMS_CAP_VCPI        0x0001u /* VCPI DE05h page mapping (386+)       */
-#define XMS_CAP_DPMI        0x0002u /* DPMI 1.0 AX=0508h mapping (386+)     */
-#define XMS_CAP_XMS_COPY    0x0004u /* INT 15h AH=87h copy path (286+)      */
-#define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)           */
-#define XMS_CAP_SINGLE      0x0010u /* single-transfer descriptor mode (286) */
+#define XMS_CAP_CONV_SINGLE 0x0001u /* conventional mem, 1 slot, single-xfer (386+)  */
+#define XMS_CAP_CONV_RING   0x0002u /* conventional mem, 2 slots, ring mode  (386+)  */
+#define XMS_CAP_XMS_COPY    0x0004u /* XMS + INT 15h AH=87h copy path        (286+)  */
+#define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)                   */
+#define XMS_CAP_SINGLE      0x0010u /* single-transfer descriptor mode (286+)        */
 
 /* ---- memory policy ----------------------------------------------------- */
 
 typedef enum {
-    XMS_POLICY_VCPI     = 0,   /* XMS + VCPI DE05h → V86 linear mapping; zero CPU copies  */
-    XMS_POLICY_DPMI     = 1,   /* XMS + DPMI 1.0 AX=0508h mapping;       zero CPU copies  */
-    XMS_POLICY_XMS_COPY = 2,   /* XMS + INT 15h AH=87h staging copy;      one CPU copy    */
+    XMS_POLICY_CONV_SINGLE = 0, /* conventional memory, single-transfer; zero CPU copies  */
+    XMS_POLICY_CONV_RING   = 1, /* conventional memory, ring mode;        zero CPU copies  */
+    XMS_POLICY_XMS_COPY    = 2, /* XMS + INT 15h AH=87h staging copy;      one CPU copy   */
 } xms_mem_policy_t;
-/* MEM_CONVENTIONAL (sub-386 / no XMS): no extension call; standard Crynwr PIO path */
+/* MEM_CONVENTIONAL (sub-286 / no DMA): no extension call; standard Crynwr PIO path */
 
 /* ---- error codes (DH on CF=1) ------------------------------------------ */
 

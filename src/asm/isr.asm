@@ -311,7 +311,10 @@ xms_rx_deliver:
         cmp     ax, 14
         jb      .discard
 
-        ; --- 4. 286 single-transfer: pre-arm OTHER slot before processing ---
+        ; --- 4. 286/XMS_COPY single-transfer: pre-arm OTHER slot before processing ---
+        ; Skip for CONV_SINGLE (1 slot only; re-arm happens AFTER upcall instead)
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV_SINGLE
+        je      .no_prearm
         cmp     byte [g_tx_ring], 0
         jne     .no_prearm
         xor     byte [xms_slot_idx], 1  ; toggle to the OTHER (new) slot
@@ -381,7 +384,7 @@ xms_rx_deliver:
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
         jae     .hdr_int15
 
-        ; VCPI/DPMI: read 14 bytes from lin_seg:0 into hdr_buf
+        ; CONV_SINGLE/CONV_RING: read 14 bytes from lin_seg:0 into hdr_buf
         mov     es, [bp-6]              ; ES = lin_seg
         xor     bx, bx                  ; source offset = 0
         mov     di, hdr_buf
@@ -534,9 +537,36 @@ xms_rx_deliver:
         xor     ax, ax
         mov     [si + EL3_DESC_STATUS], ax
         mov     [si + EL3_DESC_STATUS + 2], ax
-        ; 386+ ring: toggle slot index AFTER delivery
+
+        ; --- 12. CONV_SINGLE: post-deliver re-arm desc0 + StartDmaUp ---
+        ; (1 slot only; xms_slot_idx stays 0; gap is acceptable at 10 Mbps)
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV_SINGLE
+        jne     .toggle
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, xms_rx_desc0
+        adc     dx, 0
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        jmp     .done                   ; no slot toggle for CONV_SINGLE
+
+        ; --- 13. Slot toggle for ring and XMS_COPY+286 ---
+.toggle:
         cmp     byte [g_tx_ring], 0
-        je      .done                   ; 286: already toggled during pre-arm
+        je      .done                   ; XMS_COPY+286: already toggled during pre-arm
         xor     byte [xms_slot_idx], 1
 
 .done:

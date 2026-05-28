@@ -19,17 +19,17 @@ XMS_DMA_RELEASE     equ 0x02    ; AL: release ring, stop DMA
 
 ; ---- capability flags (BX on successful QUERY) --------------------------
 
-XMS_CAP_VCPI        equ 0x0001  ; VCPI DE05h page mapping (386+)
-XMS_CAP_DPMI        equ 0x0002  ; DPMI 1.0 AX=0508h mapping (386+)
-XMS_CAP_XMS_COPY    equ 0x0004  ; INT 15h AH=87h copy path (286+)
+XMS_CAP_CONV_SINGLE equ 0x0001  ; conventional mem, 1 slot, single-xfer (386+)
+XMS_CAP_CONV_RING   equ 0x0002  ; conventional mem, 2 slots, ring mode  (386+)
+XMS_CAP_XMS_COPY    equ 0x0004  ; XMS + INT 15h AH=87h copy path        (286+)
 XMS_CAP_RING        equ 0x0008  ; ring descriptor mode (386+)
-XMS_CAP_SINGLE      equ 0x0010  ; single-transfer descriptor mode (286)
+XMS_CAP_SINGLE      equ 0x0010  ; single-transfer descriptor mode (286+)
 
 ; ---- memory policy (xms_rx_cfg_t.policy field) --------------------------
 
-XMS_POLICY_VCPI     equ 0       ; XMS + VCPI DE05h -> zero CPU copies
-XMS_POLICY_DPMI     equ 1       ; XMS + DPMI 1.0 AX=0508h -> zero CPU copies
-XMS_POLICY_XMS_COPY equ 2       ; XMS + INT 15h AH=87h staging -> one CPU copy
+XMS_POLICY_CONV_SINGLE equ 0    ; conventional memory, single-transfer; zero CPU copies
+XMS_POLICY_CONV_RING   equ 1    ; conventional memory, ring mode;        zero CPU copies
+XMS_POLICY_XMS_COPY    equ 2    ; XMS + INT 15h AH=87h staging copy;     one CPU copy
 
 ; ---- error codes (DH on CF=1) -------------------------------------------
 

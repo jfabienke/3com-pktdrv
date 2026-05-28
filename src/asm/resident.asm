@@ -584,10 +584,11 @@ dbg_logb:
 
 ;--- XMS DMA QUERY: return capability flags in BX, max slot size in DX ---
 f_xms_query:
+        ; CONV_SINGLE + CONV_RING always available on 386+ (g_tx_ring set by JIT)
         mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE
         cmp     byte [g_tx_ring], 0
         je      .no_ring
-        or      bx, XMS_CAP_RING | XMS_CAP_VCPI | XMS_CAP_DPMI
+        or      bx, XMS_CAP_RING | XMS_CAP_CONV_SINGLE | XMS_CAP_CONV_RING
 .no_ring:
         mov     [bp + F_BX], bx
         mov     ax, EL3_MAX_FRAME
@@ -660,10 +661,19 @@ f_xms_configure:
         mov     [xms_rx_desc1 + EL3_DESC_LEN + 2], ax
         mov     [xms_rx_desc1 + EL3_DESC_STATUS], ax
         mov     [xms_rx_desc1 + EL3_DESC_STATUS + 2], ax
-        ; set NEXT fields based on g_tx_ring (ring vs single-transfer)
+        ; set NEXT fields:
+        ;   CONV_SINGLE: NEXT=0 on desc0 (1-slot, ISR re-arms after deliver)
+        ;   CONV_RING:   chain desc0→desc1→desc0 (ring, NIC auto-advances)
+        ;   XMS_COPY+386 (g_tx_ring=1): same ring chain as CONV_RING
+        ;   XMS_COPY+286 (g_tx_ring=0): NEXT=0 on both (ISR pre-arms other slot)
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV_RING
+        je      .do_ring
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        jne     .single_next        ; CONV_SINGLE: always single-transfer
         cmp     byte [g_tx_ring], 0
-        je      .single_next
-        ; 386+ ring: phys(CS:xms_rx_desc1) -> desc0.NEXT; phys(CS:xms_rx_desc0) -> desc1.NEXT
+        je      .single_next        ; XMS_COPY + 286: single-transfer
+.do_ring:
+        ; ring: phys(CS:xms_rx_desc1) -> desc0.NEXT; phys(CS:xms_rx_desc0) -> desc1.NEXT
         mov     ax, cs
         mov     cl, 4
         shl     ax, cl
@@ -690,17 +700,17 @@ f_xms_configure:
         mov     [xms_rx_desc1 + EL3_DESC_NEXT + 2], dx
         jmp     .next_done
 .single_next:
-        ; 286 single-transfer: NEXT = 0 (no chain; ISR re-arms manually)
         xor     ax, ax
         mov     [xms_rx_desc0 + EL3_DESC_NEXT], ax
         mov     [xms_rx_desc0 + EL3_DESC_NEXT + 2], ax
         mov     [xms_rx_desc1 + EL3_DESC_NEXT], ax
         mov     [xms_rx_desc1 + EL3_DESC_NEXT + 2], ax
 .next_done:
-        ; pre-set GDT access bytes for INT 15h AH=87h (entries 2 and 3, src and dst)
-        mov     byte [xms_gdt + 21], 0x93   ; source descriptor access byte (present, read/write)
+        ; GDT for INT 15h AH=87h: only needed for XMS_COPY
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        jne     .skip_gdt
+        mov     byte [xms_gdt + 21], 0x93   ; source descriptor access byte
         mov     byte [xms_gdt + 29], 0x93   ; destination descriptor access byte
-        ; zero all other GDT bytes (entries 0,1,4,5)
         xor     ax, ax
         mov     [xms_gdt +  0], ax
         mov     [xms_gdt +  2], ax
@@ -710,16 +720,14 @@ f_xms_configure:
         mov     [xms_gdt + 10], ax
         mov     [xms_gdt + 12], ax
         mov     [xms_gdt + 14], ax
-        mov     word [xms_gdt + 16], 0   ; src limit
-        mov     [xms_gdt + 18], ax       ; src base 0-15
-        mov     [xms_gdt + 20], al       ; src base 16-23
-        ; access byte [21] already set above
-        mov     [xms_gdt + 22], ax       ; src base 24-31 / reserved
-        mov     word [xms_gdt + 24], 0   ; dst limit
-        mov     [xms_gdt + 26], ax       ; dst base 0-15
-        mov     [xms_gdt + 28], al       ; dst base 16-23
-        ; access byte [29] already set above
-        mov     [xms_gdt + 30], ax       ; dst base 24-31 / reserved
+        mov     word [xms_gdt + 16], 0
+        mov     [xms_gdt + 18], ax
+        mov     [xms_gdt + 20], al
+        mov     [xms_gdt + 22], ax
+        mov     word [xms_gdt + 24], 0
+        mov     [xms_gdt + 26], ax
+        mov     [xms_gdt + 28], al
+        mov     [xms_gdt + 30], ax
         mov     [xms_gdt + 32], ax
         mov     [xms_gdt + 34], ax
         mov     [xms_gdt + 36], ax
@@ -728,6 +736,7 @@ f_xms_configure:
         mov     [xms_gdt + 42], ax
         mov     [xms_gdt + 44], ax
         mov     [xms_gdt + 46], ax
+.skip_gdt:
         ; slot index = 0
         mov     byte [xms_slot_idx], 0
         ; arm UP_LIST_PTR <- phys(CS:xms_rx_desc0)
