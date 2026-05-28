@@ -19,24 +19,21 @@ XMS_DMA_RELEASE     equ 0x02    ; AL: release ring, stop DMA
 
 ; ---- capability flags (BX on successful QUERY) --------------------------
 ; Caps are fixed at install time by JIT fragment selection:
-;   286 binary:  XMS_COPY | SINGLE | CONV_SINGLE
-;   386+ binary: XMS_RING | RING   | CONV_SINGLE | CONV_RING
+;   286 binary:  CONV_SINGLE
+;   386+ binary: XMS_RING | RING | CONV_SINGLE | CONV_RING
 
 XMS_CAP_CONV_SINGLE equ 0x0001  ; conventional mem, 1 slot, single-xfer (286+)
 XMS_CAP_CONV_RING   equ 0x0002  ; conventional mem, 2 slots, ring mode  (386+)
-XMS_CAP_XMS_COPY    equ 0x0004  ; XMS + INT 15h single-xfer             (286)
 XMS_CAP_RING        equ 0x0008  ; ring descriptor mode (386+)
-XMS_CAP_SINGLE      equ 0x0010  ; single-transfer descriptor mode (286+)
 XMS_CAP_XMS_RING    equ 0x0020  ; XMS + INT 15h ring mode               (386+)
 
 ; ---- memory policy (xms_rx_cfg_t.policy field) --------------------------
-; Bit 0 encodes ring/single: 0=single (policies 0,2), 1=ring (policies 1,3).
-; Policies >= XMS_POLICY_XMS_COPY require GDT setup (INT 15h AH=87h).
+; CONV_SINGLE(0) is the only single-transfer policy; CONFIGURE uses a single CMP.
+; Policies >= XMS_POLICY_XMS_RING(2) require GDT setup (INT 15h AH=87h).
 
 XMS_POLICY_CONV_SINGLE equ 0    ; conventional memory, single-transfer; zero CPU copies
 XMS_POLICY_CONV_RING   equ 1    ; conventional memory, ring mode;        zero CPU copies
-XMS_POLICY_XMS_COPY    equ 2    ; XMS + INT 15h single-xfer (286);       one CPU copy
-XMS_POLICY_XMS_RING    equ 3    ; XMS + INT 15h ring mode   (386+);      one CPU copy
+XMS_POLICY_XMS_RING    equ 2    ; XMS + INT 15h ring mode   (386+);      one CPU copy
 
 ; ---- error codes (DH on CF=1) -------------------------------------------
 

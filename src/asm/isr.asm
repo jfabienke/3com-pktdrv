@@ -381,7 +381,7 @@ xms_rx_deliver:
         mov     [bp-6], di              ; lin_seg
 
         ; --- 6. Read 14-byte Ethernet header into hdr_buf ---
-        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_RING
         jae     .hdr_int15
 
         ; CONV_SINGLE/CONV_RING: read 14 bytes from lin_seg:0 into hdr_buf
@@ -456,7 +456,7 @@ xms_rx_deliver:
         mov     [cur_handle], si
 
         ; --- 8. Upcall 1 (AX=0): request buffer ---
-        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_RING
         jae     .up1_no_hint
         mov     es, [bp-6]              ; VCPI/DPMI hint: lin_seg:0
         xor     di, di
@@ -477,7 +477,7 @@ xms_rx_deliver:
         mov     [appbuf_off], di
 
         ; --- 9. XMS_COPY: INT 15h to copy full frame into appbuf ---
-        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_RING
         jb      .no_copy
         ; src: phys_N, limit = rx_len - 1
         mov     ax, [bp-2]
