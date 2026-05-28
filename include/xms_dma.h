@@ -4,12 +4,14 @@
  * Allows nvmetsr.exe to hand 3cpd.exe the physical/linear addresses of
  * receive buffers so the 3C515 bus-master can DMA directly into them.
  *
- * Two buffer classes are supported:
- *   CONV_SINGLE  conventional memory, one slot, single-transfer (386 / 10 Mbps)
- *   CONV_RING    conventional memory, two slots, ring mode      (486+ / 100 Mbps)
- *   XMS_COPY     XMS extended memory, two slots, ring + INT 15h copy (286+)
+ * Three buffer classes are supported (two DMA modes each):
+ *   CONV_SINGLE  conventional memory, 1 slot, single-transfer       (286+  / 10  Mbps)
+ *   CONV_RING    conventional memory, 2 slots, ring mode            (386+ / 100  Mbps)
+ *   XMS_COPY     XMS extended memory, 1 slot, single + INT 15h copy (286   / 10  Mbps)
+ *   XMS_RING     XMS extended memory, 2 slots, ring  + INT 15h copy (386+ / 100  Mbps)
  *
- * On sub-286 or when the query call returns CF=1, caller falls back to PIO.
+ * Caps are determined at install time by CPU-generation JIT selection.
+ * On sub-286 or when QUERY returns CF=1, caller falls back to PIO.
  *
  * See docs/09-xms-dma-ext.md for the full design.
  */
@@ -27,21 +29,33 @@
 #define XMS_DMA_RELEASE     0x02u   /* AL: release ring, stop DMA, restore conventional path */
 
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
-
-#define XMS_CAP_CONV_SINGLE 0x0001u /* conventional mem, 1 slot, single-xfer (386+)  */
+/*
+ * Caps are set in stone at install time by JIT fragment selection.
+ * 286-assembled binary: XMS_COPY + SINGLE + CONV_SINGLE
+ * 386+-assembled binary: XMS_RING + RING  + CONV_SINGLE + CONV_RING
+ */
+#define XMS_CAP_CONV_SINGLE 0x0001u /* conventional mem, 1 slot, single-xfer (286+)  */
 #define XMS_CAP_CONV_RING   0x0002u /* conventional mem, 2 slots, ring mode  (386+)  */
-#define XMS_CAP_XMS_COPY    0x0004u /* XMS + INT 15h AH=87h copy path        (286+)  */
+#define XMS_CAP_XMS_COPY    0x0004u /* XMS + INT 15h single-xfer             (286)   */
 #define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)                   */
 #define XMS_CAP_SINGLE      0x0010u /* single-transfer descriptor mode (286+)        */
+#define XMS_CAP_XMS_RING    0x0020u /* XMS + INT 15h ring mode               (386+)  */
 
 /* ---- memory policy ----------------------------------------------------- */
-
+/*
+ * Policy values are paired by bit 0: 0=single, 1=ring.
+ * This lets the CONFIGURE NEXT-field setup use a single TEST instruction.
+ *   bit0=0: CONV_SINGLE(0), XMS_COPY(2)  → NEXT=0, ISR re-arms or pre-arms
+ *   bit0=1: CONV_RING(1),   XMS_RING(3)  → NEXT chained, NIC auto-advances
+ * Policies ≥ XMS_COPY(2) require GDT setup for INT 15h AH=87h.
+ */
 typedef enum {
     XMS_POLICY_CONV_SINGLE = 0, /* conventional memory, single-transfer; zero CPU copies  */
     XMS_POLICY_CONV_RING   = 1, /* conventional memory, ring mode;        zero CPU copies  */
-    XMS_POLICY_XMS_COPY    = 2, /* XMS + INT 15h AH=87h staging copy;      one CPU copy   */
+    XMS_POLICY_XMS_COPY    = 2, /* XMS + INT 15h single-xfer (286);        one CPU copy   */
+    XMS_POLICY_XMS_RING    = 3, /* XMS + INT 15h ring mode   (386+);       one CPU copy   */
 } xms_mem_policy_t;
-/* MEM_CONVENTIONAL (sub-286 / no DMA): no extension call; standard Crynwr PIO path */
+/* No policy value = no extension call; standard Crynwr PIO path */
 
 /* ---- error codes (DH on CF=1) ------------------------------------------ */
 

@@ -584,11 +584,13 @@ dbg_logb:
 
 ;--- XMS DMA QUERY: return capability flags in BX, max slot size in DX ---
 f_xms_query:
-        ; CONV_SINGLE + CONV_RING always available on 386+ (g_tx_ring set by JIT)
-        mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE
+        ; Caps are fixed by JIT fragment selection at install time.
+        ; 286: single-transfer XMS + conventional single (HIMEM gives XMS_COPY)
+        ; 386+: ring XMS + conventional ring (replaces single with ring variants)
+        mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE | XMS_CAP_CONV_SINGLE
         cmp     byte [g_tx_ring], 0
         je      .no_ring
-        or      bx, XMS_CAP_RING | XMS_CAP_CONV_SINGLE | XMS_CAP_CONV_RING
+        mov     bx, XMS_CAP_XMS_RING | XMS_CAP_RING | XMS_CAP_CONV_SINGLE | XMS_CAP_CONV_RING
 .no_ring:
         mov     [bp + F_BX], bx
         mov     ax, EL3_MAX_FRAME
@@ -611,8 +613,8 @@ f_xms_configure:
         ; validate version
         cmp     byte [es:bx + XMS_CFG_version], XMS_CFG_VERSION
         jne     .ever
-        ; validate policy
-        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_COPY
+        ; validate policy (0=CONV_SINGLE … 3=XMS_RING)
+        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_RING
         ja      .epol
         ; validate phys0 < 16 MB: byte[3] of the 32-bit physical address must be 0
         ; (if phys[31:24]=0 then phys ≤ 0x00FFFFFF = 16MB-1, within ISA DMA range)
@@ -661,17 +663,11 @@ f_xms_configure:
         mov     [xms_rx_desc1 + EL3_DESC_LEN + 2], ax
         mov     [xms_rx_desc1 + EL3_DESC_STATUS], ax
         mov     [xms_rx_desc1 + EL3_DESC_STATUS + 2], ax
-        ; set NEXT fields:
-        ;   CONV_SINGLE: NEXT=0 on desc0 (1-slot, ISR re-arms after deliver)
-        ;   CONV_RING:   chain desc0→desc1→desc0 (ring, NIC auto-advances)
-        ;   XMS_COPY+386 (g_tx_ring=1): same ring chain as CONV_RING
-        ;   XMS_COPY+286 (g_tx_ring=0): NEXT=0 on both (ISR pre-arms other slot)
-        cmp     byte [xms_rx_policy], XMS_POLICY_CONV_RING
-        je      .do_ring
-        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jne     .single_next        ; CONV_SINGLE: always single-transfer
-        cmp     byte [g_tx_ring], 0
-        je      .single_next        ; XMS_COPY + 286: single-transfer
+        ; set NEXT fields: policy bit 0 encodes ring(1) vs single(0)
+        ;   bit0=0: CONV_SINGLE(0), XMS_COPY(2) → NEXT=0
+        ;   bit0=1: CONV_RING(1),   XMS_RING(3) → chain desc0→desc1→desc0
+        test    byte [xms_rx_policy], 1
+        jz      .single_next
 .do_ring:
         ; ring: phys(CS:xms_rx_desc1) -> desc0.NEXT; phys(CS:xms_rx_desc0) -> desc1.NEXT
         mov     ax, cs
@@ -706,9 +702,9 @@ f_xms_configure:
         mov     [xms_rx_desc1 + EL3_DESC_NEXT], ax
         mov     [xms_rx_desc1 + EL3_DESC_NEXT + 2], ax
 .next_done:
-        ; GDT for INT 15h AH=87h: only needed for XMS_COPY
+        ; GDT for INT 15h AH=87h: needed for XMS_COPY(2) and XMS_RING(3); skip for CONV paths(0,1)
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jne     .skip_gdt
+        jb      .skip_gdt
         mov     byte [xms_gdt + 21], 0x93   ; source descriptor access byte
         mov     byte [xms_gdt + 29], 0x93   ; destination descriptor access byte
         xor     ax, ax
