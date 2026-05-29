@@ -78,6 +78,7 @@ install:
         ; modes (no RX-DMA arm) -- bidirectional RX-DMA dropped ACKs; see the ISR RX-COMPLETE path.
         cmp     byte [g_use_dma], 0
         je      .no_dma
+        mov     byte [g_tx_in_flight], 0 ; clear re-entrance guard before TSR activates
         cmp     byte [g_tx_ring], 0
         je      .no_dma                 ; 286 single-transfer: nothing to arm (RX is PIO, no ring)
         call    tx_ring_init            ; 386+ ring: init the TX descriptors/slots

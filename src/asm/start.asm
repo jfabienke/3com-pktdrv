@@ -135,6 +135,7 @@ g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286)
 g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
+g_tx_in_flight: resb 1             ; 1 while dma_tx_single holds the DMA channel (re-entrance guard)
 g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking TX ring (movsd copy); 0 = 286 -> blocking zero-copy single-transfer
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)

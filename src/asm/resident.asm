@@ -247,6 +247,8 @@ f_send_pkt:
         clc
         ret
 .tx_single:
+        cmp     byte [g_tx_in_flight], 0
+        jne     .tx_pio                 ; re-entrant call from upcall: fall back to PIO for this frame
         call    dma_tx_single           ; 286: zero-copy DMA straight from the caller's buffer (blocking)
         clc
         ret
@@ -452,6 +454,7 @@ dma_tx_single:
         out     dx, ax                  ; high word
         ; arm completion, then kick StartDmaDown (cmd 0x14, param != 0)
         mov     byte [g_tx_done], 0     ; cleared with IF=0, so the ISR can't race ahead
+        mov     byte [g_tx_in_flight], 1 ; mark channel busy before opening interrupts
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_START_DMA_DOWN
@@ -476,6 +479,7 @@ dma_tx_single:
         inc     word [stat_txwait]      ; no TxComplete in time (wedged card) -- counted, not fatal
 .dma_done:
         cli                             ; restore the INT 60h handler's IF=0 invariant
+        mov     byte [g_tx_in_flight], 0
         ret
 
 ;--- 6: get_address -- copy our MAC to the caller's ES:DI, return CX = length ---
