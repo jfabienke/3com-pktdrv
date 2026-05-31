@@ -241,10 +241,25 @@ f_send_pkt:
         inc     word [stat_tx]
         cmp     byte [g_use_dma], 0     ; bus-master DMA TX path (3C515, >=286)?
         je      .tx_pio
+        ; ISR upcall context: limit ring enqueue to keep at least one slot free for the
+        ; main-loop ring-full wait (STI/HLT) to escape. Without this, the pattern is:
+        ;   TX_COMPLETE drains count N→N-1, then RX upcall enqueues N-1→N, main loop
+        ;   re-checks and still sees count=N — the W-wait never exits.
+        ; Fix: in the ISR, only enqueue if count < TX_RING_N-1 so that after enqueue
+        ; count ≤ TX_RING_N-1 < TX_RING_N and the main-loop wait can escape.
+        ; When count ≥ TX_RING_N-1, fall through to PIO for this frame.
+        cmp     byte [g_isr_busy], 0
+        jz      .tx_check_ring          ; not in ISR: use ring unconditionally
+        cmp     word [tx_ring_count], TX_RING_N - 1
+        jae     .tx_pio                 ; ISR + count ≥ N-1: PIO to leave room for main loop
+.tx_check_ring:
         cmp     byte [g_tx_ring], 0     ; 386+ -> non-blocking ring; 286 -> zero-copy single-transfer
         je      .tx_single
         call    dma_tx_enqueue          ; 386+: copy to a ring slot, ISR drains the card (non-blocking)
-        clc
+        jc      .tx_pio                 ; ring full past timeout, or ISR-context full -> PIO THIS frame.
+                                        ; NEVER drop: a frame dropped but reported sent (CF=0) stalls TCP
+                                        ; until its RTO -- fatal during the latency-tight NVMe handshake.
+        clc                             ; enqueued -> the TxComplete ISR drains it
         ret
 .tx_single:
         cmp     byte [g_tx_in_flight], 0
@@ -303,16 +318,51 @@ dma_tx_enqueue:
 .eq_wait:
         cmp     word [tx_ring_count], TX_RING_N
         jb      .eq_have
+        ; Inside the NIC ISR upcall (g_isr_busy>0), the DMA completion ISR can't fire:
+        ; reentrancy guard takes the 'Z' path (EOI, no TX_COMPLETE processing) and the
+        ; edge-triggered PIC never re-fires. STI/HLT would spin the full 9-tick timeout
+        ; without ever draining a slot. Signal the caller to fall back to PIO instead.
+        cmp     byte [g_isr_busy], 0
+        jnz     .eq_isr_full
         mov     ax, [es:BIOS_TICK_COUNT]
         sub     ax, bx
         cmp     ax, EL3_DMA_TX_TICKS
         jae     .eq_full                        ; ring still full after the timeout -> drop
+        push    ax
+        push    dx
+.eq_w_tx:   mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .eq_w_tx
+        mov     dx, 0x3F8
+        mov     al, 'W'
+        out     dx, al
+        pop     dx
+        pop     ax
         sti                                     ; let the TxComplete ISR drain a slot
         hlt
         cli
         jmp     .eq_wait
+.eq_isr_full:
+        stc                                     ; ISR context, ring full: tell caller to use PIO
+        ret
 .eq_full:
-        inc     word [stat_txwait]              ; dropped: ring never drained (wedged card)
+        ; Ring stayed full for the whole timeout. Do NOT drop -- return CF=1 so f_send_pkt sends THIS
+        ; frame via PIO instead. The ring is a throughput optimization; correctness (every accepted
+        ; frame is actually transmitted) must never depend on it draining in time. 'P' marks the fallback.
+        inc     word [stat_txwait]              ; count ring-full -> PIO fallbacks
+        push    ax
+        push    dx
+.eq_p_tx:   mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .eq_p_tx
+        mov     dx, 0x3F8
+        mov     al, 'P'
+        out     dx, al
+        pop     dx
+        pop     ax
+        stc                                     ; -> caller (f_send_pkt) falls back to PIO for this frame
         ret
 .eq_have:
         ; copy caller frame (F_DS:F_SI, F_CX bytes) into slot[head] = tx_slots + head*TX_SLOT_SZ
@@ -361,9 +411,20 @@ dma_tx_enqueue:
         inc     word [tx_ring_count]
         ; if the card is idle, kick the oldest queued slot
         cmp     byte [tx_dma_busy], 0
-        jne     .eq_done
+        jne     .eq_queued
         call    tx_kick
-.eq_done:
+        ret
+.eq_queued:
+        ; DMA in progress: frame queued but no kick needed -- print 'q'
+        push    dx
+.eq_q_tx: mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .eq_q_tx
+        mov     dx, 0x3F8
+        mov     al, 'q'
+        out     dx, al
+        pop     dx
         ret
 
 ;------------------------------------------------------------------------------
@@ -371,6 +432,17 @@ dma_tx_enqueue:
 ; phys to DownListPtr and issue StartDmaDown. Sets tx_dma_busy. Enter DS=CS. Clobbers ax,bx,cx,dx.
 ;------------------------------------------------------------------------------
 tx_kick:
+        push    ax
+        push    dx
+.tx_k_tx: mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .tx_k_tx
+        mov     dx, 0x3F8
+        mov     al, 'K'
+        out     dx, al
+        pop     dx
+        pop     ax
         mov     bx, [tx_ring_tail]
         mov     cl, 4
         shl     bx, cl                          ; tail * 16

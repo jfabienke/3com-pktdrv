@@ -73,12 +73,18 @@ EL3_W1_DELTA_VORTEX     equ 0x10
 EL3_TXS_COMPLETE        equ 0x80     ; a TX status entry is present
 EL3_TXS_RESET_MASK      equ 0x30     ; underrun (0x10) | jabber (0x20) -> needs TxReset
 
-; ---- status bits ----
+; ---- status bits (IntStatus, command/status reg 0x0E; same layout across the 3c59x lineage) ----
 EL3_ST_INT_LATCH        equ 0x0001
 EL3_ST_ADAPTER_FAILURE  equ 0x0002   ; RX engine wedged -> needs RX_RESET (ISR self-heals)
-EL3_ST_TX_COMPLETE      equ 0x0004
+EL3_ST_TX_COMPLETE      equ 0x0004   ; TX done (bus-master DMA + PIO; emulator signals this for down-DMA)
 EL3_ST_RX_COMPLETE      equ 0x0010
-EL3_ST_UP_COMPLETE      equ 0x0080   ; 3C515 UpList DMA transfer done
+EL3_ST_STATS_FULL       equ 0x0080   ; statistics registers near overflow (a.k.a. UpdateStats)
+EL3_ST_DOWN_COMPLETE    equ 0x0200   ; DownList (TX) DMA done on real 3c59x HW (emulator uses TX_COMPLETE)
+; UpList (RX) DMA done is bit 10 = 0x0400. It was previously (wrongly) 0x0080 -- that is StatsFull,
+; not UpComplete (confirmed vs the QEMU model's el3_core.h: STAT_STATS_FULL=0x0080, STAT_UP_COMPLETE=0x0400).
+; The wrong value silently disabled the RX-DMA UpComplete IRQ (f_xms_configure enables this bit in the
+; SetIntEnable mask), so RX stayed PIO. The corrected value is exercised by CONV_RING (nvme connect READY).
+EL3_ST_UP_COMPLETE      equ 0x0400
 EL3_ST_CMD_BUSY         equ 0x1000
 
 ; ---- Window 1: operating (TX/RX FIFO + status) ----

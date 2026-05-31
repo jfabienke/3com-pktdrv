@@ -41,8 +41,30 @@ nic_isr:
 
         ; --- reentrancy guard ---
         cmp     byte [g_isr_busy], 0
-        jne     .eoi
+        je      .isr_free
+        ; reentrant: print 'Z' and skip
+        push    dx
+.isr_z_tx: mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .isr_z_tx
+        mov     dx, 0x3F8
+        mov     al, 'Z'
+        out     dx, al
+        pop     dx
+        jmp     .eoi
+.isr_free:
         inc     byte [g_isr_busy]
+        ; print 'I' to COM1
+        push    dx
+.isr_i_tx: mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .isr_i_tx
+        mov     dx, 0x3F8
+        mov     al, 'I'
+        out     dx, al
+        pop     dx
         inc     word [stat_irq]
         mov     byte [isr_work], MAX_RX_WORK   ; bound RX frames processed this entry
 %ifdef CFG_DEBUG
@@ -69,7 +91,31 @@ nic_isr:
         mov     byte [g_tx_done], 1     ; 286 single-transfer: flag dma_tx_single's blocking wait
         jmp     .no_txdone
 .tx_ring_adv:
+        ; print 'T' to COM1
+        push    dx
+.tx_t_tx: mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .tx_t_tx
+        mov     dx, 0x3F8
+        mov     al, 'T'
+        out     dx, al
+        pop     dx
         push    ax                      ; preserve adapter status (tx_kick clobbers ax)
+        ; print count digit (AH used as scratch; adapter status safe on stack)
+        push    dx
+        mov     al, [tx_ring_count]
+        add     al, '0'
+        mov     ah, al                  ; save count char in AH (serial wait clobbers AL)
+.tx_c_tx: mov dx, 0x3FD
+        in      al, dx
+        test    al, 0x20
+        jz      .tx_c_tx
+        mov     dx, 0x3F8
+        mov     al, ah
+        out     dx, al
+        pop     dx
+        ; AX clobbered; adapter status is on the stack for .tx_acpop to restore
         cmp     word [tx_ring_count], 0
         je      .tx_idle                ; spurious -- nothing queued
         dec     word [tx_ring_count]    ; the tail slot's DMA finished
@@ -80,6 +126,13 @@ nic_isr:
         xor     ax, ax
 .tx_twrap:
         mov     [tx_ring_tail], ax
+        ; NOTE: do NOT selectively AckIntr(TxComplete) here to suppress the spurious re-reads of
+        ; this latch on later recv_loop iterations. TxComplete is cleared once, at .recv_done
+        ; (AckIntr 0x00FF). A mid-ISR ack is incompatible with the emulator's edge-triggered IRQ
+        ; model: el3_update_irq only toggles the line on a level TRANSITION, so once TxComplete is
+        ; cleared mid-loop the NEXT drain-timer completion raises no fresh rising edge -> no ISR ->
+        ; the ring stalls and every enqueue drops (verified: ring fills to 4, no further 'I'). The
+        ; spurious re-advances are harmless: they hit tx_ring_count==0 and fall through to .tx_idle.
         cmp     word [tx_ring_count], 0
         je      .tx_idle                ; ring drained
         call    tx_kick                 ; more queued -> start the next slot's DMA

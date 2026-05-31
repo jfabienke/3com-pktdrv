@@ -91,9 +91,10 @@ el3_init:
 ; activation, before el3_init writes it back to Window 2.
 ;
 ; Generation-aware: the 3C515 (Corkscrew) relocated the EEPROM registers to the +0x2000 ISA
-; alias (cmd io+0x200A, data +2), vs the 3C509's io+0x0A/0x0C (Linux 3c515 + iPXE). A fixed
-; io_delay (~300 us > the 162 us read latency) covers both, sidestepping the differing busy
-; bit. Cold. Clobbers AX, BX, CX, DX, SI, DI, BP.
+; alias (cmd io+0x200A, data +2), vs the 3C509's io+0x0A/0x0C (Linux 3c515 + iPXE). Polls
+; EL3_EE_BUSY (cmd reg bit 15) until clear; works regardless of CPU/bus speed and in QEMU
+; icount/realtiming mode where the fixed io_delay loop exits too fast. Cold. Clobbers AX, BX,
+; CX, DX, SI, DI, BP.
 ;------------------------------------------------------------------------------
 el3_load_mac_io:
         mov     bx, [g_nic_io]
@@ -114,9 +115,10 @@ el3_load_mac_io:
         mov     ax, di
         or      ax, EL3_EE_READ            ; 0x80 | word addr -> issue read
         out     dx, ax
-        call    io_delay                   ; fixed wait > 162 us EEPROM read latency
-        mov     dx, bx
-        add     dx, bp
+.ee_busy:
+        in      ax, dx                     ; read cmd reg back; bit 15 set while busy
+        test    ax, EL3_EE_BUSY
+        jnz     .ee_busy
         add     dx, 2                      ; data register = command + 2
         in      ax, dx                     ; AX = word (AH = first MAC byte, big-endian)
         mov     [g_mac + si], ah

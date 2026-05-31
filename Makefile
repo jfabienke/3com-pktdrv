@@ -57,34 +57,29 @@ $(BUILD)/blast.com : tools/blast.asm
 # fakenic: test build that skips the probe (no emulator has a 3C509) so the install +
 # resident handler are exercisable in dosbox-x. Forces a recompile with -dCFG_FAKENIC.
 fakenic: .SYMBOLIC
-    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    @rm -f $(BUILD)/start.obj
     $(MAKE) DEFS=-dCFG_FAKENIC all
 
 # debug: instrumented build for out-of-house HARDWARE testing -- verbose cold trace, the
 # resident event log, the video heartbeat, get_statistics, and the 0x7F debug block.
 debug: .SYMBOLIC
-    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    @rm -f $(BUILD)/start.obj
     $(MAKE) DEFS=-dCFG_DEBUG all
 
 # debugfake: debug instrumentation + fake NIC, so the whole thing is exercisable in dosbox-x.
 debugfake: .SYMBOLIC
-    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    @rm -f $(BUILD)/start.obj
     $(MAKE) DEFS="-dCFG_DEBUG -dCFG_FAKENIC" all
 
 # pnp: full profile -- adds the direct ISA PnP probe (3C515 Corkscrew / PnP-mode 3C509B),
 # tried before the legacy ID-port on >=286. debugpnp adds the instrumentation on top.
 pnp: .SYMBOLIC
-    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    @rm -f $(BUILD)/start.obj
     $(MAKE) DEFS=-dCFG_PNP all
 
 debugpnp: .SYMBOLIC
-    @if exist $(BUILD)\start.obj del $(BUILD)\start.obj
+    @rm -f $(BUILD)/start.obj
     $(MAKE) DEFS="-dCFG_DEBUG -dCFG_PNP" all
 
 clean: .SYMBOLIC
-    @if exist $(BUILD)\*.obj del $(BUILD)\*.obj
-    @if exist $(BUILD)\*.bin del $(BUILD)\*.bin
-    @if exist $(BUILD)\frags_asm.inc del $(BUILD)\frags_asm.inc
-    @if exist $(TARGET) del $(TARGET)
-    @if exist $(BUILD)\blast.com del $(BUILD)\blast.com
-    @if exist $(BUILD)\3cpd.map del $(BUILD)\3cpd.map
+    @rm -f $(BUILD)/start.obj $(BUILD)/*.bin $(BUILD)/frags_asm.inc $(TARGET) $(BUILD)/blast.com $(BUILD)/3cpd.map
