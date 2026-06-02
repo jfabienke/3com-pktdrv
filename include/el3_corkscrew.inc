@@ -61,7 +61,14 @@ EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 ; TxComplete ISR). send_pkt copies the frame into a free slot and returns; the ISR frees the
 ; finished slot and kicks the next, overlapping CPU frame-prep with the card's DMA.
 TX_RING_N               equ 4        ; ring slots (frames that can be queued in flight)
-TX_SLOT_SZ              equ 1536     ; per-slot buffer (holds a max standard frame; FDDI later)
+TX_SLOT_SZ              equ 4608     ; per-slot buffer -- FDDI-sized so the ring can DMA large frames
+                                     ; (matches the stack's txbuf[4608] and the emulator's
+                                     ; EL3_LARGE_FRAME_MAX). 4*4608 = 18 KB, kept only on the 386+
+                                     ; ring DMA path (resident_end); the PIO floor drops it.
+EL3_MAX_FRAME_LARGE     equ 4490     ; max interoperable large (FDDI) TX frame, excl FCS. Equals the
+                                     ; card's allowLargePackets oversize threshold - 1 (and the
+                                     ; emulator's EL3_LARGE_RX_MAX): a bigger frame is RX-dropped as
+                                     ; oversize by a peer, so the TX path must not exceed it.
 
 ; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done,
 ; bounded by ELAPSED time via the BIOS 18.2 Hz tick (0040:006C) -- NOT by a wakeup count, since

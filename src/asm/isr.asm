@@ -33,38 +33,27 @@ nic_isr:
         mov     ax, cs
         mov     ds, ax                  ; DS = our segment
 
-        ; --- switch to a private stack ---
+        ; --- reentrancy guard FIRST, before any stack switch. A nested IRQ must detect "busy"
+        ;     while still on the interrupted task's stack. If we switched first, the nested entry
+        ;     would (a) overwrite the outer ISR's saved isr_save_ss/sp and (b) reset SP to the top
+        ;     of the private stack the outer ISR is still using -- the busy path would then iret
+        ;     through a corrupted frame. The reentrant path needs no private stack: it only EOIs
+        ;     and returns, popping the regs it pushed on whatever stack it entered on. ---
+        cmp     byte [g_isr_busy], 0
+        je      .isr_free
+        ; reentrant: skip this entry (the in-flight ISR still sees the pending source)
+%ifdef CFG_DEBUG
+        mov     al, 'Z'
+        call    dbg_logb
+%endif
+        jmp     .eoi                    ; EOI + iret WITHOUT switching/restoring the private stack
+.isr_free:
+        inc     byte [g_isr_busy]
+        ; --- now safe to switch to a private stack (busy flag bars a reentrant clobber) ---
         mov     [isr_save_ss], ss
         mov     [isr_save_sp], sp
         mov     ss, ax                  ; SS = our segment (ax = cs)
         mov     sp, isr_stack_top
-
-        ; --- reentrancy guard ---
-        cmp     byte [g_isr_busy], 0
-        je      .isr_free
-        ; reentrant: print 'Z' and skip
-        push    dx
-.isr_z_tx: mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .isr_z_tx
-        mov     dx, 0x3F8
-        mov     al, 'Z'
-        out     dx, al
-        pop     dx
-        jmp     .eoi
-.isr_free:
-        inc     byte [g_isr_busy]
-        ; print 'I' to COM1
-        push    dx
-.isr_i_tx: mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .isr_i_tx
-        mov     dx, 0x3F8
-        mov     al, 'I'
-        out     dx, al
-        pop     dx
         inc     word [stat_irq]
         mov     byte [isr_work], MAX_RX_WORK   ; bound RX frames processed this entry
 %ifdef CFG_DEBUG
@@ -91,31 +80,16 @@ nic_isr:
         mov     byte [g_tx_done], 1     ; 286 single-transfer: flag dma_tx_single's blocking wait
         jmp     .no_txdone
 .tx_ring_adv:
-        ; print 'T' to COM1
-        push    dx
-.tx_t_tx: mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .tx_t_tx
-        mov     dx, 0x3F8
+%ifdef CFG_DEBUG
         mov     al, 'T'
-        out     dx, al
-        pop     dx
-        push    ax                      ; preserve adapter status (tx_kick clobbers ax)
-        ; print count digit (AH used as scratch; adapter status safe on stack)
-        push    dx
+        call    dbg_logb                ; dbg_logb preserves AX -> adapter status intact
+%endif
+        push    ax                      ; preserve adapter status (tail advance + tx_kick clobber ax)
+%ifdef CFG_DEBUG
         mov     al, [tx_ring_count]
         add     al, '0'
-        mov     ah, al                  ; save count char in AH (serial wait clobbers AL)
-.tx_c_tx: mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .tx_c_tx
-        mov     dx, 0x3F8
-        mov     al, ah
-        out     dx, al
-        pop     dx
-        ; AX clobbered; adapter status is on the stack for .tx_acpop to restore
+        call    dbg_logb                ; log ring depth (adapter status safe on the stack)
+%endif
         cmp     word [tx_ring_count], 0
         je      .tx_idle                ; spurious -- nothing queued
         dec     word [tx_ring_count]    ; the tail slot's DMA finished
@@ -307,11 +281,18 @@ nic_isr:
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_ACK_INTR | 0x00FF   ; acknowledge all latched sources
         out     dx, ax
+        ; Bar a nested IRQ across the busy-clear + stack restore. A receiver upcall or a BIOS path
+        ; (e.g. INT 15h on the XMS RX route) may have re-enabled IF; a nested entry that saw
+        ; g_isr_busy==0 with SS:SP not yet restored would take the full path and switch onto the
+        ; private stack the outer ISR is still using. CLI closes that window; the IRET below
+        ; restores the caller's IF. (The reentrant path joins at .eoi and never gets here.)
+        cli
         dec     byte [g_isr_busy]
-.eoi:
-        ; restore the interrupted task's stack
+        ; restore the interrupted task's stack (ONLY the non-reentrant path switched to the
+        ; private stack -- the reentrant path joins at .eoi below and must NOT restore SS:SP).
         mov     ss, [isr_save_ss]
         mov     sp, [isr_save_sp]
+.eoi:
         ; PIC end-of-interrupt: slave first (IRQ >= 8), then master
         mov     al, 0x20
         cmp     byte [g_nic_irq], 8
@@ -363,6 +344,11 @@ xms_rx_deliver:
         mov     [rx_len], ax
         cmp     ax, 14
         jb      .discard
+        ; defense-in-depth: never copy more than the caller's slot holds. CONFIGURE requires
+        ; slot_size >= the max frame, so this should be unreachable, but a card that reports a
+        ; length past the slot must not make us read/deliver past the buffer -> drop the frame.
+        cmp     ax, [xms_slot_sz]
+        ja      .discard
 
         ; --- 4. 286/XMS_COPY single-transfer: pre-arm OTHER slot before processing ---
         ; Skip for CONV_SINGLE (1 slot only; re-arm happens AFTER upcall instead)

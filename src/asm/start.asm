@@ -157,16 +157,21 @@ old_int_seg:    resw 1
 old_irq_off:    resw 1             ; previous NIC IRQ owner
 old_irq_seg:    resw 1
 irq_vec:        resb 1             ; computed NIC IRQ vector number
-                resb 1
+pic_mask_orig:  resb 1             ; NIC IRQ line's PIC mask bit at install (restored at uninstall)
+pic_casc_orig:  resb 1             ; master IRQ2-cascade mask bit at install (slave IRQ; restored at /u)
+                resb 1             ; pad to word alignment
 
 g_off:          resw FRAG__COUNT   ; emitted-fragment offsets (handler/ISR call via these)
 g_isr_busy:     resb 1             ; ISR reentrancy guard
 isr_work:       resb 1             ; per-interrupt RX work cap counter (MAX_RX_WORK down to 0)
 isr_save_ss:    resw 1             ; interrupted task's SS:SP (private-stack switch)
 isr_save_sp:    resw 1
-isr_stack:      resb 128           ; the ISR's private stack
+isr_stack:      resb 512           ; the ISR's private stack -- must hold the register save, the
+                                   ; far receiver upcall (arbitrary app code), the XMS RX path's
+                                   ; INT 15h (BIOS) frame, AND a nested-IRQ entry layered on top
 isr_stack_top:
-resident_image: resb 256           ; the composed datapath (tx + rx drain)
+RESIDENT_IMAGE_MAX equ 256         ; byte budget for the composed datapath (compose_resident enforces)
+resident_image: resb RESIDENT_IMAGE_MAX   ; the composed datapath (tx + rx drain)
 
 ; --- statistics (resident; updated by the ISR / send_pkt, read by get_statistics) ---
 stat_rx:        dw 0               ; packets received & delivered
@@ -248,7 +253,7 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 6               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma
+        mov     cx, 7               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma, g_want_large
         xor     al, al
         rep     stosb
         mov     [psp_seg], bp
@@ -655,6 +660,12 @@ compose_resident:
 
         ; copy fragment bytes: resident_image[pos..] = entry.bytes[0..len)
         mov     cx, [di + 4]            ; len
+        ; budget guard: pos + len must fit resident_image, else the rep movsb overruns into the
+        ; stats / resident state that follow it. Fail the compose (AX=0 -> install aborts) instead.
+        mov     ax, [g_pos]
+        add     ax, cx
+        cmp     ax, RESIDENT_IMAGE_MAX
+        ja      .fail
         mov     si, [di + 6]            ; src ptr
         push    di
         mov     di, resident_image

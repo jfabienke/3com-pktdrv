@@ -39,6 +39,21 @@ install:
         mov     ah, 0x25                        ; install our ISR
         int     0x21
 
+        ; --- record our IRQ line's current PIC mask bit so uninstall can restore it exactly
+        ;     (a line already unmasked -- e.g. shared -- must be left unmasked, not re-masked) ---
+        mov     cl, [g_nic_irq]
+        mov     dx, 0x21                        ; master mask port
+        cmp     cl, 8
+        jb      .save_mask
+        sub     cl, 8
+        mov     dx, 0xA1                        ; slave mask port
+.save_mask:
+        mov     ah, 1
+        shl     ah, cl
+        in      al, dx
+        and     al, ah                          ; isolate our bit
+        mov     [pic_mask_orig], al             ; 0 = was unmasked, nonzero = was masked
+
         ; --- unmask the IRQ at the 8259 PIC ---
         mov     cl, [g_nic_irq]
         cmp     cl, 8
@@ -58,8 +73,13 @@ install:
         in      al, 0xA1                        ; slave mask
         and     al, ah
         out     0xA1, al
-        in      al, 0x21                        ; also unmask IRQ2 cascade on the master
-        and     al, 0xFB
+        ; save IRQ2's current mask bit, then unmask the master IRQ2 cascade (a slave IRQ can't
+        ; reach the CPU without it). Uninstall restores IRQ2 to this saved state.
+        in      al, 0x21                        ; master mask
+        mov     ah, al
+        and     ah, 0x04                        ; isolate IRQ2 cascade bit (bit 2)
+        mov     [pic_casc_orig], ah             ; 0 = IRQ2 was unmasked, nonzero = was masked
+        and     al, 0xFB                        ; unmask IRQ2 cascade on the master
         out     0x21, al
 .pic_done:
         ; --- enable the card's interrupts (card left in Window 1 by el3_init) ---

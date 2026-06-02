@@ -21,6 +21,7 @@ F_BP   equ 4
 F_DI   equ 6
 F_SI   equ 8
 F_DX   equ 10
+F_DL   equ 10
 F_DH   equ 11
 F_CX   equ 12
 F_CL   equ 12
@@ -32,14 +33,19 @@ F_AH   equ 17
 F_FLAGS equ 22
 CY     equ 0x0001
 
-; --- Crynwr API constants ---
-PD_VERSION      equ 0x000B      ; packet driver spec 1.11 -> 11
+; --- Crynwr API constants (kept in sync with include/pktdrv.h) ---
+PD_VERSION      equ 0x0111      ; packet driver spec v1.11 (== PKT_API_VERSION in pktdrv.h)
 PD_CLASS_ETHER  equ 1           ; DIX/Ethernet
 PD_TYPE_3C509   equ 0x0009      ; interface type (3Com EtherLink III)
 PD_FUNC_EXT     equ 2           ; basic + extended (we provide get_statistics)
-PD_ERR_BADHANDLE equ 1          ; bad handle
-PD_ERR_NOSPACE  equ 10         ; no free handle
-PD_ERR_BADCMD   equ 11          ; bad command
+PD_ERR_BADHANDLE equ 1          ; PDE_BAD_HANDLE
+PD_ERR_NOCLASS  equ 2           ; PDE_NO_CLASS  (interface class not supported)
+PD_ERR_NOTYPE   equ 3           ; PDE_NO_TYPE   (interface type not supported)
+PD_ERR_NONUMBER equ 4           ; PDE_NO_NUMBER (interface number not present)
+PD_ERR_BADTYPE  equ 5           ; PDE_BAD_TYPE  (bad packet type)
+PD_ERR_NOSPACE  equ 9           ; PDE_NO_SPACE  (no free handle; 10 = PDE_TYPE_INUSE, do NOT use)
+PD_ERR_BADCMD   equ 11          ; PDE_BAD_COMMAND
+PD_ERR_CANTSEND equ 12          ; PDE_CANT_SEND (frame too large / TX rejected)
 PD_NFUNCS       equ 7           ; functions 1..7 handled via the table
 PD_GET_STATS    equ 24          ; get_statistics
 PD_DBG_BLOCK    equ 0x7F        ; vendor: return the debug block pointer (CFG_DEBUG)
@@ -163,6 +169,22 @@ f_driver_info:
 ;     ES:DI = receiver upcall. We demux on the 2-byte EtherType only (CX>=2 -> match
 ;     SI[0..1]; CX==0 -> match all). The handle returned is the slot offset in htable.
 f_access_type:
+        ; --- validate the interface selectors before allocating a handle. We are a single
+        ;     DIX-Ethernet interface, number 0; reject anything else with the proper Crynwr code
+        ;     rather than handing back a handle for an unsupported request. ---
+        cmp     byte [bp + F_AL], PD_CLASS_ETHER   ; if_class
+        jne     .at_noclass
+        mov     ax, [bp + F_BX]                    ; if_type
+        cmp     ax, 0xFFFF                         ; 0xFFFF = any type for this class
+        je      .at_type_ok
+        cmp     ax, PD_TYPE_3C509                  ; or our specific interface type
+        jne     .at_notype
+.at_type_ok:
+        cmp     byte [bp + F_DL], 0                ; if_number -- we expose interface 0 only
+        jne     .at_nonumber
+        cmp     word [bp + F_CX], 1                ; typelen 1 cannot form a 2-byte EtherType and
+        je      .at_badtype                        ;   would read one byte past the caller template
+        ; --- find a free handle slot ---
         mov     di, htable
         mov     cx, MAX_HANDLES
 .at_find:
@@ -178,11 +200,11 @@ f_access_type:
         mov     [di + 0], ax                 ; recv_off
         mov     ax, [bp + F_ES]
         mov     [di + 2], ax                 ; recv_seg (claims the slot)
-        mov     cx, [bp + F_CX]              ; caller's type length
+        mov     cx, [bp + F_CX]              ; caller's type length (0, or >= 2)
         jcxz    .at_all
-        mov     bx, [bp + F_SI]              ; caller's SI -> type template
+        mov     bx, [bp + F_SI]              ; caller's SI -> type template (>= 2 bytes)
         mov     ds, [bp + F_DS]              ; caller's DS (briefly)
-        mov     ax, [bx]                     ; the 2 EtherType bytes (wire order)
+        mov     ax, [bx]                     ; the first 2 EtherType bytes (wire order)
         push    cs
         pop     ds                           ; restore our DS
         mov     [di + 4], ax
@@ -193,6 +215,22 @@ f_access_type:
         mov     [bp + F_AX], di              ; handle = slot offset
         clc
         ret
+.at_noclass:
+        mov     dh, PD_ERR_NOCLASS
+        stc
+        ret
+.at_notype:
+        mov     dh, PD_ERR_NOTYPE
+        stc
+        ret
+.at_nonumber:
+        mov     dh, PD_ERR_NONUMBER
+        stc
+        ret
+.at_badtype:
+        mov     dh, PD_ERR_BADTYPE
+        stc
+        ret
 
 ;--- 3: release_type -- BX = handle (slot offset); free the slot ---
 f_release_type:
@@ -201,6 +239,16 @@ f_release_type:
         jb      .rt_bad
         cmp     bx, htable + MAX_HANDLES * HANDLE_SIZE
         jae     .rt_bad
+        ; must be a slot boundary: (bx - htable) mod HANDLE_SIZE == 0. An interior address (e.g.
+        ; htable+1) is in range but would zero [bx+2] across two slots, corrupting a neighbouring
+        ; handle's recv_seg / far-call pointer. (clobbers ax,cx,dx -- all caller-saved on the frame.)
+        mov     ax, bx
+        sub     ax, htable
+        xor     dx, dx
+        mov     cx, HANDLE_SIZE
+        div     cx                           ; dx = (bx - htable) mod HANDLE_SIZE
+        or      dx, dx
+        jnz     .rt_bad
         mov     word [bx + 2], 0             ; recv_seg = 0 -> slot free
         clc
         ret
@@ -211,6 +259,23 @@ f_release_type:
 
 ;--- 4: send_pkt -- DS:SI = packet, CX = length; near-call the emitted TX datapath ---
 f_send_pkt:
+        ; --- length guard: reject oversized frames BEFORE any TX work. The 386+ DMA path copies
+        ;     the caller frame into fixed TX_SLOT_SZ ring slots (dma_tx_enqueue does not re-check),
+        ;     so an oversized CX would overrun resident memory. Cap = the interoperable large-frame
+        ;     max (FDDI, < the card's oversize threshold) when /j is active, else a standard
+        ;     Ethernet frame. Both caps are <= TX_SLOT_SZ so the slot copy is always safe. Return
+        ;     Crynwr CANT_SEND. ---
+        mov     ax, EL3_MAX_FRAME
+        cmp     byte [g_use_large], 0
+        je      .sp_cap
+        mov     ax, EL3_MAX_FRAME_LARGE
+.sp_cap:
+        cmp     word [bp + F_CX], ax
+        jbe     .sp_len_ok
+        mov     dh, PD_ERR_CANTSEND
+        stc
+        ret
+.sp_len_ok:
         ; Recover any pending TX error from a prior (early-start) transmission so an
         ; underrun/jabber doesn't leave the transmitter stuck. Bounded loop -> safe on a
         ; floating bus. DS = our segment here (stat_* and g_nic_io are addressable).
@@ -238,7 +303,9 @@ f_send_pkt:
         out     dx, al                  ; pop this entry off the TX status stack
         loop    .txs
 .txs_done:
-        inc     word [stat_tx]
+        ; stat_tx ("packets out") is bumped at each SUCCESS exit below, not here: a frame that
+        ; reaches a CANT_SEND reject (oversized at the top guard, or a large frame falling to PIO)
+        ; must not be reported as transmitted by get_statistics.
         cmp     byte [g_use_dma], 0     ; bus-master DMA TX path (3C515, >=286)?
         je      .tx_pio
         ; ISR upcall context: limit ring enqueue to keep at least one slot free for the
@@ -259,15 +326,30 @@ f_send_pkt:
         jc      .tx_pio                 ; ring full past timeout, or ISR-context full -> PIO THIS frame.
                                         ; NEVER drop: a frame dropped but reported sent (CF=0) stalls TCP
                                         ; until its RTO -- fatal during the latency-tight NVMe handshake.
+        inc     word [stat_tx]          ; success: frame accepted into the ring
         clc                             ; enqueued -> the TxComplete ISR drains it
         ret
 .tx_single:
         cmp     byte [g_tx_in_flight], 0
         jne     .tx_pio                 ; re-entrant call from upcall: fall back to PIO for this frame
         call    dma_tx_single           ; 286: zero-copy DMA straight from the caller's buffer (blocking)
+        inc     word [stat_tx]          ; success: single-transfer DMA issued
         clc
         ret
 .tx_pio:
+        ; --- PIO is only FIFO-safe for standard-size frames. The tx_pio fragment bursts the whole
+        ; frame with a blind `rep outsw`, and TxFree can never reach (len+4) for a frame larger than
+        ; the ~2 KB FIFO -- the wait below would time out and the burst would overflow the FIFO mid
+        ; frame. A large (/j FDDI) frame MUST use a bus-master DMA path (ring or 286 single-transfer);
+        ; if it reached PIO (no DMA at all, a ring-full/ISR fallback, or 286 reentrancy) we cannot
+        ; send it safely. Return Crynwr CANT_SEND (honest CF=1) rather than silently corrupt-send.
+        ; DMA frames up to EL3_MAX_FRAME_LARGE are handled in full by the ring/single paths above. ---
+        cmp     word [bp + F_CX], EL3_MAX_FRAME
+        jbe     .tx_pio_room
+        mov     dh, PD_ERR_CANTSEND
+        stc
+        ret
+.tx_pio_room:
         ; --- wait for FIFO room before bursting. With early-start enabled the card may still
         ; be draining a prior frame; a fast 286+ doing `rep outsw` can outrun a 2 KB FIFO
         ; (an 8088 loop never does). Require TxFree >= length + 4 (the 2 preamble words).
@@ -296,6 +378,7 @@ f_send_pkt:
         call    ax
         push    cs
         pop     ds
+        inc     word [stat_tx]          ; success: PIO burst issued
         clc
         ret
 
@@ -328,17 +411,10 @@ dma_tx_enqueue:
         sub     ax, bx
         cmp     ax, EL3_DMA_TX_TICKS
         jae     .eq_full                        ; ring still full after the timeout -> drop
-        push    ax
-        push    dx
-.eq_w_tx:   mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .eq_w_tx
-        mov     dx, 0x3F8
+%ifdef CFG_DEBUG
         mov     al, 'W'
-        out     dx, al
-        pop     dx
-        pop     ax
+        call    dbg_logb
+%endif
         sti                                     ; let the TxComplete ISR drain a slot
         hlt
         cli
@@ -351,17 +427,10 @@ dma_tx_enqueue:
         ; frame via PIO instead. The ring is a throughput optimization; correctness (every accepted
         ; frame is actually transmitted) must never depend on it draining in time. 'P' marks the fallback.
         inc     word [stat_txwait]              ; count ring-full -> PIO fallbacks
-        push    ax
-        push    dx
-.eq_p_tx:   mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .eq_p_tx
-        mov     dx, 0x3F8
+%ifdef CFG_DEBUG
         mov     al, 'P'
-        out     dx, al
-        pop     dx
-        pop     ax
+        call    dbg_logb
+%endif
         stc                                     ; -> caller (f_send_pkt) falls back to PIO for this frame
         ret
 .eq_have:
@@ -413,18 +482,15 @@ dma_tx_enqueue:
         cmp     byte [tx_dma_busy], 0
         jne     .eq_queued
         call    tx_kick
+        clc                                     ; success (kicked): caller must NOT fall back to PIO
         ret
 .eq_queued:
-        ; DMA in progress: frame queued but no kick needed -- print 'q'
-        push    dx
-.eq_q_tx: mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .eq_q_tx
-        mov     dx, 0x3F8
+        ; DMA in progress: frame queued, no kick needed (CFG_DEBUG logs 'q')
+%ifdef CFG_DEBUG
         mov     al, 'q'
-        out     dx, al
-        pop     dx
+        call    dbg_logb
+%endif
+        clc                                     ; success (queued): caller must NOT fall back to PIO
         ret
 
 ;------------------------------------------------------------------------------
@@ -432,17 +498,10 @@ dma_tx_enqueue:
 ; phys to DownListPtr and issue StartDmaDown. Sets tx_dma_busy. Enter DS=CS. Clobbers ax,bx,cx,dx.
 ;------------------------------------------------------------------------------
 tx_kick:
-        push    ax
-        push    dx
-.tx_k_tx: mov dx, 0x3FD
-        in      al, dx
-        test    al, 0x20
-        jz      .tx_k_tx
-        mov     dx, 0x3F8
+%ifdef CFG_DEBUG
         mov     al, 'K'
-        out     dx, al
-        pop     dx
-        pop     ax
+        call    dbg_logb
+%endif
         mov     bx, [tx_ring_tail]
         mov     cl, 4
         shl     bx, cl                          ; tail * 16
@@ -589,15 +648,32 @@ f_get_statistics:
 ;--- 0x82 (vendor): tear down -- restore vectors, mask the IRQ, quiet the NIC.
 ; Returns BX = our PSP so the cold re-run can free the resident block. DS = our segment.
 f_uninstall:
-        ; restore the previous INT 60h owner
-        mov     dx, [old_int_off]
-        mov     ax, [old_int_seg]
-        push    ds
-        mov     ds, ax
-        mov     ax, 0x2500 | PKTINT
-        int     0x21                          ; DS:DX -> old handler
-        pop     ds
-        ; restore the previous NIC IRQ owner
+        ; Teardown order matters: quiet the interrupt SOURCE before touching any vector. The old
+        ; code restored INT 60h + the NIC IRQ vector first, so an IRQ arriving mid-teardown would
+        ; dispatch to a stale/previous handler. Sequence now: (1) disable NIC sources, (2) mask the
+        ; PIC line, (3) restore the vectors (now safe), (4) restore the line's ORIGINAL PIC mask.
+
+        ; (1) disable all NIC interrupt sources at the card
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SET_INTR_ENB      ; | 0 -> no sources enabled
+        out     dx, ax
+
+        ; (2) mask our IRQ line at the PIC (temporary; restored to original state in step 4)
+        mov     cl, [g_nic_irq]
+        mov     dx, 0x21
+        cmp     cl, 8
+        jb      .un_mask
+        sub     cl, 8
+        mov     dx, 0xA1
+.un_mask:
+        mov     ah, 1
+        shl     ah, cl
+        in      al, dx
+        or      al, ah
+        out     dx, al
+
+        ; (3) restore the previous NIC IRQ owner, then the previous INT 60h owner
         mov     al, [irq_vec]
         mov     dx, [old_irq_off]
         mov     bx, [old_irq_seg]
@@ -606,28 +682,47 @@ f_uninstall:
         mov     ah, 0x25
         int     0x21
         pop     ds
-        ; mask the NIC's IRQ at the PIC so the now-stale vector is never entered
+        mov     dx, [old_int_off]
+        mov     ax, [old_int_seg]
+        push    ds
+        mov     ds, ax
+        mov     ax, 0x2500 | PKTINT
+        int     0x21                          ; DS:DX -> old handler
+        pop     ds
+
+        ; (4) restore the line's PIC mask to its state at install: a line we found unmasked
+        ;     (e.g. shared) is unmasked again; one we found masked is left masked.
         mov     cl, [g_nic_irq]
-        mov     ah, 1
+        mov     dx, 0x21
         cmp     cl, 8
-        jae     .un_slave
-        shl     ah, cl
-        in      al, 0x21
-        or      al, ah
-        out     0x21, al
-        jmp     .un_card
-.un_slave:
+        jb      .un_restore
         sub     cl, 8
-        shl     ah, cl
-        in      al, 0xA1
-        or      al, ah
-        out     0xA1, al
-.un_card:
-        ; disable all NIC interrupt sources (leave the card otherwise idle)
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_SET_INTR_ENB      ; | 0 -> no sources enabled
-        out     dx, ax
+        mov     dx, 0xA1
+.un_restore:
+        mov     ah, 1
+        shl     ah, cl                        ; ah = our bit
+        in      al, dx
+        cmp     byte [pic_mask_orig], 0
+        jne     .un_done                      ; was masked at install -> leave masked (bit set)
+        not     ah
+        and     al, ah                        ; was unmasked at install -> clear our bit
+        out     dx, al
+        jmp     .un_psp
+.un_done:
+        or      al, ah                        ; ensure our bit stays set (masked)
+        out     dx, al
+.un_psp:
+        ; (4b) slave IRQ only: install also unmasked the master IRQ2 cascade. Restore it -- if IRQ2
+        ;      was masked before install, re-mask it (else leave it unmasked). Otherwise a /u leaks
+        ;      IRQ2 unmasked. (docs/01-constraints.md: "save and restore both PIC masks".)
+        cmp     byte [g_nic_irq], 8
+        jb      .un_ret                       ; master IRQ -> IRQ2 cascade never touched
+        cmp     byte [pic_casc_orig], 0
+        je      .un_ret                       ; IRQ2 was unmasked at install -> leave it unmasked
+        in      al, 0x21                      ; IRQ2 was masked at install -> re-mask it
+        or      al, 0x04                      ; master bit 2 = IRQ2 cascade
+        out     0x21, al
+.un_ret:
         mov     bx, [psp_seg]
         mov     [bp + F_BX], bx               ; hand the PSP back to the caller
         clc
@@ -675,7 +770,7 @@ f_xms_query:
         mov     ax, EL3_MAX_FRAME
         cmp     byte [g_use_large], 0
         je      .done
-        mov     ax, TX_SLOT_SZ          ; 1536 (FDDI-sized slot limit)
+        mov     ax, TX_SLOT_SZ          ; max slot size = 4608 (FDDI-sized ring buffer)
 .done:
         mov     [bp + F_DX], ax
         clc
@@ -698,6 +793,14 @@ f_xms_configure:
         ; validate policy (0=CONV_SINGLE, 1=CONV_RING, 2=XMS_RING)
         cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_RING
         ja      .epol
+        ; ring / XMS-ring policies require the 386+ TX ring. The 286 single-transfer tier
+        ; advertises only CONV_SINGLE via QUERY, so reject a ring policy here too -- otherwise a
+        ; caller that skips QUERY could arm a mode this tier cannot honour.
+        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_CONV_SINGLE
+        je      .pol_ok
+        cmp     byte [g_tx_ring], 0
+        je      .epol
+.pol_ok:
         ; validate phys0 < 16 MB: byte[3] of the 32-bit physical address must be 0
         ; (if phys[31:24]=0 then phys ≤ 0x00FFFFFF = 16MB-1, within ISA DMA range)
         cmp     byte [es:bx + XMS_CFG_phys0 + 3], 0
@@ -705,16 +808,24 @@ f_xms_configure:
         ; validate phys1 < 16 MB
         cmp     byte [es:bx + XMS_CFG_phys1 + 3], 0
         jne     .ephys
-        ; validate slot_size
+        ; validate slot_size against BOTH bounds, both mode-dependent so CONFIGURE never accepts a
+        ; slot QUERY did not advertise (public contract, xms_dma.h: slot_size <= QUERY's DX):
+        ;   lower = the active max RX frame -- the slot must hold the largest deliverable frame, else
+        ;           a card completion the ISR copies out could overrun the caller's buffer;
+        ;   upper = QUERY's advertised DX = EL3_MAX_FRAME (std) / TX_SLOT_SZ (/j large).
+        ; In std mode the two coincide, so slot_size must equal EL3_MAX_FRAME (exactly what QUERY
+        ; returns, which is also what the reference caller passes back).
         cmp     byte [g_use_large], 0
-        je      .slotchk_std
-        mov     ax, TX_SLOT_SZ
-        jmp     .slotchk_cmp
-.slotchk_std:
-        mov     ax, EL3_MAX_FRAME
-.slotchk_cmp:
-        cmp     [es:bx + XMS_CFG_slot_size], ax
-        ja      .esz
+        jne     .slotchk_large
+        cmp     word [es:bx + XMS_CFG_slot_size], EL3_MAX_FRAME
+        jne     .esz                            ; std: must equal the QUERY-advertised max (= max frame)
+        jmp     .slotchk_ok
+.slotchk_large:
+        cmp     word [es:bx + XMS_CFG_slot_size], EL3_MAX_FRAME_LARGE
+        jb      .esz                            ; smaller than the FDDI max frame -> RX overrun risk
+        cmp     word [es:bx + XMS_CFG_slot_size], TX_SLOT_SZ
+        ja      .esz                            ; larger than QUERY advertised (TX_SLOT_SZ)
+.slotchk_ok:
         ; save config pointer + fields
         mov     ax, [es:bx + XMS_CFG_slot_size]
         mov     [xms_slot_sz], ax
