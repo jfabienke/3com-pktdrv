@@ -64,6 +64,7 @@ msg_dbgon   db '[debug build]', 13, 10, '$'
 msg_eeprod  db 13, 10, 'EEPROM prod=0x', '$'
 msg_eeid    db ' mfg=0x', '$'
 msg_emit    db 'emitted=0x', '$'
+msg_txring  db 'TXRING=', '$'                   ; 8b.1: 0=single (286/386), 1=ring (486+)
 msg_keep    db ' resident para=0x', '$'
 msg_inst    db 13, 10, 'INSTALLED: INT 60h, IRQ vec=0x', '$'
 %endif
@@ -415,6 +416,16 @@ global resident_end
         call    print_str
 
         call    build_plan          ; per-gen Window-1 base + TX-start cmd + PIO immediates
+%ifdef CFG_DEBUG
+        ; 8b.1 tier verification: g_tx_ring resolved by build_plan (286/386=0 single, 486+=1 ring).
+        mov     dx, msg_txring
+        call    print_str
+        mov     al, [g_tx_ring]
+        add     al, '0'
+        call    print_char          ; 0 = single-transfer, 1 = ring
+        mov     dx, msg_crlf
+        call    print_str
+%endif
         call    el3_init            ; bring the activated card to operational state (uses g_tx_start)
 
         call    compose_resident    ; ax = emitted length, fills resident_image + g_off
@@ -600,11 +611,13 @@ build_plan:
         jb      .dma_resolved
         mov     byte [g_use_dma], 1
 .dma_resolved:
-        ; resident TX DMA path: 386+ uses the non-blocking ring (movsd slot copy); a 286 can't hide
-        ; that per-frame copy (no movsd, nothing to overlap in a flood), so it uses the blocking
-        ; zero-copy single-transfer instead -- ~+47% at 100 Mbit (28668 vs 19570 kbit/s).
+        ; resident TX DMA path: 486+ uses the non-blocking ring (movsd slot copy, hidden by the
+        ; faster core); 286 AND 386 use the blocking zero-copy single-transfer. (Phase 8b tier:
+        ; ring threshold raised 386 -> 486. A 386's slower core can't usefully overlap the ring's
+        ; per-frame movsd copy in a flood, and single-transfer is simpler + zero-copy; the ring's
+        ; ~+47% at 100 Mbit -- 28668 vs 19570 kbit/s -- was measured on a fast (486+) core.)
         mov     byte [g_tx_ring], 0
-        cmp     byte [g_cpu_class], CPU_80386
+        cmp     byte [g_cpu_class], CPU_80486
         jb      .ring_resolved
         mov     byte [g_tx_ring], 1
 .ring_resolved:
