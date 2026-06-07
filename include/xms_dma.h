@@ -31,6 +31,15 @@
 #define XMS_DMA_CONFIGURE   0x01u   /* AL: configure XMS DMA receive ring (ES:DI → cfg)     */
 #define XMS_DMA_RELEASE     0x02u   /* AL: release ring, stop DMA, restore conventional path */
 
+/* v2 sub-functions (Phase 8b copybreak; see docs/10-copybreak-ext.md). Defined but
+ * currently stubbed (CF=1, DH=XMS_ERR_NOT_V2) until the implementing increment lands.
+ * Single source of truth: this file + xms_dma.inc + dos-nvmeotcp/src/xms.h,
+ * cross-checked by tools/abi_check.sh. */
+#define XMS_DMA_RX_CONFIGURE2 0x03u /* AL: N-slot RX ring + completion/free rings (ES:DI → xms_rx_cfg2_t) */
+#define XMS_DMA_TX_CONFIGURE  0x04u /* AL: register caller TX slot pool, once (ES:DI → xms_tx_cfg_t)      */
+#define XMS_DMA_TX_SUBMIT     0x05u /* AL: submit one TX frame from caller phys (DX:CX=phys, BX=len)       */
+#define XMS_DMA_RX_REFILL     0x06u /* AL: reserved RX free-ring doorbell                                  */
+
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
 /*
  * Caps are fixed at install time by JIT fragment selection:
@@ -39,8 +48,12 @@
  */
 #define XMS_CAP_CONV_SINGLE 0x0001u /* conventional mem, 1 slot, single-xfer (286+)  */
 #define XMS_CAP_CONV_RING   0x0002u /* conventional mem, 2 slots, ring mode  (386+)  */
+/* 0x0004 = RESERVED/DEPRECATED (was XMS_CAP_XMS_COPY; XMS_COPY policy dropped) -- never reuse */
 #define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)                   */
+/* 0x0010 = RESERVED (was a stack-only XMS_CAP_SINGLE; unused by the driver) -- never reuse */
 #define XMS_CAP_XMS_RING    0x0020u /* XMS + INT 15h ring mode               (386+)  */
+#define XMS_CAP_RX_DESC_V2  0x0040u /* N-slot RX ring + completion/free rings (RX vertical) */
+#define XMS_CAP_XMS_TX      0x0080u /* caller-phys TX submit path             (TX vertical) */
 
 /* ---- memory policy ----------------------------------------------------- */
 /*
@@ -62,6 +75,10 @@ typedef enum {
 #define XMS_ERR_SLOT_SIZE   0x04u   /* cfg.slot_size > DX returned by QUERY       */
 #define XMS_ERR_ALREADY_CFG 0x05u   /* ring already configured; call RELEASE first */
 #define XMS_ERR_NOT_CFG     0x06u   /* RELEASE called but ring not configured      */
+#define XMS_ERR_BAD_NSLOTS  0x07u   /* cfg2.n_slots out of range [2, RX_DMA_SLOTS] */
+#define XMS_ERR_TX_NOT_CFG  0x08u   /* TX_SUBMIT before TX_CONFIGURE               */
+#define XMS_ERR_TX_RANGE    0x09u   /* TX_SUBMIT phys/len outside the pool         */
+#define XMS_ERR_NOT_V2      0x0Au   /* v2 sub-function recognized but not implemented in this build */
 
 /* ---- configuration structure (passed via ES:DI to CONFIGURE) ----------- */
 
@@ -87,5 +104,65 @@ typedef struct {
     uint32_t phys1;         /* VDS physical address — slot 1 data buffer      */
     uint32_t lin1;          /* VCPI/DPMI linear address — slot 1 (0=XMS_COPY) */
 } xms_rx_cfg_t;             /* 20 bytes                                       */
+
+/* ======================================================================== */
+/* v2 wire structs (Phase 8b copybreak; see docs/10-copybreak-ext.md).        */
+/* PINNED layouts; must byte-match xms_dma.inc and dos-nvmeotcp/src/xms.h.     */
+/* Explicit pack(1): the layout contract is enforced by the compile-time      */
+/* asserts in the stack mirror + tools/abi_check.sh, never by implicit packing.*/
+/* ======================================================================== */
+
+#define XMS_CFG2_VERSION    2u      /* xms_rx_cfg2_t.version */
+#define XMS_TX_CFG_VERSION  1u      /* xms_tx_cfg_t.version  */
+#define RX_DMA_SLOTS        8u      /* max N-slot RX ring depth */
+#define TXSLOT_HEADROOM     128u    /* reserved header prefix per TX slot */
+
+#pragma pack(push, 1)
+
+typedef struct {                /* ES:DI -> RX_CONFIGURE2; 24 bytes */
+    uint8_t  version;           /* = XMS_CFG2_VERSION (2)                       */
+    uint8_t  policy;            /* xms_mem_policy_t (CONV_RING | XMS_RING)      */
+    uint16_t n_slots;           /* 2..RX_DMA_SLOTS                              */
+    uint16_t slot_size;         /* <= DX from QUERY                            */
+    uint16_t compl_ring_n;      /* completion ring entries (power of two)       */
+    uint16_t free_ring_n;       /* free ring entries (power of two)             */
+    uint16_t reserved;          /* 0                                            */
+    uint32_t slots_lin;         /* seg:off (hi16=seg, lo16=off) of slots[]      */
+    uint32_t compl_ring_lin;    /* seg:off of completion ring (hdr + entries)   */
+    uint32_t free_ring_lin;     /* seg:off of free ring (hdr + entries)         */
+} xms_rx_cfg2_t;
+
+typedef struct {                /* one per RX slot (array at slots_lin); 8 bytes */
+    uint32_t phys;              /* NIC DMA phys (< DMA_ISA_16M_LIMIT)           */
+    uint32_t lin;              /* seg:off CPU alias for header peel (0=XMS-only)*/
+} xms_slot_desc_t;
+
+typedef struct {                /* prefix of each ring; 8 bytes */
+    uint16_t head;              /* producer index                              */
+    uint16_t tail;             /* consumer index                              */
+    uint16_t mask;             /* n_entries - 1 (power of two)                 */
+    uint16_t rsv;
+} xms_ring_hdr_t;
+
+typedef struct {                /* completion ring entry (driver->stack); 8 bytes */
+    uint16_t slot_id;
+    uint16_t len;
+    uint16_t status;
+    uint16_t seq;
+} xms_rx_compl_t;
+
+typedef struct {                /* free ring entry (stack->driver); 2 bytes */
+    uint16_t slot_id;
+} xms_rx_free_t;
+
+typedef struct {                /* ES:DI -> TX_CONFIGURE; 12 bytes */
+    uint8_t  version;          /* = XMS_TX_CFG_VERSION (1)                     */
+    uint8_t  flags;            /* bit0 = pool is XMS                           */
+    uint16_t reserved;         /* 0                                           */
+    uint32_t pool_phys;        /* base phys (< DMA_ISA_16M_LIMIT)             */
+    uint32_t pool_len;         /* pool size in bytes                          */
+} xms_tx_cfg_t;
+
+#pragma pack(pop)
 
 #endif /* PKTDRV_XMS_DMA_H */

@@ -120,7 +120,17 @@ pkt_do_xms:
         je      .xc
         cmp     al, XMS_DMA_RELEASE
         je      .xr
+        ; v2 sub-functions 0x03..0x06 are defined but not implemented in this build.
+        ; Return XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell
+        ; "v2 known, unimplemented" from a genuinely bad command. al is >= 0x03 here
+        ; (0x00..0x02 already dispatched above).
+        cmp     al, XMS_DMA_RX_REFILL   ; 0x06 = top of the reserved v2 range
+        jbe     .xstub
         mov     dh, PD_ERR_BADCMD
+        stc
+        jmp     pkt_error
+.xstub:
+        mov     dh, XMS_ERR_NOT_V2
         stc
         jmp     pkt_error
 .xq:    call    f_xms_query
