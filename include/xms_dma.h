@@ -80,6 +80,9 @@ typedef enum {
 #define XMS_ERR_TX_NOT_CFG  0x08u   /* TX_SUBMIT before TX_CONFIGURE               */
 #define XMS_ERR_TX_RANGE    0x09u   /* TX_SUBMIT phys/len outside the pool         */
 #define XMS_ERR_NOT_V2      0x0Au   /* v2 sub-function recognized but not implemented in this build */
+/* 0x0B is PD_ERR_BADCMD (genuinely-unknown AL) -- do not reuse for an XMS error */
+#define XMS_ERR_TX_BUSY     0x0Cu   /* a TX_SUBMIT single-transfer is already in flight (transient) */
+#define XMS_ERR_TX_TIMEOUT  0x0Du   /* no TxComplete within the bound -- card wedged */
 
 /* ---- configuration structure (passed via ES:DI to CONFIGURE) ----------- */
 

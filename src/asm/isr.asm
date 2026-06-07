@@ -75,6 +75,14 @@ nic_isr:
         jz      .no_txdone
         cmp     byte [g_use_dma], 0
         je      .no_txdone              ; PIO mode: no DMA (TxComplete just acked at .recv_done)
+        ; 8b.2a: a TX_SUBMIT caller-phys single-transfer takes priority over the ring path on EVERY
+        ; tier -- flag its blocking wait and skip tx_ring_adv, so the 486+ ring's count/tail stay
+        ; untouched while a submit is in flight (the stack serialises the two; see docs/10).
+        cmp     byte [xms_tx_in_flight], 0
+        je      .tx_not_submit
+        mov     byte [g_tx_done], 1
+        jmp     .no_txdone
+.tx_not_submit:
         cmp     byte [g_tx_ring], 0
         jne     .tx_ring_adv            ; 486+: advance the non-blocking TX ring
         mov     byte [g_tx_done], 1     ; 286/386 single-transfer: flag dma_tx_single's blocking wait

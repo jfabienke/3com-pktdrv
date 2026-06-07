@@ -227,6 +227,21 @@ xms_rx_desc0:   resb EL3_DESC_SIZE ; RX up-descriptor slot 0 (16 bytes, 16-byte 
 xms_rx_desc1:   resb EL3_DESC_SIZE ; RX up-descriptor slot 1
 xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; access bytes pre-set)
 
+; 8b.2a: caller-phys TX pool (registered via TX_CONFIGURE) + a dedicated TX down-descriptor.
+; Blocking single-transfer (caller-phys variant of dma_tx_single), used on ALL DMA tiers
+; (gated on g_use_dma, independent of g_tx_ring); the dedicated descriptor never touches the
+; ring's tx_descs[]. Present whenever g_use_dma (kept on 286/386 and 486+).
+                  alignb 4
+xms_tx_armed:     resb 1           ; 1 = TX pool registered via TX_CONFIGURE
+xms_tx_in_flight: resb 1           ; 1 = a TX_SUBMIT single-transfer is DMAing now. The TxComplete
+                                   ; ISR checks this FIRST and sets g_tx_done (skipping tx_ring_adv),
+                                   ; so completion works on every tier independent of g_tx_ring and
+                                   ; never disturbs the 486+ ring's bookkeeping.
+xms_tx_pool_phys: resd 1           ; caller TX pool base phys (< DMA_ISA_16M_LIMIT)
+xms_tx_pool_len:  resd 1           ; caller TX pool length (bytes)
+                  alignb 4
+xms_tx_desc:      resb EL3_DESC_SIZE ; dedicated TX down-descriptor (NOT the ring's tx_descs[])
+
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
 

@@ -60,6 +60,9 @@ XMS_ERR_BAD_NSLOTS  equ 0x07   ; cfg2.n_slots out of range [2, RX_DMA_SLOTS]
 XMS_ERR_TX_NOT_CFG  equ 0x08   ; TX_SUBMIT before TX_CONFIGURE
 XMS_ERR_TX_RANGE    equ 0x09   ; TX_SUBMIT phys/len outside the registered pool
 XMS_ERR_NOT_V2      equ 0x0A   ; v2 sub-function recognized but not implemented in this build
+; 0x0B is the packet-driver PD_ERR_BADCMD (genuinely-unknown AL) -- do not reuse for an XMS error
+XMS_ERR_TX_BUSY     equ 0x0C   ; a TX_SUBMIT single-transfer is already in flight (transient, retry)
+XMS_ERR_TX_TIMEOUT  equ 0x0D   ; no TxComplete within the bound -- card wedged (slot not safely reusable)
 
 ; ---- configuration structure (xms_rx_cfg_t) offsets --------------------
 ; Matches the C struct in include/xms_dma.h exactly (20 bytes total).

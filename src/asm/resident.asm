@@ -120,10 +120,14 @@ pkt_do_xms:
         je      .xc
         cmp     al, XMS_DMA_RELEASE
         je      .xr
-        ; v2 sub-functions 0x03..0x06 are defined but not implemented in this build.
-        ; Return XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell
-        ; "v2 known, unimplemented" from a genuinely bad command. al is >= 0x03 here
-        ; (0x00..0x02 already dispatched above).
+        cmp     al, XMS_DMA_TX_CONFIGURE   ; 0x04 (8b.2a)
+        je      .xtc
+        cmp     al, XMS_DMA_TX_SUBMIT      ; 0x05 (8b.2a)
+        je      .xts
+        ; 0x03 RX_CONFIGURE2 and 0x06 RX_REFILL are defined but not implemented in this build:
+        ; return XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell "v2 known,
+        ; unimplemented" from a genuinely bad command. al is in {0x03,0x06} here (0x00-0x02/0x04/0x05
+        ; already dispatched above); a higher AL falls through to PD_ERR_BADCMD.
         cmp     al, XMS_DMA_RX_REFILL   ; 0x06 = top of the reserved v2 range
         jbe     .xstub
         mov     dh, PD_ERR_BADCMD
@@ -138,6 +142,10 @@ pkt_do_xms:
 .xc:    call    f_xms_configure
         jmp     pkt_xms_ret
 .xr:    call    f_xms_release
+        jmp     pkt_xms_ret
+.xtc:   call    f_xms_tx_configure
+        jmp     pkt_xms_ret
+.xts:   call    f_xms_tx_submit
         jmp     pkt_xms_ret
 pkt_xms_ret:
         jc      pkt_error
@@ -769,10 +777,11 @@ f_xms_query:
         cmp     byte [g_use_dma], 0
         je      .no_dma
         ; Caps are fixed by JIT fragment selection at install time; the ring tier keys off
-        ; g_tx_ring (486+ since Phase 8b.1).
-        ; 286/386: CONV_SINGLE only — XMS single-transfer excluded (INT 15h ~1200 us > inter-frame)
-        ; 486+:    XMS_RING + RING + CONV_SINGLE + CONV_RING
-        mov     bx, XMS_CAP_CONV_SINGLE
+        ; g_tx_ring (486+ since Phase 8b.1). XMS_TX (caller-phys blocking TX, 8b.2a) is a
+        ; single-transfer path, so it is advertised on every DMA tier (286/386/486+).
+        ; 286/386: CONV_SINGLE + XMS_TX
+        ; 486+:    + XMS_RING + RING + CONV_RING
+        mov     bx, XMS_CAP_CONV_SINGLE | XMS_CAP_XMS_TX
         cmp     byte [g_tx_ring], 0
         je      .no_ring
         or      bx, XMS_CAP_XMS_RING | XMS_CAP_RING | XMS_CAP_CONV_RING
@@ -1018,6 +1027,206 @@ f_xms_release:
         clc
         ret
 .enot:  mov     dh, XMS_ERR_NOT_CFG
+        stc
+        ret
+
+;--- XMS DMA TX_CONFIGURE (AL=0x04): ES:DI -> xms_tx_cfg_t; register the caller TX pool (8b.2a) ---
+; Validates version + that the whole pool is ISA-reachable (< 16 MB), stores pool_phys/pool_len, and
+; sets xms_tx_armed. No DMA is armed here -- TX_SUBMIT issues one blocking single-transfer per frame.
+; g_use_dma is checked FIRST: the TX state lives in the XMS region, NOT resident on the PIO floor.
+; ES:DI is the caller's live cfg pointer (the dispatch preserves it). Returns CF=0, or CF=1 + DH.
+f_xms_tx_configure:
+        cmp     byte [g_use_dma], 0
+        je      .txc_ehw                ; no bus-master engine (3C509 / PIO): TX DMA unavailable
+        cmp     byte [es:di + XMS_TXCFG_version], XMS_TX_CFG_VERSION
+        jne     .txc_ever
+        ; pool base < 16 MB: high word of pool_phys must be below the 24-bit ISA limit
+        mov     ax, [es:di + XMS_TXCFG_pool_phys + 2]
+        cmp     ax, DMA_ISA_16M_LIMIT
+        jae     .txc_erange
+        ; pool_len must be nonzero
+        mov     ax, [es:di + XMS_TXCFG_pool_len]
+        or      ax, [es:di + XMS_TXCFG_pool_len + 2]
+        jz      .txc_erange
+        ; pool end = pool_phys + pool_len must be <= 16 MB (dx:ax = end, exclusive)
+        mov     ax, [es:di + XMS_TXCFG_pool_phys]
+        mov     dx, [es:di + XMS_TXCFG_pool_phys + 2]
+        add     ax, [es:di + XMS_TXCFG_pool_len]
+        adc     dx, [es:di + XMS_TXCFG_pool_len + 2]
+        cmp     dx, DMA_ISA_16M_LIMIT
+        ja      .txc_erange
+        jb      .txc_store
+        or      ax, ax                  ; dx == 0x0100: end ok only if low word == 0 (exactly 16 MB)
+        jnz     .txc_erange
+.txc_store:
+        mov     ax, [es:di + XMS_TXCFG_pool_phys]
+        mov     [xms_tx_pool_phys], ax
+        mov     ax, [es:di + XMS_TXCFG_pool_phys + 2]
+        mov     [xms_tx_pool_phys + 2], ax
+        mov     ax, [es:di + XMS_TXCFG_pool_len]
+        mov     [xms_tx_pool_len], ax
+        mov     ax, [es:di + XMS_TXCFG_pool_len + 2]
+        mov     [xms_tx_pool_len + 2], ax
+        mov     byte [xms_tx_armed], 1
+        clc
+        ret
+.txc_ehw:   mov dh, PD_ERR_BADCMD       ; QUERY won't advertise XMS_TX without g_use_dma; defense-in-depth
+        stc
+        ret
+.txc_ever:  mov dh, XMS_ERR_BAD_VERSION
+        stc
+        ret
+.txc_erange: mov dh, XMS_ERR_PHYS_RANGE
+        stc
+        ret
+
+;--- XMS DMA TX_SUBMIT (AL=0x05): DX:CX = caller frame phys (hi:lo), BX = length; blocking (8b.2a) ---
+; Requires a registered pool. Range-checks the frame is wholly inside the pool, then DMAs it via a
+; blocking caller-phys single-transfer (dma_tx_caller; independent of g_tx_ring, never the ring path).
+; DX:CX/BX are the caller's live registers (the dispatch preserves them). Returns CF=0 on completion,
+; CF=1 + DH=XMS_ERR_* on a validation failure, a busy channel, or a TX timeout.
+f_xms_tx_submit:
+        cmp     byte [g_use_dma], 0     ; PIO floor: the xms_tx_* state is NOT resident -- never touch it
+        je      .txs_ehw
+        cmp     byte [xms_tx_armed], 0
+        je      .txs_enotcfg
+        ; length: 0 < bx <= max frame (std, or FDDI-large when /j)
+        or      bx, bx
+        jz      .txs_esize
+        mov     ax, EL3_MAX_FRAME
+        cmp     byte [g_use_large], 0
+        je      .txs_lcap
+        mov     ax, EL3_MAX_FRAME_LARGE
+.txs_lcap:
+        cmp     bx, ax
+        ja      .txs_esize
+        ; range (1): phys (dx:cx) >= pool_phys
+        cmp     dx, [xms_tx_pool_phys + 2]
+        jb      .txs_erange
+        ja      .txs_ge_ok
+        cmp     cx, [xms_tx_pool_phys]
+        jb      .txs_erange
+.txs_ge_ok:
+        ; range (2): frame_end = phys + len  <=  pool_end = pool_phys + pool_len. Scratch: ax,si,di
+        ; (the dispatch frame restores caller si/di on iret, so clobbering them is safe).
+        mov     di, cx
+        add     di, bx
+        mov     si, dx
+        adc     si, 0                   ; si:di = frame_end (phys + len)
+        mov     ax, [xms_tx_pool_phys]
+        add     ax, [xms_tx_pool_len]   ; CF = carry out of the low add
+        mov     ax, [xms_tx_pool_phys + 2]
+        adc     ax, [xms_tx_pool_len + 2]   ; ax = pool_end.high
+        cmp     si, ax
+        ja      .txs_erange             ; frame_end.high > pool_end.high
+        jb      .txs_submit             ; frame_end.high < pool_end.high -> in range
+        mov     ax, [xms_tx_pool_phys]
+        add     ax, [xms_tx_pool_len]   ; ax = pool_end.low (recomputed; only ax is free here)
+        cmp     di, ax
+        ja      .txs_erange             ; equal high, frame_end.low > pool_end.low
+.txs_submit:
+        call    dma_tx_caller           ; dx:cx = phys, bx = len; blocking; CF/DH set by it
+        ret
+.txs_ehw:   mov dh, PD_ERR_BADCMD       ; no bus-master engine (PIO floor): TX DMA unavailable
+        stc
+        ret
+.txs_enotcfg: mov dh, XMS_ERR_TX_NOT_CFG
+        stc
+        ret
+.txs_esize: mov dh, XMS_ERR_SLOT_SIZE
+        stc
+        ret
+.txs_erange: mov dh, XMS_ERR_TX_RANGE
+        stc
+        ret
+
+;------------------------------------------------------------------------------
+; dma_tx_caller -- blocking caller-phys bus-master TX (the TX_SUBMIT engine). A caller-phys variant
+; of dma_tx_single: the down descriptor's ADDR/LEN come from DX:CX/BX, not phys(CS:tx_slots). Uses a
+; DEDICATED descriptor (xms_tx_desc), never the ring's tx_descs[], and is independent of g_tx_ring.
+; Completion is the TxComplete ISR (the emulator does not write a pollable down-descriptor bit):
+; xms_tx_in_flight diverts that IRQ to g_tx_done on every tier, so the wait is uniform and the 486+
+; ring's bookkeeping is untouched.
+; Enter: DX:CX = frame phys (DX high, CX low), BX = length; DS = CS.
+; Exit:  CF=0 on completion; CF=1 + DH on busy/timeout. Clobbers ax,bx,cx,dx,si,di,es. IF=0.
+;------------------------------------------------------------------------------
+dma_tx_caller:
+        cmp     byte [g_tx_in_flight], 0
+        jne     .tc_busy                ; another single-transfer in flight (transient)
+        ; build the dedicated TX descriptor: ADDR = dx:cx, LEN = bx, NEXT/STATUS = 0
+        mov     [xms_tx_desc + EL3_DESC_ADDR], cx
+        mov     [xms_tx_desc + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [xms_tx_desc + EL3_DESC_NEXT], ax
+        mov     [xms_tx_desc + EL3_DESC_NEXT + 2], ax
+        mov     [xms_tx_desc + EL3_DESC_STATUS], ax
+        mov     [xms_tx_desc + EL3_DESC_STATUS + 2], ax
+        mov     [xms_tx_desc + EL3_DESC_LEN + 2], ax
+        mov     [xms_tx_desc + EL3_DESC_LEN], bx
+        ; descriptor phys (CS:xms_tx_desc) -> dx:ax
+        mov     bx, cs
+        mov     ax, bx
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, bx
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, xms_tx_desc
+        adc     dx, 0                   ; dx:ax = phys(xms_tx_desc)
+        ; DownListPtr <- descriptor phys (io+0x404 low, +0x406 high)
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        ; arm completion (IF=0 so the ISR can't race), then StartDmaDown
+        mov     byte [g_tx_done], 0
+        mov     byte [g_tx_in_flight], 1
+        mov     byte [xms_tx_in_flight], 1   ; divert TxComplete -> g_tx_done (all tiers)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_DOWN
+        out     dx, ax
+        ; IRQ-driven wait, bounded by elapsed BIOS ticks (same shape as dma_tx_single)
+        xor     ax, ax
+        mov     es, ax
+        mov     bx, [es:BIOS_TICK_COUNT]
+.tc_wait:
+        cmp     byte [g_tx_done], 0
+        jne     .tc_done
+        mov     ax, [es:BIOS_TICK_COUNT]
+        sub     ax, bx
+        cmp     ax, EL3_DMA_TX_TICKS
+        jae     .tc_timeout
+        sti
+        hlt
+        jmp     .tc_wait
+.tc_timeout:
+        ; wedged card: abort the down channel so it stops reading the caller's slot, then report.
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        xor     ax, ax
+        out     dx, ax
+        add     dx, 2
+        out     dx, ax
+        inc     word [stat_txwait]
+        mov     byte [xms_tx_in_flight], 0
+        mov     byte [g_tx_in_flight], 0
+        cli
+        mov     dh, XMS_ERR_TX_TIMEOUT
+        stc
+        ret
+.tc_done:
+        mov     byte [xms_tx_in_flight], 0
+        mov     byte [g_tx_in_flight], 0
+        cli
+        inc     word [stat_tx]
+        clc
+        ret
+.tc_busy:
+        mov     dh, XMS_ERR_TX_BUSY
         stc
         ret
 

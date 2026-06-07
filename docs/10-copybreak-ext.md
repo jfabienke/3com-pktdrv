@@ -72,3 +72,31 @@ xms_tx_cfg_t   : 0 u8 version(=1) ; 1 u8 flags(bit0=XMS) ; 2 u16 rsv ; 4 u32 poo
 TX_SUBMIT (0x05) is **register-only** (no wire struct): `DX:CX` = caller phys (hi:lo), `BX` = len.
 
 Constants: `XMS_CFG2_VERSION=2`, `XMS_TX_CFG_VERSION=1`, `RX_DMA_SLOTS=8`, `TXSLOT_HEADROOM=128`.
+
+## TX semantics (8b.2a — implemented)
+
+`TX_CONFIGURE` (0x04) registers the caller's TX pool once; `TX_SUBMIT` (0x05) DMAs one frame from a
+caller-supplied physical address. Both require `g_use_dma` (advertised as `XMS_CAP_XMS_TX`, on every
+DMA tier — it is a single-transfer path, independent of the 486+ ring).
+
+- **Ownership.** The stack owns the pool (allocated in ISA-reachable `< 16 MB` memory) and all slot
+  reuse; the driver owns only the in-flight descriptor during a submit.
+- **Blocking, single-transfer, ring-independent.** `TX_SUBMIT` is a caller-phys variant of
+  `dma_tx_single`: it builds a **dedicated** descriptor (`xms_tx_desc`, never the ring's `tx_descs[]`),
+  kicks `StartDmaDown`, and blocks until completion — on **all** tiers, never the 486+ ring path. So
+  `TX_SUBMIT` returning CF=0 means the slot is immediately reusable (no TX completion queue).
+- **Completion via the TxComplete IRQ, not descriptor polling.** The QEMU el3 model clears the down
+  descriptor's status after TX (it does not set a pollable done bit; its `DESC_DN_COMPLETE` is the
+  high-word `0x00010000`, ≠ the driver's `0x4000`), so completion is detected via the interrupt. While
+  a submit is in flight, `xms_tx_in_flight` diverts `TxComplete` to `g_tx_done` and skips `tx_ring_adv`,
+  so the wait is uniform across tiers and the 486+ ring's count/tail stay untouched. The stack must not
+  interleave a `TX_SUBMIT` with a Crynwr ring TX (the down-DMA channel is shared).
+- **`TX_CONFIGURE` validation:** `version==1`; `g_use_dma`; `pool_phys < 16 MB`; `pool_phys+pool_len
+  ≤ 16 MB`; `pool_len > 0`. Errors: `BAD_VERSION`/`PHYS_RANGE` (and `PD_ERR_BADCMD` if `!g_use_dma`).
+- **`TX_SUBMIT` validation (in order):** armed (`TX_NOT_CFG`); `0 < len ≤` max frame
+  (`EL3_MAX_FRAME`, or `EL3_MAX_FRAME_LARGE` with `/j`) else `SLOT_SIZE`; frame wholly within the pool
+  `pool_phys ≤ phys` **and** `phys+len ≤ pool_phys+pool_len` else `TX_RANGE`. Then: `TX_BUSY` if a
+  submit is already in flight, or `TX_TIMEOUT` (CF=1) if no `TxComplete` arrives within the bound (the
+  channel is aborted so the card stops reading the caller's slot).
+- **Out of scope (8b.2b):** the stack-side headroom-prepend producer (NVMe H2C dirty-cache-slot flush)
+  and the retain-until-ACK retransmit model. TX_SUBMIT is the mechanism; the stack is its only client.
