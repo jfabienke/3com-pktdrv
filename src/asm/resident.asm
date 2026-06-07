@@ -269,7 +269,7 @@ f_release_type:
 
 ;--- 4: send_pkt -- DS:SI = packet, CX = length; near-call the emitted TX datapath ---
 f_send_pkt:
-        ; --- length guard: reject oversized frames BEFORE any TX work. The 386+ DMA path copies
+        ; --- length guard: reject oversized frames BEFORE any TX work. The 486+ ring DMA path copies
         ;     the caller frame into fixed TX_SLOT_SZ ring slots (dma_tx_enqueue does not re-check),
         ;     so an oversized CX would overrun resident memory. Cap = the interoperable large-frame
         ;     max (FDDI, < the card's oversize threshold) when /j is active, else a standard
@@ -330,9 +330,9 @@ f_send_pkt:
         cmp     word [tx_ring_count], TX_RING_N - 1
         jae     .tx_pio                 ; ISR + count ≥ N-1: PIO to leave room for main loop
 .tx_check_ring:
-        cmp     byte [g_tx_ring], 0     ; 386+ -> non-blocking ring; 286 -> zero-copy single-transfer
+        cmp     byte [g_tx_ring], 0     ; 486+ -> non-blocking ring; 286/386 -> zero-copy single-transfer
         je      .tx_single
-        call    dma_tx_enqueue          ; 386+: copy to a ring slot, ISR drains the card (non-blocking)
+        call    dma_tx_enqueue          ; 486+: copy to a ring slot, ISR drains the card (non-blocking)
         jc      .tx_pio                 ; ring full past timeout, or ISR-context full -> PIO THIS frame.
                                         ; NEVER drop: a frame dropped but reported sent (CF=0) stalls TCP
                                         ; until its RTO -- fatal during the latency-tight NVMe handshake.
@@ -342,7 +342,7 @@ f_send_pkt:
 .tx_single:
         cmp     byte [g_tx_in_flight], 0
         jne     .tx_pio                 ; re-entrant call from upcall: fall back to PIO for this frame
-        call    dma_tx_single           ; 286: zero-copy DMA straight from the caller's buffer (blocking)
+        call    dma_tx_single           ; 286/386: zero-copy DMA straight from the caller's buffer (blocking)
         inc     word [stat_tx]          ; success: single-transfer DMA issued
         clc
         ret
@@ -350,8 +350,8 @@ f_send_pkt:
         ; --- PIO is only FIFO-safe for standard-size frames. The tx_pio fragment bursts the whole
         ; frame with a blind `rep outsw`, and TxFree can never reach (len+4) for a frame larger than
         ; the ~2 KB FIFO -- the wait below would time out and the burst would overflow the FIFO mid
-        ; frame. A large (/j FDDI) frame MUST use a bus-master DMA path (ring or 286 single-transfer);
-        ; if it reached PIO (no DMA at all, a ring-full/ISR fallback, or 286 reentrancy) we cannot
+        ; frame. A large (/j FDDI) frame MUST use a bus-master DMA path (ring or 286/386 single-transfer);
+        ; if it reached PIO (no DMA at all, a ring-full/ISR fallback, or 286/386 reentrancy) we cannot
         ; send it safely. Return Crynwr CANT_SEND (honest CF=1) rather than silently corrupt-send.
         ; DMA frames up to EL3_MAX_FRAME_LARGE are handled in full by the ring/single paths above. ---
         cmp     word [bp + F_CX], EL3_MAX_FRAME
@@ -393,7 +393,7 @@ f_send_pkt:
         ret
 
 ;------------------------------------------------------------------------------
-; dma_tx_enqueue -- non-blocking bus-master TX via a software ring (3C515, 386+ real mode).
+; dma_tx_enqueue -- non-blocking bus-master TX via a software ring (3C515, 486+ real mode).
 ; Copies the caller's frame into a free ring slot (so the caller can reuse its buffer per the
 ; Crynwr ABI), fills that slot's descriptor, bumps the ring, and -- if the card is idle -- kicks
 ; the DMA for the oldest queued slot. It does NOT wait for completion: the TxComplete ISR frees
@@ -457,7 +457,7 @@ dma_tx_enqueue:
         mov     ds, [bp + F_DS]
         mov     si, [bp + F_SI]
         cld
-        ; slot copy: the ring is 386+ only (286 uses the zero-copy single-transfer path), so always
+        ; slot copy: the ring is 486+ only (286/386 use the zero-copy single-transfer path), so always
         ; the 32-bit rep movsd. The per-element copy cost dominated the ring under -icount; wider wins.
         mov     bx, cx                          ; bx = byte count (for the 0..3-byte remainder)
         cpu     386
@@ -768,9 +768,10 @@ f_xms_query:
         ; DMA extension requires bus-master NIC (3C515); 3C509 is PIO-only
         cmp     byte [g_use_dma], 0
         je      .no_dma
-        ; Caps are fixed by JIT fragment selection at install time.
-        ; 286: CONV_SINGLE only — XMS single-transfer excluded (INT 15h ~1200 us > inter-frame)
-        ; 386+: XMS_RING + RING + CONV_SINGLE + CONV_RING
+        ; Caps are fixed by JIT fragment selection at install time; the ring tier keys off
+        ; g_tx_ring (486+ since Phase 8b.1).
+        ; 286/386: CONV_SINGLE only — XMS single-transfer excluded (INT 15h ~1200 us > inter-frame)
+        ; 486+:    XMS_RING + RING + CONV_SINGLE + CONV_RING
         mov     bx, XMS_CAP_CONV_SINGLE
         cmp     byte [g_tx_ring], 0
         je      .no_ring
@@ -803,7 +804,7 @@ f_xms_configure:
         ; validate policy (0=CONV_SINGLE, 1=CONV_RING, 2=XMS_RING)
         cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_RING
         ja      .epol
-        ; ring / XMS-ring policies require the 386+ TX ring. The 286 single-transfer tier
+        ; ring / XMS-ring policies require the 486+ TX ring. The 286/386 single-transfer tier
         ; advertises only CONV_SINGLE via QUERY, so reject a ring policy here too -- otherwise a
         ; caller that skips QUERY could arm a mode this tier cannot honour.
         cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_CONV_SINGLE

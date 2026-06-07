@@ -132,14 +132,14 @@ g_nic_io:       resw 1              ; detected I/O base (command reg at +0x0E, w
 g_nic_irq:      resw 1              ; detected IRQ
 g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
 g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
-g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286): single-transfer on 286, ring on 386+
+g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286): single-transfer on 286/386, ring on 486+
 g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
-g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
+g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286/386 path)
 g_tx_in_flight: resb 1             ; 1 while dma_tx_single holds the DMA channel (re-entrance guard)
-g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking TX ring (movsd copy); 0 = 286 -> blocking zero-copy single-transfer
+g_tx_ring:      resb 1             ; 1 = 486+ -> non-blocking TX ring (movsd copy); 0 = 286/386 -> blocking zero-copy single-transfer
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
-;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
+;  so the TSR drops them on the PIO floor; the 286/386 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
 ; receiver handle table: per slot recv_off, recv_seg (0=free), type (0=match all)
 htable:         resb MAX_HANDLES * HANDLE_SIZE
@@ -201,19 +201,19 @@ global resident_end_pio
 ; bus-master TX-DMA structures -- kept ONLY when the DMA path is active (gated on g_use_dma), so
 ; they sit past resident_end_pio and the PIO floor drops them. RX is always PIO (no RX-DMA buffer/
 ; descriptor), so only the TX descriptors + ring slots live here. dword-aligned; descriptor layout
-; matches the emulator EL3 Down desc (next/status/addr/length). tx_descs[0] doubles as the 286
-; single-transfer down descriptor (the ring is 386+ only); the TX slots below the single boundary
-; exist only for the 386+ ring, so the 286 path drops them too.
+; matches the emulator EL3 Down desc (next/status/addr/length). tx_descs[0] doubles as the 286/386
+; single-transfer down descriptor (the ring is 486+ only); the TX slots below the single boundary
+; exist only for the 486+ ring, so the 286/386 path drops them too.
                 alignb 4
-tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-reads them); [0] also serves the 286 single-transfer
+tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-reads them); [0] also serves the 286/386 single-transfer
                 alignb 4
 
-resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (descriptors only)
+resident_end_single:               ; <== TSR keep boundary for the 286/386 single-transfer DMA path (descriptors only)
 global resident_end_single
 
-; XMS DMA receive ring state -- present whenever g_use_dma=1 (286 or 386+).
-; 286: kept through resident_end_xms_single (drops tx_slots / ring vars).
-; 386+: kept through resident_end (includes tx_slots for the TX ring).
+; XMS DMA receive ring state -- present whenever g_use_dma=1 (286+).
+; 286/386: kept through resident_end_xms_single (drops tx_slots / ring vars).
+; 486+:    kept through resident_end (includes tx_slots for the TX ring).
 xms_dma_armed:  resb 1             ; 0 = PIO / not configured; 1 = XMS ring armed
 xms_rx_policy:  resb 1             ; xms_mem_policy_t (VCPI=0, DPMI=1, XMS_COPY=2)
 xms_slot_idx:   resb 1             ; current ping-pong slot index (0 or 1)
@@ -230,14 +230,14 @@ xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; acc
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
 
-tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ ring frame slots (dma_tx_enqueue copies the frame in)
+tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 486+ ring frame slots (dma_tx_enqueue copies the frame in)
 tx_ring_head:   resw 1             ; next slot to fill (producer: send_pkt)
 tx_ring_tail:   resw 1             ; oldest in-flight slot (consumer: TxComplete ISR)
 tx_ring_count:  resw 1             ; frames currently queued (0..TX_RING_N)
 tx_dma_busy:    resb 1             ; 1 while a slot's DMA is in flight
                 resb 1             ; pad to even
 
-resident_end:                      ; <== TSR keep boundary for the 386+ ring DMA path
+resident_end:                      ; <== TSR keep boundary for the 486+ ring DMA path
 global resident_end
 
 ;==============================================================================

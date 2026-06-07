@@ -6,8 +6,8 @@
  *
  * Three buffer classes are supported:
  *   CONV_SINGLE  conventional memory, 1 slot, single-transfer       (286+  / 10  Mbps)
- *   CONV_RING    conventional memory, 2 slots, ring mode            (386+ / 100  Mbps)
- *   XMS_RING     XMS extended memory, 2 slots, ring + INT 15h copy  (386+ / 100  Mbps)
+ *   CONV_RING    conventional memory, 2 slots, ring mode            (486+ / 100  Mbps)
+ *   XMS_RING     XMS extended memory, 2 slots, ring + INT 15h copy  (486+ / 100  Mbps)
  *
  * XMS single-transfer (286 + HIMEM) is not supported: INT 15h AH=87h on a
  * 286SX/16 costs ~1200-1800 us, consuming the entire 10 Mbps inter-frame gap.
@@ -42,16 +42,17 @@
 
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
 /*
- * Caps are fixed at install time by JIT fragment selection:
- *   286 binary:  CONV_SINGLE
- *   386+ binary: XMS_RING | RING | CONV_SINGLE | CONV_RING
+ * Caps are fixed at install time by JIT fragment selection (the ring tier is gated on
+ * g_tx_ring, which is 486+ since Phase 8b.1 -- 286/386 use single-transfer):
+ *   286/386: CONV_SINGLE
+ *   486+   : XMS_RING | RING | CONV_SINGLE | CONV_RING
  */
 #define XMS_CAP_CONV_SINGLE 0x0001u /* conventional mem, 1 slot, single-xfer (286+)  */
-#define XMS_CAP_CONV_RING   0x0002u /* conventional mem, 2 slots, ring mode  (386+)  */
+#define XMS_CAP_CONV_RING   0x0002u /* conventional mem, 2 slots, ring mode  (486+)  */
 /* 0x0004 = RESERVED/DEPRECATED (was XMS_CAP_XMS_COPY; XMS_COPY policy dropped) -- never reuse */
-#define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)                   */
+#define XMS_CAP_RING        0x0008u /* ring descriptor mode (486+)                   */
 /* 0x0010 = RESERVED (was a stack-only XMS_CAP_SINGLE; unused by the driver) -- never reuse */
-#define XMS_CAP_XMS_RING    0x0020u /* XMS + INT 15h ring mode               (386+)  */
+#define XMS_CAP_XMS_RING    0x0020u /* XMS + INT 15h ring mode               (486+)  */
 #define XMS_CAP_RX_DESC_V2  0x0040u /* N-slot RX ring + completion/free rings (RX vertical) */
 #define XMS_CAP_XMS_TX      0x0080u /* caller-phys TX submit path             (TX vertical) */
 
@@ -63,7 +64,7 @@
 typedef enum {
     XMS_POLICY_CONV_SINGLE = 0, /* conventional memory, single-transfer; zero CPU copies  */
     XMS_POLICY_CONV_RING   = 1, /* conventional memory, ring mode;        zero CPU copies  */
-    XMS_POLICY_XMS_RING    = 2, /* XMS + INT 15h ring mode   (386+);       one CPU copy   */
+    XMS_POLICY_XMS_RING    = 2, /* XMS + INT 15h ring mode   (486+);       one CPU copy   */
 } xms_mem_policy_t;
 /* No policy value = no extension call; standard Crynwr PIO path */
 
@@ -83,7 +84,7 @@ typedef enum {
 /* ---- configuration structure (passed via ES:DI to CONFIGURE) ----------- */
 
 #define XMS_CFG_VERSION     1u      /* cfg.version must equal this */
-#define XMS_CFG_N_SLOTS     2u      /* fixed: 2-slot ping-pong ring (386+ ring mode only) */
+#define XMS_CFG_N_SLOTS     2u      /* fixed: 2-slot ping-pong ring (486+ ring mode only) */
 
 /*
  * xms_rx_cfg_t — caller-allocated, must remain resident for the lifetime of

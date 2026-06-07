@@ -94,14 +94,14 @@ install:
         mov     ax, EL3_CMD_SET_STATUS_ENB | 0x00FF
         out     dx, ax
 
-        ; arm bus-master TX DMA (386+ ring only): init the TX descriptors/slots. RX is PIO in all
+        ; arm bus-master TX DMA (486+ ring only): init the TX descriptors/slots. RX is PIO in all
         ; modes (no RX-DMA arm) -- bidirectional RX-DMA dropped ACKs; see the ISR RX-COMPLETE path.
         cmp     byte [g_use_dma], 0
         je      .no_dma
         mov     byte [g_tx_in_flight], 0 ; clear re-entrance guard before TSR activates
         cmp     byte [g_tx_ring], 0
-        je      .no_dma                 ; 286 single-transfer: nothing to arm (RX is PIO, no ring)
-        call    tx_ring_init            ; 386+ ring: init the TX descriptors/slots
+        je      .no_dma                 ; 286/386 single-transfer: nothing to arm (RX is PIO, no ring)
+        call    tx_ring_init            ; 486+ ring: init the TX descriptors/slots
 .no_dma:
 
         ; free our environment block (PSP[2Ch] = environment segment)
@@ -112,17 +112,17 @@ install:
 
         ; terminate-and-stay-resident. Keep PSP + the RESIDENT region only (handler, ISR,
         ; resident state, emitted datapath); the cold composer/probe/init is reclaimed. Three keep
-        ; boundaries: PIO floor (no DMA) drops the whole TX-DMA region; 286 DMA keeps tx_descs +
-        ; XMS state (resident_end_xms_single) and drops the ring's TX slots; 386+ ring DMA keeps
+        ; boundaries: PIO floor (no DMA) drops the whole TX-DMA region; 286/386 DMA keeps tx_descs +
+        ; XMS state (resident_end_xms_single) and drops the ring's TX slots; 486+ ring DMA keeps
         ; everything through the TX slots + ring vars. (RX is PIO in all modes -- no RX-DMA buffer.)
         ;   paragraphs = PSP(0x10) + ceil(boundary / 16)
         mov     ax, resident_end_pio            ; PIO floor: drop the whole bus-master DMA region
         cmp     byte [g_use_dma], 0
         je      .keep_calc
-        mov     ax, resident_end_xms_single     ; 286 single-transfer DMA: keep XMS state, drop TX ring slots
+        mov     ax, resident_end_xms_single     ; 286/386 single-transfer DMA: keep XMS state, drop TX ring slots
         cmp     byte [g_tx_ring], 0
         je      .keep_calc
-        mov     ax, resident_end                ; 386+ ring DMA: keep through the TX slots + ring vars
+        mov     ax, resident_end                ; 486+ ring DMA: keep through the TX slots + ring vars
 .keep_calc:
         add     ax, 15
         mov     cl, 4

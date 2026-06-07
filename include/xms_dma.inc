@@ -26,16 +26,17 @@ XMS_DMA_TX_SUBMIT     equ 0x05  ; AL: submit one TX frame from caller phys (DX:C
 XMS_DMA_RX_REFILL     equ 0x06  ; AL: reserved RX free-ring doorbell
 
 ; ---- capability flags (BX on successful QUERY) --------------------------
-; Caps are fixed at install time by JIT fragment selection:
-;   286 binary:  CONV_SINGLE
-;   386+ binary: XMS_RING | RING | CONV_SINGLE | CONV_RING
+; Caps are fixed at install time by JIT fragment selection (the ring tier is gated
+; on g_tx_ring, which is 486+ since Phase 8b.1 -- 286/386 use single-transfer):
+;   286/386: CONV_SINGLE
+;   486+   : XMS_RING | RING | CONV_SINGLE | CONV_RING
 
 XMS_CAP_CONV_SINGLE equ 0x0001  ; conventional mem, 1 slot, single-xfer (286+)
-XMS_CAP_CONV_RING   equ 0x0002  ; conventional mem, 2 slots, ring mode  (386+)
+XMS_CAP_CONV_RING   equ 0x0002  ; conventional mem, 2 slots, ring mode  (486+)
 ; 0x0004 = RESERVED/DEPRECATED (was XMS_CAP_XMS_COPY; XMS_COPY policy dropped) -- never reuse
-XMS_CAP_RING        equ 0x0008  ; ring descriptor mode (386+)
+XMS_CAP_RING        equ 0x0008  ; ring descriptor mode (486+)
 ; 0x0010 = RESERVED (was a stack-only XMS_CAP_SINGLE; unused by the driver) -- never reuse
-XMS_CAP_XMS_RING    equ 0x0020  ; XMS + INT 15h ring mode               (386+)
+XMS_CAP_XMS_RING    equ 0x0020  ; XMS + INT 15h ring mode               (486+)
 XMS_CAP_RX_DESC_V2  equ 0x0040  ; N-slot RX ring + completion/free rings (advertised by the RX vertical)
 XMS_CAP_XMS_TX      equ 0x0080  ; caller-phys TX submit path             (advertised by the TX vertical)
 
@@ -45,7 +46,7 @@ XMS_CAP_XMS_TX      equ 0x0080  ; caller-phys TX submit path             (advert
 
 XMS_POLICY_CONV_SINGLE equ 0    ; conventional memory, single-transfer; zero CPU copies
 XMS_POLICY_CONV_RING   equ 1    ; conventional memory, ring mode;        zero CPU copies
-XMS_POLICY_XMS_RING    equ 2    ; XMS + INT 15h ring mode   (386+);      one CPU copy
+XMS_POLICY_XMS_RING    equ 2    ; XMS + INT 15h ring mode   (486+);      one CPU copy
 
 ; ---- error codes (DH on CF=1) -------------------------------------------
 

@@ -76,8 +76,8 @@ nic_isr:
         cmp     byte [g_use_dma], 0
         je      .no_txdone              ; PIO mode: no DMA (TxComplete just acked at .recv_done)
         cmp     byte [g_tx_ring], 0
-        jne     .tx_ring_adv            ; 386+: advance the non-blocking TX ring
-        mov     byte [g_tx_done], 1     ; 286 single-transfer: flag dma_tx_single's blocking wait
+        jne     .tx_ring_adv            ; 486+: advance the non-blocking TX ring
+        mov     byte [g_tx_done], 1     ; 286/386 single-transfer: flag dma_tx_single's blocking wait
         jmp     .no_txdone
 .tx_ring_adv:
 %ifdef CFG_DEBUG
@@ -315,7 +315,7 @@ nic_isr:
 ; xms_rx_deliver -- handle an XMS up-descriptor completion (UP_COMPLETE interrupt).
 ; Reads the completed slot's descriptor status to get frame length, delivers to the
 ; registered receiver, clears the descriptor, and advances the ping-pong index.
-; On 286 (single-transfer, g_tx_ring=0): re-arms the OTHER slot and issues StartDmaUp
+; On 286/386 (single-transfer, g_tx_ring=0): re-arms the OTHER slot and issues StartDmaUp
 ; before processing -- minimises the gap during which the NIC has no armed descriptor.
 ; Clobbers AX, BX, CX, DX, SI, DI, ES. DS = our segment on entry and exit.
 ;------------------------------------------------------------------------------
@@ -602,10 +602,10 @@ xms_rx_deliver:
         out     dx, ax
         jmp     .done                   ; no slot toggle for CONV_SINGLE
 
-        ; --- 13. Slot toggle for ring and XMS_COPY+286 ---
+        ; --- 13. Slot toggle for ring and XMS_COPY+286/386 ---
 .toggle:
         cmp     byte [g_tx_ring], 0
-        je      .done                   ; XMS_COPY+286: already toggled during pre-arm
+        je      .done                   ; XMS_COPY+286/386: already toggled during pre-arm
         xor     byte [xms_slot_idx], 1
 
 .done:
