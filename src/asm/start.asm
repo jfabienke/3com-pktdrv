@@ -79,6 +79,8 @@ g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1
 g_manual:       resb 1          ; 1 = manual /b= I/O base given -> skip the ID-port probe
 g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit byte-loop) datapath
 g_force286:     resb 1          ; 1 = /2 given -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
+g_force386:     resb 1          ; 1 = /3 given -> force the 386-class datapath (32-bit PIO + CONV_SINGLE DMA)
+g_force486:     resb 1          ; 1 = /4 given -> force the 486-class datapath (32-bit PIO + CONV_RING DMA)
 g_want_dma:     resb 1          ; 1 = /d given -> request bus-master TX DMA (resolved in build_plan)
 g_want_large:   resb 1          ; 1 = /j given -> request FDDI-sized large frames (gated to 3C515)
 tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
@@ -188,7 +190,18 @@ pkt_stats:      times 7 dd 0       ; Crynwr get_statistics struct (built on dema
 %ifdef CFG_DEBUG
 ; --- debug event-log ring (resident; appended by the ISR / handler, dumped by pktdbg) ---
 DBG_LOG_SIZE    equ 512
-dbg_sig:        db 'PKTDBG00'      ; marker the dump tool can recognise
+dbg_sig:        db 'PKTDBG01'      ; bumped: block now carries TX-ring diag counters at sig+8
+; --- TX-ring DMA diagnostic counters (task #54: discriminate ring-full vs busy-stuck vs TCP-wait).
+;     Fixed layout at sig+8.. read by txdiag.com via AH=0x7F (returns DS:SI -> dbg_sig). All cheap
+;     `inc word [mem]` (no dbg_logb call), so they barely perturb the 100Mbit TX-ring timing. ---
+txd_max_count:   dw 0   ; sig+8   peak tx_ring_count seen (ring-depth high-water mark)
+txd_pio_fallb:   dw 0   ; sig+10  ring-full -> PIO fallbacks (foreground couldn't enqueue)
+txd_drained:     dw 0   ; sig+12  total descriptors retired by the drain loop
+txd_kick:        dw 0   ; sig+14  tx_kick calls (StartDmaDown issued)
+txd_cpl_seen:    dw 0   ; sig+16  TxComplete ISR entries that reached .tx_ring_adv
+txd_busy_stuck:  dw 0   ; sig+18  enqueue hit ring-full in ISR ctx (completion couldn't drain it)
+txd_full_spins:  dw 0   ; sig+20  eq_wait HLT spins (foreground blocked waiting for a free slot)
+txd_spare:       dw 0   ; sig+22  reserved
 dbg_log_head:   dw 0               ; ring write index (wraps at DBG_LOG_SIZE)
 dbg_log:        times DBG_LOG_SIZE db 0
 %endif
@@ -269,7 +282,7 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 7               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma, g_want_large
+        mov     cx, 9               ; g_cpu_class, g_nic_gen, g_manual, g_force8/286/386/486, g_want_dma, g_want_large
         xor     al, al
         rep     stosb
         mov     [psp_seg], bp
@@ -305,8 +318,18 @@ global resident_end
         jmp     .st_next
 .chk_286:
         cmp     al, '2'
-        jne     .chk_dma
+        jne     .chk_386
         mov     byte [g_force286], 1 ; force 286-class datapath (test 286 16-bit PIO + single-transfer DMA)
+        jmp     .st_next
+.chk_386:
+        cmp     al, '3'
+        jne     .chk_486
+        mov     byte [g_force386], 1 ; force 386-class datapath (32-bit PIO + CONV_SINGLE DMA)
+        jmp     .st_next
+.chk_486:
+        cmp     al, '4'
+        jne     .chk_dma
+        mov     byte [g_force486], 1 ; force 486-class datapath (32-bit PIO + CONV_RING DMA)
         jmp     .st_next
 .chk_dma:
         cmp     al, 'd'
@@ -354,14 +377,24 @@ global resident_end
         jmp     .cpu_ok
 .chk_force286:
         cmp     byte [g_force286], 0 ; /2 -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
-        je      .cpu_ok
+        je      .chk_force386
         mov     byte [g_cpu_class], CPU_80286
+        jmp     .cpu_ok
+.chk_force386:
+        cmp     byte [g_force386], 0 ; /3 -> force the 386-class datapath (32-bit PIO + CONV_SINGLE DMA)
+        je      .chk_force486
+        mov     byte [g_cpu_class], CPU_80386
+        jmp     .cpu_ok
+.chk_force486:
+        cmp     byte [g_force486], 0 ; /4 -> force the 486-class datapath (32-bit PIO + CONV_RING DMA)
+        je      .cpu_ok
+        mov     byte [g_cpu_class], CPU_80486
 .cpu_ok:
         mov     dx, msg_cpu
         call    print_str
         mov     al, [g_cpu_class]
         add     al, '0'
-        call    print_char          ; CPU class digit (0=8088,1=286,2=386)
+        call    print_char          ; CPU class digit (0=8088,1=286,2=386,3=486,4=CPUID)
 
         ; --- 5150 short-circuit -------------------------------------------------
         ; On an 8088/8086 the capability axis collapses to PIO: no protected mode, no

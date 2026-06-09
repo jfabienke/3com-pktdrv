@@ -341,9 +341,21 @@ f_send_pkt:
         cmp     byte [g_tx_ring], 0     ; 486+ -> non-blocking ring; 286/386 -> zero-copy single-transfer
         je      .tx_single
         call    dma_tx_enqueue          ; 486+: copy to a ring slot, ISR drains the card (non-blocking)
-        jc      .tx_pio                 ; ring full past timeout, or ISR-context full -> PIO THIS frame.
-                                        ; NEVER drop: a frame dropped but reported sent (CF=0) stalls TCP
-                                        ; until its RTO -- fatal during the latency-tight NVMe handshake.
+        jnc     .tx_enqueued            ; CF=0: frame is in a ring slot, FIFO order preserved
+        ; CF=1: dma_tx_enqueue could not place the frame. Two cases, distinguished by context:
+        ;  - ISR/reentrancy (g_isr_busy): the completion ISR can't fire to drain a slot, so waiting
+        ;    would deadlock -> PIO this frame (the only safe option in ISR context).
+        ;  - Foreground: the ring stayed full for the full WEDGE guard (dead card). Do NOT PIO -- a
+        ;    PIO burst jumps the FIFO ahead of the frames queued in the DMA ring -> out-of-order TX
+        ;    -> dupack/retransmit storm (the 515dma100 write collapse). Reject CANT_SEND (honest
+        ;    CF=1, NOT a silent CF=0 drop); the TCP stack retransmits in order. FIFO order across the
+        ;    TX path is non-negotiable for TCP.
+        cmp     byte [g_isr_busy], 0
+        jnz     .tx_pio                 ; ISR/reentrancy context -> PIO
+        mov     dh, PD_ERR_CANTSEND     ; foreground wedge -> reject, never reorder
+        stc
+        ret
+.tx_enqueued:
         inc     word [stat_tx]          ; success: frame accepted into the ring
         clc                             ; enqueued -> the TxComplete ISR drains it
         ret
@@ -425,11 +437,42 @@ dma_tx_enqueue:
         ; without ever draining a slot. Signal the caller to fall back to PIO instead.
         cmp     byte [g_isr_busy], 0
         jnz     .eq_isr_full
+        ; --- self-heal: a TxComplete EDGE can be lost outright (edge-triggered ISA: a latch that
+        ; rises and drops mid-INTA resolves as spurious IRQ15 and is gone forever -- reproduced
+        ; deterministically under the emulator, and a classic failure mode on real edge-triggered
+        ; hardware). The descriptor still shows DN_COMPLETE in memory, so don't wait on an IRQ
+        ; that will never come: retire the completed tail + kick the next INLINE. IF=0 here, so
+        ; this can't race the ISR's drain; retire-oldest/kick-next is exactly the ISR's order, so
+        ; FIFO order is preserved. With every edge lost (worst case) the ring still cycles via
+        ; these foreground drains; the wedge guard below remains for a genuinely dead card. ---
+        mov     bx, [tx_ring_tail]
+        mov     cl, 4
+        shl     bx, cl                          ; tail * 16
+        add     bx, tx_descs
+        test    word [bx + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        jz      .eq_wtick                       ; tail genuinely in flight -> wait for the IRQ
+        dec     word [tx_ring_count]            ; retire the completed tail (ring full -> count>0 after)
+        mov     ax, [tx_ring_tail]
+        inc     ax
+        cmp     ax, TX_RING_N
+        jb      .eq_twr
+        xor     ax, ax
+.eq_twr:
+        mov     [tx_ring_tail], ax
+        call    tx_kick                         ; start the new tail (count > 0: ring was full)
+%ifdef CFG_DEBUG
+        inc     word [txd_drained]              ; self-heal retires count in dr alongside ISR ones
+        mov     al, 'H'
+        call    dbg_logb                        ; 'H' = foreground self-heal retire (lost edge)
+%endif
+        jmp     .eq_wait                        ; slot freed -> .eq_have on the next pass
+.eq_wtick:
         mov     ax, [es:BIOS_TICK_COUNT]
         sub     ax, bx
-        cmp     ax, EL3_DMA_TX_TICKS
-        jae     .eq_full                        ; ring still full after the timeout -> drop
+        cmp     ax, EL3_DMA_TX_WEDGE_TICKS      ; ONLY a genuine-wedge escape (~5 s), NOT a tuning timeout:
+        jae     .eq_full                        ; the foreground waits for the ring to drain (see below)
 %ifdef CFG_DEBUG
+        inc     word [txd_full_spins]           ; foreground blocked, ring full, waiting on a drain
         mov     al, 'W'
         call    dbg_logb
 %endif
@@ -438,18 +481,25 @@ dma_tx_enqueue:
         cli
         jmp     .eq_wait
 .eq_isr_full:
+%ifdef CFG_DEBUG
+        inc     word [txd_busy_stuck]           ; ring full while we can't drain (ISR ctx) -> PIO
+%endif
         stc                                     ; ISR context, ring full: tell caller to use PIO
         ret
 .eq_full:
-        ; Ring stayed full for the whole timeout. Do NOT drop -- return CF=1 so f_send_pkt sends THIS
-        ; frame via PIO instead. The ring is a throughput optimization; correctness (every accepted
-        ; frame is actually transmitted) must never depend on it draining in time. 'P' marks the fallback.
-        inc     word [stat_txwait]              ; count ring-full -> PIO fallbacks
+        ; Foreground only (the ISR path branched to .eq_isr_full above), and only after the ring
+        ; stayed full for the full WEDGE guard (~5 s) -- i.e. the card is genuinely dead, not a normal
+        ; deferred-completion stall. Return CF=1: the caller rejects this frame with CANT_SEND (it must
+        ; NOT PIO -- a PIO burst would jump the FIFO ahead of the frames still queued in the ring ->
+        ; out-of-order TX -> TCP dupack/retransmit storm, the 515dma100 write collapse). FIFO order
+        ; across the TX path is non-negotiable for TCP; the stack retransmits the rejected frame in order.
+        inc     word [stat_txwait]              ; count ring-full wedge rejects (was: PIO fallbacks)
 %ifdef CFG_DEBUG
+        inc     word [txd_pio_fallb]            ; (txdiag: now counts foreground wedge rejects)
         mov     al, 'P'
         call    dbg_logb
 %endif
-        stc                                     ; -> caller (f_send_pkt) falls back to PIO for this frame
+        stc                                     ; -> caller: foreground wedge -> CANT_SEND (never PIO)
         ret
 .eq_have:
         ; copy caller frame (F_DS:F_SI, F_CX bytes) into slot[head] = tx_slots + head*TX_SLOT_SZ
@@ -496,6 +546,13 @@ dma_tx_enqueue:
 .eq_hwrap:
         mov     [tx_ring_head], ax
         inc     word [tx_ring_count]
+%ifdef CFG_DEBUG
+        mov     ax, [tx_ring_count]             ; track ring-depth high-water for the diagnostic
+        cmp     ax, [txd_max_count]
+        jbe     .eq_nomax
+        mov     [txd_max_count], ax
+.eq_nomax:
+%endif
         ; if the card is idle, kick the oldest queued slot
         cmp     byte [tx_dma_busy], 0
         jne     .eq_queued
@@ -517,6 +574,7 @@ dma_tx_enqueue:
 ;------------------------------------------------------------------------------
 tx_kick:
 %ifdef CFG_DEBUG
+        inc     word [txd_kick]         ; one StartDmaDown issued
         mov     al, 'K'
         call    dbg_logb
 %endif

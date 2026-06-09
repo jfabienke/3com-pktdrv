@@ -88,19 +88,42 @@ nic_isr:
         mov     byte [g_tx_done], 1     ; 286/386 single-transfer: flag dma_tx_single's blocking wait
         jmp     .no_txdone
 .tx_ring_adv:
+        push    ax                      ; preserve adapter status (drain loop + tx_kick clobber ax)
+                                        ; (push BEFORE the debug marker: `mov al,'T'` would otherwise
+                                        ; corrupt the saved status -- the .recv_done recheck joins
+                                        ; here with AX=0 and must rejoin .no_txdone with AX=0)
 %ifdef CFG_DEBUG
+        inc     word [txd_cpl_seen]     ; one TxComplete ISR entry reached the ring path
         mov     al, 'T'
-        call    dbg_logb                ; dbg_logb preserves AX -> adapter status intact
+        call    dbg_logb
 %endif
-        push    ax                      ; preserve adapter status (tail advance + tx_kick clobber ax)
-%ifdef CFG_DEBUG
-        mov     al, [tx_ring_count]
-        add     al, '0'
-        call    dbg_logb                ; log ring depth (adapter status safe on the stack)
-%endif
+        ; Drain ALL completed tail descriptors per service, not one. At 100Mbit several down-list
+        ; descriptors complete (each sets EL3_DESC_DN_COMPLETE in its status) behind ONE coalesced
+        ; TxComplete latch; retiring one-per-IRQ falls behind, the ring looks full, the stack stops
+        ; sending -> ~0.5s TX-pacing gaps (515dma100 collapse). DN_COMPLETE is the reliable per-
+        ; descriptor completion; TxComplete just says "inspect the ring". This is hardware-correct:
+        ; it retires exactly the descriptors that are actually DN_COMPLETE -- on real HW (spaced
+        ; completions) that's ~one per IRQ; under the emulator (StartDmaDown sets the next tail's
+        ; DN_COMPLETE synchronously) the whole queue drains in one pass.
+        ; NOTE: still NO mid-ISR AckIntr(TxComplete). TxComplete is cleared once at .recv_done
+        ; (AckIntr 0x00FF); the emulator's IRQ line only toggles on a level TRANSITION, so a mid-loop
+        ; ack would lose the next rising edge and stall the ring. We gate on DN_COMPLETE, not the
+        ; latch, so coalesced completions are caught without touching the ack.
+.tx_drain_loop:
         cmp     word [tx_ring_count], 0
-        je      .tx_idle                ; spurious -- nothing queued
-        dec     word [tx_ring_count]    ; the tail slot's DMA finished
+        je      .tx_idle                ; nothing (more) queued -- also guards stale descriptor reads
+        mov     bx, [tx_ring_tail]
+        mov     cl, 4
+        shl     bx, cl                  ; tail * 16 (EL3_DESC_SIZE)
+        add     bx, tx_descs            ; bx = &desc[tail]
+        test    word [bx + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        jz      .tx_drained             ; tail still in flight -> no more completed; leave it
+%ifdef CFG_DEBUG
+        inc     word [txd_drained]      ; one descriptor actually retired this pass
+        mov     al, 'T'
+        call    dbg_logb                ; one 'T' per retired slot (ring-depth visibility)
+%endif
+        dec     word [tx_ring_count]    ; retire the completed tail slot
         mov     ax, [tx_ring_tail]
         inc     ax
         cmp     ax, TX_RING_N
@@ -108,16 +131,12 @@ nic_isr:
         xor     ax, ax
 .tx_twrap:
         mov     [tx_ring_tail], ax
-        ; NOTE: do NOT selectively AckIntr(TxComplete) here to suppress the spurious re-reads of
-        ; this latch on later recv_loop iterations. TxComplete is cleared once, at .recv_done
-        ; (AckIntr 0x00FF). A mid-ISR ack is incompatible with the emulator's edge-triggered IRQ
-        ; model: el3_update_irq only toggles the line on a level TRANSITION, so once TxComplete is
-        ; cleared mid-loop the NEXT drain-timer completion raises no fresh rising edge -> no ISR ->
-        ; the ring stalls and every enqueue drops (verified: ring fills to 4, no further 'I'). The
-        ; spurious re-advances are harmless: they hit tx_ring_count==0 and fall through to .tx_idle.
         cmp     word [tx_ring_count], 0
-        je      .tx_idle                ; ring drained
-        call    tx_kick                 ; more queued -> start the next slot's DMA
+        je      .tx_idle                ; ring fully drained
+        call    tx_kick                 ; start the new tail's DMA (sets its DN_COMPLETE synchronously)
+        jmp     .tx_drain_loop          ; re-check: the just-kicked tail is now complete -> drain it
+.tx_drained:
+        ; tail not yet complete: it is in flight -> its own TxComplete will re-enter the ISR.
         jmp     .tx_acpop
 .tx_idle:
         mov     byte [tx_dma_busy], 0
@@ -285,10 +304,54 @@ nic_isr:
         jmp     .recv_done             ; ack + EOI; a real frame re-fires the IRQ
 
 .recv_done:
+%ifdef CFG_DEBUG
+        mov     al, 'A'
+        call    dbg_logb                ; one 'A' per terminal AckIntr (ack-race forensics)
+%endif
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_ACK_INTR | 0x00FF   ; acknowledge all latched sources
         out     dx, ax
+        ; --- closed-window re-check (edge-triggered IRQ). A TxComplete that latches while the
+        ; line is already high (mid-ISR) raises no new edge; if it lands after the final status
+        ; read, the ack above just cleared it UNPROCESSED and no IRQ will ever re-fire for it --
+        ; with no other NIC traffic the ring wedges (proven: connect stalled with the completed
+        ; frame on the wire, dr=kk-1, foreground waited the full wedge guard). Descriptor memory
+        ; is the truth, the latch is only the doorbell: if the ring tail shows DN_COMPLETE now,
+        ; drain it and re-ack. A completion landing AFTER the ack finds the line low and re-fires
+        ; normally, so this loop runs only for the would-have-been-lost case and terminates.
+        cmp     byte [g_use_dma], 0
+        je      .ack_clean
+        cmp     byte [g_tx_ring], 0
+        je      .ack_clean              ; ring tier only (single-transfer wait is tick-bounded)
+        cmp     byte [xms_tx_in_flight], 0
+        jne     .ack_clean              ; TX_SUBMIT owns the engine; don't touch ring state
+        cmp     word [tx_ring_count], 0
+        jne     .rc_queued
+%ifdef CFG_DEBUG
+        mov     al, 'c'
+        call    dbg_logb                ; recheck bail: ring empty at this ack
+%endif
+        jmp     .ack_clean
+.rc_queued:
+        mov     bx, [tx_ring_tail]
+        mov     cl, 4
+        shl     bx, cl
+        add     bx, tx_descs
+        test    word [bx + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        jnz     .rc_drain
+%ifdef CFG_DEBUG
+        mov     al, 'n'
+        call    dbg_logb                ; recheck bail: tail still in flight (not DN_COMPLETE)
+%endif
+        jmp     .ack_clean
+.rc_drain:
+%ifdef CFG_DEBUG
+        inc     word [txd_spare]        ; xx = ack-race recoveries (completion saved from loss)
+%endif
+        xor     ax, ax                  ; drain joins .no_txdone with AX as adapter status:
+        jmp     .tx_ring_adv            ;   0 = no other sources -> falls back to .recv_done
+.ack_clean:
         ; Bar a nested IRQ across the busy-clear + stack restore. A receiver upcall or a BIOS path
         ; (e.g. INT 15h on the XMS RX route) may have re-enabled IF; a nested entry that saw
         ; g_isr_busy==0 with SS:SP not yet restored would take the full path and switch onto the

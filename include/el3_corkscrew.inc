@@ -60,7 +60,13 @@ EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 ; ---- non-blocking TX descriptor ring (software ring driven by single-transfer DMA + the
 ; TxComplete ISR). send_pkt copies the frame into a free slot and returns; the ISR frees the
 ; finished slot and kicks the next, overlapping CPU frame-prep with the card's DMA.
-TX_RING_N               equ 4        ; ring slots (frames that can be queued in flight)
+TX_RING_N               equ 4        ; ring slots (frames in flight). Back to the baseline now that the
+                                     ; root fix (ring-full -> wait-for-drain, never PIO into an active ring
+                                     ; stream -- see dma_tx_enqueue / EL3_DMA_TX_WEDGE_TICKS) makes FIFO
+                                     ; order independent of depth. A deeper ring (8, conventional max under
+                                     ; FDDI slots; >8 needs an XMS-backed ring) is now only a throughput
+                                     ; layer -- it reduces how often the foreground must wait -- not a
+                                     ; correctness lever. Re-evaluate after measuring the root fix clean.
 TX_SLOT_SZ              equ 4608     ; per-slot buffer -- FDDI-sized so the ring can DMA large frames
                                      ; (matches the stack's txbuf[4608] and the emulator's
                                      ; EL3_LARGE_FRAME_MAX). 4*4608 = 18 KB, kept only on the 386+
@@ -76,6 +82,13 @@ EL3_MAX_FRAME_LARGE     equ 4490     ; max interoperable large (FDDI) TX frame, 
 ; before TxComplete. A healthy transfer's drain IRQ fires in well under one tick; this many
 ; ticks is just the wedged-card escape (~9 * 55 ms) so the caller can't hang forever.
 EL3_DMA_TX_TICKS        equ 9
+; Ring-full wait (foreground, 486+ ring). The foreground MUST wait for the TxComplete ISR to free
+; a slot -- it must NOT fall back to PIO, because a PIO burst jumps the TX FIFO ahead of the frames
+; still queued in the DMA ring -> out-of-order TX -> TCP dupack/retransmit storm (the 515dma100
+; write collapse). So this bound is a genuine-WEDGE escape ONLY (dead card): generous enough that a
+; normal deferred-completion stall never reaches it; on expiry the frame is rejected CANT_SEND (the
+; stack retransmits in order), never PIO'd. ~5 s.
+EL3_DMA_TX_WEDGE_TICKS  equ 91
 BIOS_TICK_COUNT         equ 0x046C   ; 0040:006C -- low word of the BIOS timer-tick counter
 
 ; ---- Window 3 MAC control (Corkscrew has it; PIO floor leaves duplex at default) ----
