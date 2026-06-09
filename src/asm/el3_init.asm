@@ -115,10 +115,13 @@ el3_load_mac_io:
         mov     ax, di
         or      ax, EL3_EE_READ            ; 0x80 | word addr -> issue read
         out     dx, ax
-.ee_busy:
-        in      ax, dx                     ; read cmd reg back; bit 15 set while busy
-        test    ax, EL3_EE_BUSY
-        jnz     .ee_busy
+        ; Wait the ~162us EEPROM read latency with the SAME proven primitive the ID-port path uses
+        ; (id_read_eeprom). The previous busy-bit poll (test EL3_EE_BUSY/0x8000) does NOT work here:
+        ; the 3C515's busy bit isn't at 0x8000 (el3_core.inc) and QEMU's cmd-reg read returns 0, so
+        ; the poll exits after one read and the data register is sampled while it still holds the
+        ; 0x8000 busy placeholder -> MAC reads as 80:00:80:00:80:00 (garbage station addr -> RX
+        ; address-filter drops everything -> control-plane dead). io_delay preserves DX (cmd reg).
+        call    io_delay                   ; >=162us; clobbers AX (reloaded by the data read below)
         add     dx, 2                      ; data register = command + 2
         in      ax, dx                     ; AX = word (AH = first MAC byte, big-endian)
         mov     [g_mac + si], ah
