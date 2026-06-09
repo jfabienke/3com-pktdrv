@@ -304,7 +304,19 @@ f_send_pkt:
         or      al, al
         jz      .txs_done
         test    al, EL3_TXS_RESET_MASK
-        jz      .txs_pop
+        jnz     .txs_err
+        ; Non-error TX status. On the bus-master path do NOT pop it: TxStatus and the TxComplete
+        ; interrupt are the same machinery (TxComplete asserts while the stack is non-empty;
+        ; popping the last entry deasserts it). This preamble runs in the FOREGROUND on every
+        ; send, racing the DMA completion -- popping a successful completion here eats a pending
+        ; TxComplete edge before the ISR can service it (the request vanishes mid-INTA -> the PIC
+        ; delivers spurious IRQ15 -> the completion is lost; 409/409 causal match in the traced
+        ; run). The ring's completion accounting is descriptor-based (DN_COMPLETE) and the latch
+        ; is acked by the ISR -- a success status is simply none of our business here.
+        cmp     byte [g_use_dma], 0
+        jnz     .txs_done
+        jmp     .txs_pop                ; PIO floor: pop successes too (keep the 4-deep stack clear)
+.txs_err:
         inc     word [stat_txunderrun]
         push    dx
         mov     dx, [g_nic_io]
