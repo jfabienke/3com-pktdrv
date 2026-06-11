@@ -307,6 +307,15 @@ nic_isr:
 %ifdef CFG_DEBUG
         mov     al, 'A'
         call    dbg_logb                ; one 'A' per terminal AckIntr (ack-race forensics)
+        ; ISR-stack overflow canary (task #57): the receiver upcall runs arbitrary app code on
+        ; this stack; a clobbered bottom word means the upcall chain exceeded it. Log 'O' and
+        ; re-arm so each overflow event logs once.
+        cmp     word [isr_stack], 0BEEFh
+        je      .canary_ok
+        mov     al, 'O'
+        call    dbg_logb
+        mov     word [isr_stack], 0BEEFh
+.canary_ok:
 %endif
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD

@@ -169,9 +169,19 @@ g_isr_busy:     resb 1             ; ISR reentrancy guard
 isr_work:       resb 1             ; per-interrupt RX work cap counter (MAX_RX_WORK down to 0)
 isr_save_ss:    resw 1             ; interrupted task's SS:SP (private-stack switch)
 isr_save_sp:    resw 1
-isr_stack:      resb 512           ; the ISR's private stack -- must hold the register save, the
+isr_stack:      dw 0BEEFh          ; canary at the stack BOTTOM (CFG_DEBUG ISR check logs 'O' on clobber)
+                resb 1534          ; the ISR's private stack -- must hold the register save, the
                                    ; far receiver upcall (arbitrary app code), the XMS RX path's
-                                   ; INT 15h (BIOS) frame, AND a nested-IRQ entry layered on top
+                                   ; INT 15h (BIOS) frame, AND a nested-IRQ entry layered on top.
+                                   ; 512 was NOT enough: tcpip.lib's receiver upcall does TCP input
+                                   ; + ACK-clocked transmit re-entering INT 60h, and on the slow-CPU
+                                   ; deep branches (ring-full / PIO fallback inside the upcall-send)
+                                   ; it overflowed -- first trashing isr_save_ss/sp below, so the
+                                   ; ISR exit restored a bogus SS:SP harvested from the overflow's
+                                   ; own frames (seg 02C6 + a return offset), relocating the
+                                   ; interrupted app's stack INTO this segment; its next 4 KB
+                                   ; pattern-fill then flattened the resident image from
+                                   ; isr_stack_top downward (the 486-tier tcpsink wedge, task #57).
 isr_stack_top:
 RESIDENT_IMAGE_MAX equ 256         ; byte budget for the composed datapath (compose_resident enforces)
 resident_image: resb RESIDENT_IMAGE_MAX   ; the composed datapath (tx + rx drain)
