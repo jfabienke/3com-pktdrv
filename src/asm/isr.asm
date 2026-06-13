@@ -252,7 +252,9 @@ nic_isr:
 .recv_done:
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
-        mov     ax, EL3_CMD_ACK_INTR | 0x00FF   ; acknowledge all latched sources
+        mov     ax, EL3_CMD_ACK_INTR | 0x07FF   ; ack all latched sources (11-bit field: incl
+                                                ; UpComplete bit 10 / DnComplete bit 9 -- 0x00FF
+                                                ; left the bus-master RX IRQ un-acked -> storm)
         out     dx, ax
         dec     byte [g_isr_busy]
 .eoi:

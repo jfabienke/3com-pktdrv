@@ -78,7 +78,7 @@ EL3_ST_INT_LATCH        equ 0x0001
 EL3_ST_ADAPTER_FAILURE  equ 0x0002   ; RX engine wedged -> needs RX_RESET (ISR self-heals)
 EL3_ST_TX_COMPLETE      equ 0x0004
 EL3_ST_RX_COMPLETE      equ 0x0010
-EL3_ST_UP_COMPLETE      equ 0x0080   ; 3C515 UpList DMA transfer done
+EL3_ST_UP_COMPLETE      equ 0x0400   ; 3C515/3c59x UpList DMA transfer done (IntStatus bit 10)
 EL3_ST_CMD_BUSY         equ 0x1000
 
 ; ---- Window 1: operating (TX/RX FIFO + status) ----
