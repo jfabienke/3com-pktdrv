@@ -268,7 +268,9 @@ nvmetsr.exe cold phase:
   3. If policy != CONVENTIONAL:
        a. Allocate two XMS EMBs (slot_size each) via HIMEM.SYS XMS API
        b. XMS Lock both EMBs → pin physical positions
-       c. VDS Lock both → phys0, phys1  (verify < 16 MB, no 64K crossing)
+       c. VDS Lock both → phys0, phys1  (verify < 16 MB; the 3C515 is a
+          first-party PCI-derived bus master with no 8237A 16-bit counter,
+          so no 64K-crossing constraint applies — see commit b7ab981)
        d. If VCPI: INT 67h AX=DE05h × 2 → lin0, lin1
           If DPMI: INT 31h AX=0508h × 2 → lin0, lin1
           If XMS_COPY: lin0 = lin1 = 0
@@ -289,3 +291,8 @@ nvmetsr.exe cold phase:
   6. INT 2Fh AX=E501h → restore INT 13h/INT 2Fh vectors
   7. _dos_freemem(psp_seg)
 ```
+
+---
+
+_Last updated: 2026-06-13 20:49 CEST — scrubbed stale "no 64K crossing" note from the
+cold-phase sequence (the 3C515 first-party bus master has no 8237A counter wrap; cf. b7ab981)._
