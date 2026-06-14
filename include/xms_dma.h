@@ -74,4 +74,10 @@ typedef struct {
     uint32_t lin1;          /* VCPI/DPMI linear address — slot 1 (0=XMS_COPY) */
 } xms_rx_cfg_t;             /* 20 bytes                                       */
 
+/* The resident ISR reads this struct via the fixed offsets in xms_dma.inc, and the producer
+ * (dos-nvmeotcp xms.h) builds the matching layout. Fixed-width fields are naturally aligned, so
+ * this stays 20 bytes on any conforming compiler; the check trips if a future edit reorders a
+ * field and introduces padding. */
+typedef char xms_rx_cfg_size_check[sizeof(xms_rx_cfg_t) == 20 ? 1 : -1];
+
 #endif /* PKTDRV_XMS_DMA_H */

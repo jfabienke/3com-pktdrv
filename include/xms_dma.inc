@@ -54,6 +54,15 @@ XMS_CFG_phys1       equ 12      ; uint32_t phys1
 XMS_CFG_lin1        equ 16      ; uint32_t lin1
 XMS_CFG_SIZE        equ 20
 
+; Compile-time self-consistency: the ISR reads cfg via these offsets, and the producer
+; (dos-nvmeotcp xms.h) lays out the matching 20-byte C struct. Catch any drift on this side.
+%if XMS_CFG_lin1 + 4 != XMS_CFG_SIZE
+  %error "xms_rx_cfg_t offsets inconsistent: lin1 (last field) does not end at XMS_CFG_SIZE"
+%endif
+%if XMS_CFG_SIZE != 20
+  %error "xms_rx_cfg_t must be 20 bytes to match dos-nvmeotcp xms.h"
+%endif
+
 ; ---- ISA 24-bit DMA physical address limit ------------------------------
 
 DMA_ISA_16M_LIMIT   equ 0x0100  ; physical high byte must be < this (16 MB)
