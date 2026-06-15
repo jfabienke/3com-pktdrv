@@ -10,16 +10,44 @@ This refines `05-memory-buffering.md` (the binary size-tiered datapath and buffe
 ## Three size classes, two pipelines
 
 ```
-                         frame length (known before drain)
-                                      │
-                ┌─────────────────────┼─────────────────────┐
-            ≤ T │                 T < … ≤ 1514               > 1514
-          SMALL │                  LARGE                     FDDI
-            PIO │                  bus-master DMA            bus-master DMA
-   FIFO → upcall│            → conventional slot (~1.5 KB)  → conventional slot (~4.5 KB)
-       buffer   │              zero-copy delivery            zero-copy delivery
-   (low latency,│            (amortizes DMA fixed cost,      (storage PDUs: 4 KB I/O
-    no flush)   │             offloads the CPU)              + metadata in one frame)
+                                THE WIRE
+                                   │  frame
+                                   ▼
+                    ┌────────────────────────────────┐
+                    │        3C515   RX FIFO          │
+                    └────────────────┬───────────────┘
+                                     │ RxComplete IRQ
+                                     ▼
+                    ┌────────────────────────────────┐
+                    │  len = RxStatus & g_rx_len_mask │   length is known
+                    │  CMP  len, T   (T = baked imm.) │   BEFORE the drain
+                    └────────────────┬───────────────┘
+                                     │     ← the ONE hot-path branch
+         ┌───────────────────────────┼───────────────────────────┐
+      len ≤ T                  T < len ≤ 1514                 len > 1514
+   ── SMALL · PIO ──         ── LARGE · DMA ──            ── FDDI · DMA ──
+                                                          (cold: /j + 3C515)
+   ┌──────────────┐         ┌──────────────┐             ┌──────────────┐
+   │  REP INSW    │         │ arm descr +  │             │ arm descr +  │
+   │  FIFO→ES:DI  │         │ StartDmaUp   │             │ StartDmaUp   │
+   └──────┬───────┘         └──────┬───────┘             └──────┬───────┘
+          ▼                        ▼                            ▼
+   ┌──────────────┐         ┌──────────────┐             ┌──────────────┐
+   │ upcall buf   │         │ conv slot    │             │ conv slot    │
+   │ (conv)       │         │ ~1.5 KB      │             │ ~4.5 KB      │
+   │              │         │ cache-align  │             │ cache-align  │
+   └──────┬───────┘         └──────┬───────┘             └──────┬───────┘
+       1 copy                  0 extra                      0 extra
+       (small)                 copies                       copies
+          └────────────────────────┼────────────────────────────┘
+                                    ▼
+                    ┌────────────────────────────────┐
+                    │  deliver → registered receiver  │   (Crynwr upcall)
+                    └────────────────────────────────┘
+
+   Each lane is one cold-composed fragment, chosen per CPU × NIC; the branch picks
+   WHICH fragment runs, it never interprets. On the 5150/PIO floor only the SMALL
+   lane is emitted and the compare vanishes entirely.
 ```
 
 The two boundaries are **different kinds of decision**:
@@ -72,6 +100,27 @@ The reason is addressability, and it is what makes the path zero-copy:
 | **Conventional** <640 K | yes | **yes** (identity-mapped under V86) | the DMA landing ring — small, hottest |
 | **UMB** 640 K–1 M | yes | **no** (mapped from XMS; linear ≠ physical) | resident code / CPU-only data |
 | **XMS** >1 M | **no** | n/a (needs copy or page map) | large **staged** stores (e.g. the page cache) |
+
+```
+   ┌───────────────── >16 MB ─────────────────┐
+   │   XMS  (extended memory)                  │  ✗ not CPU-addressable (real mode)
+   │     └─ staged page cache ─────────────────┼─►  reached by ONE copy at the
+   │                                           │     cache access boundary
+   ├───────────────── 1 MB ────────────────────┤
+   │   UMB / HMA                               │  ✓ addressable   ✗ DMA-safe (mapped)
+   │     └─ resident code / CPU-only data      │
+   ├───────────────── 640 KB ──────────────────┤
+   │   CONVENTIONAL                            │  ✓ addressable  ✓ identity-mapped
+   │     ├─ DMA ring slots  ◄══ NIC bus-master │     ✓ DMA-safe  ✓ contiguous
+   │     └─ PIO upcall buffers                 │
+   └───────────────── 0 ───────────────────────┘
+                          ▲
+       phys for the ring = VDS (INT 4Bh AX=8103h) under a paging VMM,
+                           else  seg × 16  in real mode.   no VCPI · no DPMI · no bounce
+```
+
+The DMA ring sits in the one region that is simultaneously **CPU-readable** and **DMA-safe** —
+which is exactly what makes it zero-copy.
 
 A real-mode/V86 CPU cannot read XMS, so DMA-into-XMS forces either an `INT 15h` copy down
 (`09`'s XMS_COPY) or a VCPI/DPMI page mapping (deferred — heavy, and DPMI yields a >1 MB
@@ -158,4 +207,4 @@ policy** rather than XMS_COPY:
 
 ---
 
-_Last updated: 2026-06-15 07:46 CEST._
+_Last updated: 2026-06-15 08:05 CEST._
