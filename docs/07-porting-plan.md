@@ -97,7 +97,8 @@ Orphaned, aspirational, or duplicate. Do not carry forward.
 
 Each bus gets a cold prober that enumerates EL3 cards and fills `nic_info_t`/caps, then
 hands off to the shared HAL + emitted datapath (docs/03). All are `full`-profile (above
-the 5150 floor).
+the 5150 floor). **Detailed bus-detection lift plan (presence probes, per-bus protocols,
+filter-for-EL3 adaptation, scope calls) → docs/14.**
 
 | Bus | New home | Lift source / effort |
 |-----|----------|----------------------|
