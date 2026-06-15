@@ -181,6 +181,54 @@ NetBT/SMBv1. It is **off by default** and never engaged by general networking.
   length mask (`g_rx_len_mask = 0x1FFF`), and ~4.5 KB ring slots. Without it the driver pays none
   of the 13-bit handling, the larger slots, or the conventional footprint.
 
+## Copy economics by CPU generation
+
+On a 286/386 a per-byte copy is a large slice of the per-frame budget, and a copy *after* a DMA
+hands back the offload the DMA was for — so on those parts the rule is: the CPU must touch the
+payload **at most once**.
+
+**Principle:** *eliminate every copy except the one you can fuse with the checksum; on
+HW-checksum parts, eliminate that one too.*
+
+What that removes, on every CPU:
+
+- the **`XMS_COPY` `INT 15h`** down-copy → gone (conventional zero-copy ring). On 286/386 this is
+  **disqualifying**, not merely slower — it is the exact copy the rule forbids, so the conventional
+  ring is **mandatory** there and `XMS_COPY` is a faster-part-only fallback.
+- **TCP reassembly** copies → gone, because a FDDI-sized PDU is **one frame** (above), so the 4 KB
+  payload is contiguous at a fixed offset — no coalescing.
+
+What remains is extracting the payload to its destination (`INT 13h` owns `ES:BX`; RX is
+single-buffer with no scatter, so the frame can't be split). It can't be *eliminated* on a
+no-offload part, but it collapses to **one pass** by **fusing the (mandatory) software TCP checksum
+into the copy** — read each word once, accumulate the sum, store it — instead of a `REP MOVSD`
+*plus* a separate checksum read-pass. On a memory-bound 286/386 that halves the per-byte traffic.
+
+### Per-byte passes by generation
+
+| Tier | RX-deliver fragment | Passes over payload |
+|------|---------------------|---------------------|
+| **286 / 386** (3C515, EISA), no HW csum | fused **copy-and-checksum** (`MOVSW`+16-bit / `MOVSD`+32-bit accumulate) | **1** |
+| **486**, no HW csum | same fused fragment; `WBINVD` raises the copybreak threshold | 1 |
+| **Pentium+ / Cyclone+**, HW csum | **zero-copy in place** + read csum-status bit | **0** |
+
+So the deliver step is not one snippet but a CPU × offload-tiered pair: the fused copy-checksum
+variant for non-offloading parts, the zero-touch variant for HW-csum parts.
+
+### Knock-on tunings
+
+- **Copybreak threshold `T` drops on 286/386.** Per-byte PIO is slow there and there is no
+  expensive cache flush to amortise (286 = no cache; 386 = a cheap software barrier, not `WBINVD`),
+  so DMA wins sooner — steer more traffic onto the DMA engine and off the slow CPU. 486 raises `T`
+  back up (the `WBINVD` ~250 µs fixed cost).
+- **Negotiate NVMe/TCP digests off on slow CPUs.** Header/data digests (CRC32C) are a *second*
+  per-byte pass with no hardware help on these NICs. On 286/386 the session layer should negotiate
+  them off and lean on the fused TCP checksum — one pass, not two. (Consumer-side policy, gated on
+  CPU class.)
+
+Net: the slow CPUs hit exactly **one** mandatory pass and nothing more — the best a non-offloading
+NIC can physically do — and the HW-checksum parts hit zero.
+
 ## Producer-side implications (`dos-nvmeotcp`)
 
 The conventional ring is allocated by the consumer of the link (e.g. `nvmetsr.exe`) and handed to
@@ -207,4 +255,4 @@ policy** rather than XMS_COPY:
 
 ---
 
-_Last updated: 2026-06-15 08:05 CEST._
+_Last updated: 2026-06-15 09:02 CEST — added "Copy economics by CPU generation"._
