@@ -36,7 +36,7 @@ All of it is `full`-profile (≥386); none touches the 8088 floor. Adapt to our
 | `CK_ENUM.C` → `enum_isapnp_devices()` + `isapnp_isolate()` | `src/hw/bus_isa.c` | full LFSR ISA-PnP isolation (fiddly; reuse the working version) for 3C509B PnP |
 | `CK_ENUM.C` → `enum_pci_devices()` | `src/hw/bus_pci.c` | PCI config-space scan (CardBus = PCI-class) |
 | `CK_HAL.C` → `generic_wbinvd_flush()`/`generic_invd_flush()` | `src/dma/cache.c` | raw opcodes `0F 09`/`0F 08`; WB-flush-before-disable ordering (see docs/04) |
-| `CK_HAL.H` → `chipset_ops_t` registry pattern + `nc_region_t` | (pattern) | mirrors our `nic_ops_t`; `tier`/`score_x10` = confidence proxy; NC-region model → docs/04, docs/05 |
+| `CK_HAL.H` → `chipset_ops_t` registry pattern + `nc_region_t` | (pattern) | mirrors our `nic_ops_t`; `tier`/`score_x10` = confidence proxy; NC-region lift plan → **docs/12** (subset, real-ops gate, self-test) |
 
 **Skip from cache-kit:** `CACHEKIT.C` (287 KB TUI), `CK_UI`/`CK_VIDEO`, `CK_BCFG.C`
 (interactive slot config), the 62 per-vendor desktop-chipset tables (out of scope). Note
