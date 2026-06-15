@@ -42,17 +42,19 @@ ring-capable. `Large/FDDI` is the storage-critical one and the only ISA part wit
 
 | Bus | DMA addr | Coherency | Provides | Enumeration | I/O |
 |---|---|---|---|---|---|
-| **ISA8** | 24-bit | non-snoop | PIO only | ID port | port (8-bit) |
-| **ISA16** | 24-bit / **16 MB** | non-snoop | + NIC busmaster | ISA PnP / ID port | port |
-| **EISA** | **32-bit** | non-snoop | **bus busmaster** (single-xfer) | slot ID regs | port |
-| **MCA** | 24/32-bit | non-snoop | **bus busmaster** | POS regs | port |
+| **ISA8** | 24-bit | measured¹ | PIO only | ID port | port (8-bit) |
+| **ISA16** | 24-bit / **16 MB** | measured¹ | + NIC busmaster | ISA PnP / ID port | port |
+| **EISA** | **32-bit** | measured¹ | **bus busmaster** (single-xfer) | slot ID regs | port |
+| **MCA** | 24/32-bit | measured¹ | **bus busmaster** | POS regs | port |
 | **PCMCIA-16** | — | — | PIO only | CIS / Socket Svcs | port |
-| **PCI** | 32-bit | **snoop** | NIC busmaster ring | PCI config | port/MMIO |
-| **CardBus** | 32-bit | **snoop** | NIC busmaster ring | PCI cfg + CIS | port/MMIO |
+| **PCI** | 32-bit | coherent | NIC busmaster ring | PCI config | port/MMIO |
+| **CardBus** | 32-bit | coherent | NIC busmaster ring | PCI cfg + CIS | port/MMIO |
 
-Two facts the bus axis owns: **coherency** (snoop on PCI/CardBus → no cache flush; non-snoop on
-ISA/EISA/MCA → software flush + cache-aligned buffers) and the **DMA address limit** (the 16 MB cap
-is **ISA-only**; EISA/MCA/PCI/CardBus are 32-bit — see §6).
+¹ **Coherency is measured, not bus-determined** — it's a chipset/cache property, orthogonal to the
+bus (`docs/13`). PCI/CardBus are coherent by spec (host bridge snoops); ISA/EISA/MCA must be
+*tested* (ISA commodity often non-coherent; EISA/MCA often coherent; a 386 + transparent 82385 is
+un-probeable, so it can only be measured). The other bus-owned fact is the **DMA address limit**
+(the 16 MB cap is **ISA-only**; EISA/MCA/PCI/CardBus are 32-bit — see §6).
 
 ## 3. Datapath tier = f(silicon, bus, CPU)
 

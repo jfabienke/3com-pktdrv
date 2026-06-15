@@ -69,12 +69,15 @@ desktop table, but the *pattern* — chipset detect → known-coherency/known-bu
 prior → fold into the test threshold — is the right shape for selecting the cache tier and
 seeding the busmaster-test confidence.
 
-Cache-coherency tier is selected per CPU/chipset:
+Coherency is **measured, not assumed from the bus** (`docs/13`): a cold probe decides
+*coherent → no flush* / *NC region* / *per-transfer flush*, since snooping is a chipset property
+(and a 386's transparent 82385 can't be probed at all). The flush *tier* below is the mechanism used
+only **when the probe says a flush is needed**, selected per CPU/chipset:
 
 ```
 tier 1  CLFLUSH         Pentium 4+      surgical line flush
 tier 2  WBINVD          486/Pentium     full flush (batched to amortize)
-tier 3  software barrier 386            manual ordering
+tier 3  software barrier 386            chipset flush op or timing-sized eviction sweep (docs/13)
 tier 4  none            286 / no cache  nothing to do
 disable bus master      coherency unproven → PIO
 ```

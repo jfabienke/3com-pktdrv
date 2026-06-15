@@ -16,6 +16,9 @@ From `~/Development/cache-kit` (CACHEKIT, same Open Watcom v2 cross-toolchain �
 | `chipset_ops_t` registry pattern | mirrors `nic_ops_t` | per-chipset `{nc_*, nc_count, granularity, max, tier/score}` |
 | the 3 real encoding families | folded into the per-chipset ops | OPTi (base + 4-bit size nibble, 8 KB), SiS (16-bit packed), VIA/ALi (64 KB units + size code) |
 | `generic_wbinvd_flush()` / `generic_invd_flush()` | `src/dma/cache.c` | raw `0F 09` / `0F 08`; the **fallback** when no NC region (`07` line 38) |
+| **cache write-mode** detect (write-through vs write-back) | `src/dma/cache.c` | picks cheap `INVD` vs expensive `WBINVD`; the worst case is write-*back* only (`docs/13`) |
+| **timing-based cache** presence/size detector | `src/dma/cache.c` | the *only* way to size an un-probeable 386 + 82385 cache → bounds the eviction sweep (`docs/13`) |
+| per-chipset **flush op** (controller register / 82385 FLUSH) | per-chipset ops | flushes caches `WBINVD` can't reach (386, stubborn L2); the chipset-recognized path before the sweep (`docs/13`) |
 
 **Do NOT lift:** the 62-vendor desktop-chipset table (`07` skip list), and — the key scoping
 decision — **only the 486-era ISA NC chipset ops**, not all 16 NC-capable parts. NC region only
