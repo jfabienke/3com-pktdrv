@@ -80,9 +80,13 @@ v[2] = (b1 & 0x1F) + '@';
 5. **Timing** — `isapnp_delay()` burns the spec's inter-read delay with dummy reads of port `0x80`,
    not the timer (no system-state disturbance).
 
-> The EL3 **legacy ID-port** activation (the LFSR at `0x110`) is EtherLink-III-specific and already
-> lives in `isapnp.asm`; cache-kit's isolation covers the *generic ISA-PnP* mode alongside it. So
-> `bus_isa.c` carries both: legacy ID-port for non-PnP 3C509, ISA-PnP isolation for PnP-mode cards.
+> The EL3 **legacy ID-port** activation is EtherLink-III-specific and **already implemented** in
+> `el3_probe.asm` (ID port `0x110`, GlobalReset `0xC0`, the 9-bit `0xCF` LFSR × 255, EEPROM read via
+> the ID port, activate at the EEPROM base) — verified against the Nestor 8086 3c509 driver. The
+> driver's own ISA-PnP isolation is **already implemented** in `isapnp.asm` (32-byte `0x6A` key,
+> Reset-CSN, 72-bit serial ID + checksum). cache-kit's isolation enriches the PnP path (read-port
+> discovery, multi-card); `bus_isa.c` carries both: the legacy ID-port for non-PnP 3C509, ISA-PnP for
+> PnP-mode 3C509B.
 
 ## Probe order
 
