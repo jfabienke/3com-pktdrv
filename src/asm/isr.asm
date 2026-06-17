@@ -170,9 +170,14 @@ nic_isr:
         mov     cx, [rx_len]
         sub     cx, 14
         jz      .delivered              ; header-only frame
+        cmp     byte [g_rx_cksum], 0
+        jne     .drain_cksum            ; RX checksum offload on -> summing drain (AH=0xF2)
         mov     ax, [g_off + FRAG_RX_PIO * 2]
         add     ax, resident_image
         call    ax                      ; drain remaining bytes into ES:DI
+        jmp     .delivered
+.drain_cksum:
+        call    rx_drain_cksum          ; CX=count, ES:DI=dest -> drain + fold sum into g_rx_cksum_val
 
 .delivered:
         ; --- upcall 2: AX=1 deliver; DS:SI=buffer, CX=len, BX=handle ---
@@ -180,6 +185,10 @@ nic_isr:
         mov     cx, [rx_len]
         mov     bx, [cur_handle]
         mov     ax, 1
+        cmp     byte [g_rx_cksum], 0
+        je      .deliver_go
+        mov     dx, [g_rx_cksum_val]    ; RXCK_FEAT_IPSUM: hand the folded IP+TCP+payload sum to the receiver in DX
+.deliver_go:
         mov     ds, [appbuf_seg]        ; DS:SI = buffer (set DS last)
         call far [cs:bx]
         mov     ax, cs
@@ -561,4 +570,86 @@ isr_wait_cmd:
         loop    .wc
 .wc_done:
         pop     cx
+        ret
+
+;------------------------------------------------------------------------------
+; rx_drain_cksum -- drain CX bytes from the RX FIFO into ES:DI while folding the 16-bit ones-complement
+; sum (native-LE) of the drained bytes into [g_rx_cksum_val] (RX checksum offload, AH=0xF2). Mirrors
+; cksum16/cksum32: continuous-carry-fold chain (IN/STOS/LOOP preserve CF). On real ISA hardware the
+; `adc` hides behind the ~1 us `in`, so the checksum is nearly free; the stack then skips its
+; whole-segment verify pass. In: CX=byte count, ES:DI=dest, DS=resident, DF=0. CPU-gated (insd vs insw).
+; Clobbers AX BX CX DX SI (EAX/EBX saved+restored on the 386 path). DI advances past the drained bytes.
+;------------------------------------------------------------------------------
+rx_drain_cksum:
+        mov     dx, [g_w1_base]                 ; DX = RX FIFO port (Window-1 base + 0)
+        cmp     byte [g_cpu_class], CPU_80386
+        jb      .d16
+cpu 386
+        ; --- 386+: 32-bit insd burst + 32-bit carry-fold (0x66-prefixed; only runs on 386+) ---
+        push    eax                             ; preserve upper halves (ISR only saved the 16-bit regs)
+        push    ebx
+        push    cx                              ; save byte count for the <4-byte tail
+        shr     cx, 2                           ; CX = whole-dword count
+        xor     ebx, ebx                        ; EBX = 32-bit sum accumulator
+        jcxz    .d32_folded
+        clc
+.d32_lp:
+        in      eax, dx                         ; read a dword from the FIFO
+        adc     ebx, eax                        ; fold into the running sum
+        stosd                                   ; copy to ES:DI
+        loop    .d32_lp                         ; IN/STOSD/LOOP preserve CF -> carry chain holds
+        adc     ebx, 0                          ; fold the pending 2^32 carry
+        adc     ebx, 0
+.d32_folded:
+        mov     eax, ebx
+        shr     eax, 16
+        add     bx, ax                          ; BX += high 16 bits
+        adc     bx, 0
+        adc     bx, 0                           ; BX = folded 16-bit sum of the dword body
+        pop     cx                              ; CX = original byte count
+        and     cx, 3                           ; CX = leftover bytes (0..3)
+        test    cx, 2
+        jz      .d32_byte
+        in      ax, dx                          ; trailing word
+        add     bx, ax
+        adc     bx, 0
+        stosw
+.d32_byte:
+        test    cx, 1
+        jz      .d32_store
+        in      al, dx                          ; trailing odd byte (native low position)
+        xor     ah, ah
+        add     bx, ax
+        adc     bx, 0
+        stosb
+.d32_store:
+        mov     [g_rx_cksum_val], bx
+        pop     ebx                             ; restore upper halves (value already saved)
+        pop     eax
+        ret
+cpu 8086
+.d16:
+        ; --- 8088/286: 16-bit insw + carry-fold ---
+        mov     bx, cx                          ; BX = byte count (for the odd-byte tail)
+        shr     cx, 1                           ; CX = word count
+        xor     si, si                          ; SI = 16-bit sum accumulator
+        jcxz    .d16_tail
+        clc
+.d16_lp:
+        in      ax, dx
+        adc     si, ax
+        stosw
+        loop    .d16_lp                         ; IN/STOSW/LOOP preserve CF
+        adc     si, 0
+        adc     si, 0
+.d16_tail:
+        test    bx, 1
+        jz      .d16_store
+        in      al, dx                          ; trailing odd byte
+        xor     ah, ah
+        add     si, ax
+        adc     si, 0
+        stosb
+.d16_store:
+        mov     [g_rx_cksum_val], si
         ret

@@ -81,6 +81,8 @@ pkt_disp:
         je      pkt_do_xms
         cmp     al, ASYNC_TX_FUNC       ; proprietary async zero-copy TX extension (AH=0xF1)
         je      pkt_do_async
+        cmp     al, RX_CKSUM_FUNC       ; proprietary RX checksum-offload extension (AH=0xF2)
+        je      pkt_do_rx_cksum
         cmp     al, PD_NFUNCS
         ja      pkt_bad
         mov     bl, al
@@ -163,6 +165,28 @@ pkt_do_async:
 .a_unsup:
         mov     dh, PD_ERR_BADCMD
         jmp     pkt_error                             ; CF=1 -> caller falls back to send_pkt
+
+;--- AH=0xF2: RX checksum-offload extension. AL sub-function in F_AL. See include/rx_cksum.inc. ---
+pkt_do_rx_cksum:
+        mov     al, [bp + F_AL]                 ; sub-function
+        cmp     al, RX_CKSUM_QUERY
+        je      .rc_query
+        cmp     al, RX_CKSUM_ENABLE
+        je      .rc_enable
+        cmp     al, RX_CKSUM_DISABLE
+        je      .rc_disable
+        mov     dh, PD_ERR_BADCMD
+        jmp     pkt_error
+.rc_query:
+        mov     word [bp + F_AX], 1                    ; supported
+        mov     word [bp + F_BX], RXCK_FEAT_IPSUM      ; feature: DX=folded sum over IP+TCP+payload
+        jmp     pkt_return                             ; CF=0 (cleared at entry)
+.rc_enable:
+        mov     byte [g_rx_cksum], 1                   ; ISR now sums frames during the PIO drain
+        jmp     pkt_return
+.rc_disable:
+        mov     byte [g_rx_cksum], 0
+        jmp     pkt_return
 pkt_error:
         mov     bp, sp
         mov     [bp + F_DH], dh         ; return error code in DH

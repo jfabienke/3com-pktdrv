@@ -20,6 +20,8 @@ bits 16
 ; Corkscrew (3C515) delta: bus-master DMA register block + descriptor layout (guarded; also
 ; pulled by isapnp). The resident TX DMA paths + the descriptor/ring reservations need these.
 %include "el3_corkscrew.inc"
+; Proprietary RX checksum-offload vendor extension (AH=0xF2) constants.
+%include "rx_cksum.inc"
 
 ;==============================================================================
 ; DATA (initialized) -- fragment palette, plan template
@@ -140,6 +142,8 @@ g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when lar
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
 g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking COPY ring (movsd) for send_pkt; 0 = 286 -> blocking single-transfer
 g_async:        resb 1             ; 1 = zero-copy async TX ring available (AH=0xF1): any bus-master config (>=286)
+g_rx_cksum:     resb 1             ; 1 = RX checksum offload on -> sum IP+TCP+payload during the PIO drain (AH=0xF2)
+g_rx_cksum_val: resw 1             ; folded native-LE ones-complement sum of the last drained frame
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
