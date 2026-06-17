@@ -50,6 +50,8 @@ msg_nic     db 13, 10, '3C509 I/O=0x', '$'
 msg_irq     db ' IRQ=0x', '$'
 msg_mac     db ' MAC=', '$'
 msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
+msg_badmac  db 'ERROR: invalid station MAC (all-FF/all-00/multicast) -- wrong card gen?', 13, 10
+            db '       (/5 selects 3C515 EEPROM at +0x2000; omit it for a 3C509)', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
 msg_dma     db 'DMA=', '$'
 msg_dma_on  db 'ON', 13, 10, '$'
@@ -422,6 +424,9 @@ global resident_end
         mov     dx, msg_crlf
         call    print_str
 
+        call    validate_mac        ; reject an implausible station address before building on it --
+        jc      .bad_mac            ; all-FF (off-device read, e.g. wrong /5 gen for a 3c509) / all-00 / multicast
+
         call    build_plan          ; per-gen Window-1 base + TX-start cmd + PIO immediates
         call    el3_init            ; bring the activated card to operational state (uses g_tx_start)
         call    phase_validate_dma  ; (>=286) test-before-trust: prove bus-master DMA or fall back to PIO
@@ -457,6 +462,10 @@ global resident_end
 .fail:
         mov     ax, 0x4C01
         int     0x21
+.bad_mac:
+        mov     dx, msg_badmac
+        call    print_str
+        jmp     .fail
 
 ;------------------------------------------------------------------------------
 ; do_uninstall -- `3cpd /u`: find the resident driver via the INT 60h vector + the
@@ -879,6 +888,41 @@ print_mac:                              ; " MAC=" + g_mac[0..5] as hex
         call    print_hex8
         pop     cx
         loop    .pm
+        ret
+
+;------------------------------------------------------------------------------
+; validate_mac -- sanity-check the station address in g_mac[0..5] before the driver
+; builds the resident image on it. A read from an unmapped/off-device window returns
+; 0xFF on every byte (the failure mode behind a wrong /5 gen on a 3C509: el3_load_mac_io
+; lands the MAC read at the +0x2000 alias, off the card), and an EEPROM that never
+; loaded reads back all-00. A real station address is also always unicast (bit 0 of the
+; first byte clear). Reject all three. 8088-clean. out: CF=1 invalid, CF=0 plausible.
+; Clobbers AX, CX, SI (DL preserved via push).
+;------------------------------------------------------------------------------
+validate_mac:
+        test    byte [g_mac], 1         ; I/G bit set -> multicast/broadcast, not a station addr
+        jnz     .bad
+        push    dx
+        mov     si, g_mac
+        mov     cx, 6
+        mov     ah, 0xFF                ; AND-accumulator: stays 0xFF iff every byte is 0xFF
+        xor     dl, dl                  ; OR-accumulator:  stays 0x00 iff every byte is 0x00
+.vm:
+        lodsb
+        and     ah, al
+        or      dl, al
+        loop    .vm
+        cmp     ah, 0xFF                ; all bytes 0xFF -> off-device / unmapped read
+        je      .bad_pop
+        or      dl, dl                  ; all bytes 0x00 -> EEPROM never loaded
+        jz      .bad_pop
+        pop     dx
+        clc
+        ret
+.bad_pop:
+        pop     dx
+.bad:
+        stc
         ret
 
 ;------------------------------------------------------------------------------
