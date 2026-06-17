@@ -78,9 +78,9 @@ install:
         ; modes (no RX-DMA arm) -- bidirectional RX-DMA dropped ACKs; see the ISR RX-COMPLETE path.
         cmp     byte [g_use_dma], 0
         je      .no_dma
-        cmp     byte [g_tx_ring], 0
-        je      .no_dma                 ; 286 single-transfer: nothing to arm (RX is PIO, no ring)
-        call    tx_ring_init            ; 386+ ring: init the TX descriptors/slots
+        call    tx_ring_init            ; any bus-master config: zero the ring counters (386+ copy ring
+                                        ; AND the 286/386+ zero-copy async ring use them; the ISR reads
+                                        ; tx_ring_count to tell a ring vs a single-transfer completion).
 .no_dma:
 
         ; free our environment block (PSP[2Ch] = environment segment)
@@ -137,6 +137,7 @@ tx_ring_init:
         mov     word [tx_ring_tail], 0
         mov     word [tx_ring_count], 0
         mov     byte [tx_dma_busy], 0
+        mov     word [tx_completed], 0          ; async completion counter (BSS isn't load-zeroed)
         mov     si, tx_descs                    ; descriptor walker
         mov     di, tx_slots                    ; slot walker
         mov     bx, TX_RING_N                   ; remaining slots

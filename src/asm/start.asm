@@ -49,6 +49,9 @@ msg_irq     db ' IRQ=0x', '$'
 msg_mac     db ' MAC=', '$'
 msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
+msg_dma     db 'DMA=', '$'
+msg_dma_on  db 'ON', 13, 10, '$'
+msg_dma_pio db 'PIO', 13, 10, '$'
 
 ; uninstall (`3cpd /u`)
 sig_pktdrvr db 'PKT DRVR'                       ; resident signature (handler + 3); 8 bytes
@@ -135,7 +138,8 @@ g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286)
 g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
-g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking TX ring (movsd copy); 0 = 286 -> blocking zero-copy single-transfer
+g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking COPY ring (movsd) for send_pkt; 0 = 286 -> blocking single-transfer
+g_async:        resb 1             ; 1 = zero-copy async TX ring available (AH=0xF1): any bus-master config (>=286)
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
@@ -200,8 +204,19 @@ global resident_end_pio
                 alignb 4
 tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-reads them); [0] also serves the 286 single-transfer
                 alignb 4
+; TX ring counters -- resident on ALL bus-master configs (incl. 286): the zero-copy async ring
+; (dma_tx_async) is 8086-clean and needs no per-frame slot copy, so it works on a 286 too. Only the
+; ~10 bytes of counters live here; the 6 KB tx_slots stay 386+-only (they back the COPY ring, which a
+; 286 can't hide). The ISR also reads tx_ring_count to tell a ring completion from a single-transfer.
+tx_ring_head:   resw 1             ; next slot to fill (producer: send_pkt / async_send)
+tx_ring_tail:   resw 1             ; oldest in-flight slot (consumer: TxComplete ISR)
+tx_ring_count:  resw 1             ; frames currently queued (0..TX_RING_N); 0 => any TxComplete is a single-transfer
+tx_dma_busy:    resb 1             ; 1 while a slot's DMA is in flight
+                resb 1             ; pad to even
+tx_completed:   resw 1             ; ASYNC ext: frames the TxComplete ISR has finished (wraps mod 65536);
+                                   ; ASYNC_INFO hands the stack &tx_completed to throttle posts on.
 
-resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (descriptors only)
+resident_end_single:               ; <== TSR keep boundary for the 286 single-transfer DMA path (descriptors + ring counters)
 global resident_end_single
 
 ; XMS DMA receive ring state -- present whenever g_use_dma=1 (286 or 386+).
@@ -223,12 +238,7 @@ xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; acc
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
 
-tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ ring frame slots (dma_tx_enqueue copies the frame in)
-tx_ring_head:   resw 1             ; next slot to fill (producer: send_pkt)
-tx_ring_tail:   resw 1             ; oldest in-flight slot (consumer: TxComplete ISR)
-tx_ring_count:  resw 1             ; frames currently queued (0..TX_RING_N)
-tx_dma_busy:    resb 1             ; 1 while a slot's DMA is in flight
-                resb 1             ; pad to even
+tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ COPY-ring frame slots (dma_tx_enqueue movsd's the frame in)
 
 resident_end:                      ; <== TSR keep boundary for the 386+ ring DMA path
 global resident_end
@@ -349,7 +359,7 @@ global resident_end
         ; hook for that >=286 work.
         cmp     byte [g_cpu_class], CPU_8088
         jbe     .floor
-        call    phase_validate_dma      ; (>=286) bus-master DMA validation -- deferred to Corkscrew
+        ; (>=286) bus-master DMA validation moved below -- it needs the activated card + build_plan
 .floor:
         ; ISA NIC detection. The native 3Com ID-port sequence is the universal EtherLink III
         ; ISA mechanism and runs on ANY CPU -- it's just port I/O. ISA PnP is a SEPARATE
@@ -410,6 +420,16 @@ global resident_end
 
         call    build_plan          ; per-gen Window-1 base + TX-start cmd + PIO immediates
         call    el3_init            ; bring the activated card to operational state (uses g_tx_start)
+        call    phase_validate_dma  ; (>=286) test-before-trust: prove bus-master DMA or fall back to PIO
+        ; report the resolved DMA decision (post-probe) on the console
+        mov     dx, msg_dma
+        call    print_str
+        mov     dx, msg_dma_pio
+        cmp     byte [g_use_dma], 0
+        je      .dma_report
+        mov     dx, msg_dma_on
+.dma_report:
+        call    print_str
 
         call    compose_resident    ; ax = emitted length, fills resident_image + g_off
         or      ax, ax
@@ -538,14 +558,83 @@ detect_cpu:
         cpu 8086                    ; restore floor-safety check for the rest of the file
 
 ;------------------------------------------------------------------------------
-; phase_validate_dma (>=286 cold phase) -- DEFERRED to the 3C515 (Corkscrew) generation.
-; The 3C509 (Tomahawk) is pure PIO: no bus-master, so there is no DMA engine to test and no
-; cache-coherency / VDS bounce-buffer concern. The test-before-trust DMA validation (the
-; cache-kit NC-region / cache-flush lift) -- plus the V86/protected-mode detection it needs
-; (V86 is 386+-only, so gated there, not here) -- lands when the bus-master ring datapath does.
+; phase_validate_dma (>=286 cold phase, AFTER el3_init) -- test-before-trust (docs/04). build_plan
+; tentatively set g_use_dma (3C515 + /d + >=286); here we PROVE the bus-master engine actually works
+; before compose emits the DMA datapath: DMA a probe descriptor and confirm the card writes
+; DN_COMPLETE back into it. Cold phase -> no ISR, so poll the descriptor STATUS, bounded by BIOS
+; ticks. Pass -> keep g_use_dma. Fail (no DN_COMPLETE in time = wedged/absent engine) -> clear it,
+; so compose falls back to the proven PIO floor. Mirrors dma_tx_single's descriptor + kick.
+; Clobbers AX,BX,CX,DX (ES preserved). DS = DGROUP throughout.
 ;------------------------------------------------------------------------------
+BM_TEST_LEN     equ 60                      ; probe frame size (min Ethernet payload)
 phase_validate_dma:
+        cmp     byte [g_use_dma], 0
+        je      .pv_done                    ; PIO path: no bus-master engine to test
+
+        push    es
+        ; (cs << 4) -> dx:ax ; both descriptor and probe buffer live in CS=DGROUP (<1 MB)
+        mov     bx, cs
+        mov     ax, bx
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, bx
+        mov     cl, 12
+        shr     dx, cl
+        mov     cx, ax                      ; bx:cx = (cs << 4)
+        mov     bx, dx
+        ; descriptor[0].ADDR = phys(bm_test_buf); NEXT=0, STATUS=0, LEN=BM_TEST_LEN
+        add     ax, bm_test_buf
+        adc     dx, 0
+        mov     [tx_descs + EL3_DESC_ADDR], ax
+        mov     [tx_descs + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [tx_descs + EL3_DESC_NEXT], ax
+        mov     [tx_descs + EL3_DESC_NEXT + 2], ax
+        mov     [tx_descs + EL3_DESC_STATUS], ax
+        mov     [tx_descs + EL3_DESC_STATUS + 2], ax
+        mov     [tx_descs + EL3_DESC_LEN + 2], ax
+        mov     word [tx_descs + EL3_DESC_LEN], BM_TEST_LEN
+        ; DownListPtr <- phys(tx_descs) (two 16-bit OUTs)
+        mov     ax, cx
+        mov     dx, bx
+        add     ax, tx_descs
+        adc     dx, 0
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        ; kick StartDmaDown
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_DOWN
+        out     dx, ax
+        ; poll DN_COMPLETE in the descriptor, bounded by elapsed BIOS ticks
+        xor     ax, ax
+        mov     es, ax                      ; ES = BIOS data area
+        mov     bx, [es:BIOS_TICK_COUNT]    ; start tick
+.pv_wait:
+        test    word [tx_descs + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        jnz     .pv_pass
+        mov     ax, [es:BIOS_TICK_COUNT]
+        sub     ax, bx
+        cmp     ax, EL3_DMA_TX_TICKS
+        jb      .pv_wait
+        ; timeout: bus-master unproven -> fall back to the PIO floor
+        mov     byte [g_use_dma], 0
+        mov     byte [g_tx_ring], 0
+.pv_pass:
+        pop     es
+.pv_done:
         ret
+
+; bm_test_buf -- the probe frame the bus-master DMA test downloads. dest = broadcast so if it does
+; reach the wire it's a well-formed broadcast, not garbage; the rest is don't-care (the test only
+; proves the card DMA-read it). Cold (reclaimed after install).
+bm_test_buf:    db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+                times (BM_TEST_LEN - 6) db 0x00
 
 ; detect_nic / id_read_eeprom / io_delay -- the real 3C509B ISA probe + activation.
 %include "el3_probe.asm"
@@ -594,9 +683,13 @@ build_plan:
         jb      .dma_resolved
         mov     byte [g_use_dma], 1
 .dma_resolved:
-        ; resident TX DMA path: 386+ uses the non-blocking ring (movsd slot copy); a 286 can't hide
-        ; that per-frame copy (no movsd, nothing to overlap in a flood), so it uses the blocking
-        ; zero-copy single-transfer instead -- ~+47% at 100 Mbit (28668 vs 19570 kbit/s).
+        ; Zero-copy async TX ring (AH=0xF1) is available on ANY bus-master config (>=286): dma_tx_async
+        ; is 8086-clean and does no per-frame copy, so the 286 limitation (no movsd) doesn't apply.
+        mov     al, [g_use_dma]
+        mov     [g_async], al
+        ; send_pkt's resident DMA path: 386+ uses the non-blocking COPY ring (movsd slot copy); a 286
+        ; can't hide that per-frame copy (no movsd), so its send_pkt uses the blocking zero-copy
+        ; single-transfer instead -- ~+47% at 100 Mbit (28668 vs 19570 kbit/s). (Async is separate.)
         mov     byte [g_tx_ring], 0
         cmp     byte [g_cpu_class], CPU_80386
         jb      .ring_resolved

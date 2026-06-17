@@ -64,15 +64,16 @@ nic_isr:
         jz      .no_txdone
         cmp     byte [g_use_dma], 0
         je      .no_txdone              ; PIO mode: no DMA (TxComplete just acked at .recv_done)
-        cmp     byte [g_tx_ring], 0
-        jne     .tx_ring_adv            ; 386+: advance the non-blocking TX ring
-        mov     byte [g_tx_done], 1     ; 286 single-transfer: flag dma_tx_single's blocking wait
+        cmp     word [tx_ring_count], 0 ; ring frames in flight? (386+ copy ring OR 286/386+ async ring)
+        jne     .tx_ring_adv            ; yes -> advance the ring (frees a slot, kicks the next)
+        mov     byte [g_tx_done], 1     ; no -> a blocking single-transfer (286 send_pkt) completed
         jmp     .no_txdone
 .tx_ring_adv:
         push    ax                      ; preserve adapter status (tx_kick clobbers ax)
         cmp     word [tx_ring_count], 0
         je      .tx_idle                ; spurious -- nothing queued
         dec     word [tx_ring_count]    ; the tail slot's DMA finished
+        inc     word [tx_completed]     ; ASYNC ext: publish completion so the stack can reuse the buffer
         mov     ax, [tx_ring_tail]
         inc     ax
         cmp     ax, TX_RING_N

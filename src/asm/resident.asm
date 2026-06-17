@@ -11,6 +11,7 @@
 %include "el3_core.inc"         ; EL3 command/status constants (guarded; also used by isr.asm)
 %include "el3_corkscrew.inc"    ; 3C515 DMA registers + descriptor constants (guarded)
 %include "xms_dma.inc"          ; XMS DMA extension constants (guarded)
+%include "async_tx.inc"         ; async zero-copy TX extension constants (AH=0xF1)
 
 PKTINT          equ 0x60        ; the packet-driver interrupt we install on
 
@@ -40,6 +41,7 @@ PD_FUNC_EXT     equ 2           ; basic + extended (we provide get_statistics)
 PD_ERR_BADHANDLE equ 1          ; bad handle
 PD_ERR_NOSPACE  equ 10         ; no free handle
 PD_ERR_BADCMD   equ 11          ; bad command
+PD_ERR_CANTSEND equ 12          ; cannot send (async ring full -> caller throttles + retries)
 PD_NFUNCS       equ 7           ; functions 1..7 handled via the table
 PD_GET_STATS    equ 24          ; get_statistics
 PD_DBG_BLOCK    equ 0x7F        ; vendor: return the debug block pointer (CFG_DEBUG)
@@ -77,6 +79,8 @@ pkt_disp:
 %endif
         cmp     al, XMS_DMA_FUNC        ; proprietary XMS DMA extension (AH=0xF0)
         je      pkt_do_xms
+        cmp     al, ASYNC_TX_FUNC       ; proprietary async zero-copy TX extension (AH=0xF1)
+        je      pkt_do_async
         cmp     al, PD_NFUNCS
         ja      pkt_bad
         mov     bl, al
@@ -126,11 +130,44 @@ pkt_do_xms:
 pkt_xms_ret:
         jc      pkt_error
         jmp     pkt_return
+
+;--- AH=0xF1: async zero-copy TX extension. AL sub-function in F_AL. See include/async_tx.inc. ---
+pkt_do_async:
+        mov     al, [bp + F_AL]                 ; sub-function
+        cmp     al, ASYNC_SEND
+        je      .a_send
+        cmp     al, ASYNC_INFO
+        je      .a_info
+        mov     dh, PD_ERR_BADCMD
+        jmp     pkt_error
+.a_info:
+        ; async TX exists only on the 386+ non-blocking DMA ring; else CF=1 -> caller uses send_pkt
+        cmp     byte [g_async], 0      ; zero-copy async ring available? (any bus-master config, >=286)
+        je      .a_unsup
+        mov     word [bp + F_AX], TX_RING_N             ; pool depth the stack should allocate
+        mov     word [bp + F_BX], ASYNC_FEAT_ZEROCOPY
+        ; DX:CX -> resident tx_completed counter (general regs: reliably returned via int86x out_regs)
+        mov     word [bp + F_CX], tx_completed         ; counter offset
+        mov     ax, cs
+        mov     word [bp + F_DX], ax                   ; counter segment (resident CS)
+        jmp     pkt_return                             ; CF=0 (cleared at entry)
+.a_send:
+        cmp     byte [g_async], 0      ; zero-copy async ring available? (any bus-master config, >=286)
+        je      .a_unsup
+        call    dma_tx_async                          ; F_DS:F_SI = frame, F_CX = len; CF=1 if ring full
+        jc      .a_full
+        jmp     pkt_return                            ; CF=0 queued
+.a_full:
+        mov     dh, PD_ERR_CANTSEND
+        jmp     pkt_error                             ; CF=1 -> caller throttles on tx_completed, retries
+.a_unsup:
+        mov     dh, PD_ERR_BADCMD
+        jmp     pkt_error                             ; CF=1 -> caller falls back to send_pkt
 pkt_error:
         mov     bp, sp
         mov     [bp + F_DH], dh         ; return error code in DH
         or      word [bp + F_FLAGS], CY ; set caller CY
-        jmp     short pkt_return
+        jmp     pkt_return
 pkt_bad:
         mov     dh, PD_ERR_BADCMD
         jmp     short pkt_error
@@ -394,6 +431,60 @@ tx_kick:
         mov     ax, EL3_CMD_START_DMA_DOWN
         out     dx, ax
         mov     byte [tx_dma_busy], 1
+        ret
+
+;------------------------------------------------------------------------------
+; dma_tx_async -- non-blocking ZERO-COPY bus-master TX (3C515, 386+). The async ABI's enqueue.
+; Like dma_tx_enqueue but posts the caller's buffer (F_DS:F_SI) DIRECTLY as desc[head].ADDR -- no
+; rep-movsd slot copy -- and returns CF=1 (ring full) WITHOUT blocking; the caller owns a buffer pool
+; and throttles on tx_completed. Contract: the caller must not touch the buffer until its TxComplete
+; bumps tx_completed past this post. IF=0 here (INT 60h) -> the count/busy update is atomic wrt the ISR.
+; Enter: DS=CS, bp -> INT 60h frame (F_DS:F_SI = buffer, F_CX = length). Clobbers ax,bx,cx,dx.
+; Returns: CF=0 queued, CF=1 ring full. Leaves DS=CS.
+;------------------------------------------------------------------------------
+dma_tx_async:
+        cmp     word [tx_ring_count], TX_RING_N
+        jb      .have
+        stc                                     ; ring full -> caller throttles (no block)
+        ret
+.have:
+        mov     bx, [tx_ring_head]
+        mov     cl, 4
+        shl     bx, cl                          ; head * 16
+        add     bx, tx_descs                    ; bx = &desc[head]
+        ; ADDR = phys(F_DS:F_SI): the card DMAs straight from the caller's pooled buffer (<1 MB, 24-bit)
+        mov     ax, [bp + F_DS]
+        mov     dx, ax
+        mov     cl, 4
+        shl     ax, cl                          ; ax = (seg << 4) low 16
+        mov     cl, 12
+        shr     dx, cl                          ; dx = seg >> 12 (high 4 bits of seg*16)
+        add     ax, [bp + F_SI]
+        adc     dx, 0                           ; dx:ax = phys(buffer)
+        mov     [bx + EL3_DESC_ADDR], ax
+        mov     [bx + EL3_DESC_ADDR + 2], dx
+        ; LEN = F_CX, STATUS = 0
+        mov     ax, [bp + F_CX]
+        mov     [bx + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [bx + EL3_DESC_LEN + 2], ax
+        mov     [bx + EL3_DESC_STATUS], ax
+        mov     [bx + EL3_DESC_STATUS + 2], ax
+        ; advance head (mod N), count++
+        mov     ax, [tx_ring_head]
+        inc     ax
+        cmp     ax, TX_RING_N
+        jb      .hwrap
+        xor     ax, ax
+.hwrap:
+        mov     [tx_ring_head], ax
+        inc     word [tx_ring_count]
+        ; kick the DMA if the card is idle
+        cmp     byte [tx_dma_busy], 0
+        jne     .ok
+        call    tx_kick
+.ok:
+        clc
         ret
 
 ;------------------------------------------------------------------------------
