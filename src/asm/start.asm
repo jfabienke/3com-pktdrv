@@ -56,6 +56,7 @@ msg_crlf    db 13, 10, '$'
 msg_dma     db 'DMA=', '$'
 msg_dma_on  db 'ON', 13, 10, '$'
 msg_dma_pio db 'PIO', 13, 10, '$'
+msg_cb      db 'COPYBREAK T=0x', '$'
 
 ; uninstall (`3cpd /u`)
 sig_pktdrvr db 'PKT DRVR'                       ; resident signature (handler + 3); 8 bytes
@@ -141,6 +142,8 @@ g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-st
 g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286): single-transfer on 286, ring on 386+
 g_use_large:    resb 1             ; 1 = FDDI-sized large frames active (/j AND 3C515): allowLargePackets
 g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when large (13-bit 3C515 field)
+g_copybreak_t:  resw 1             ; RX copybreak threshold (bytes): len<=T -> PIO, len>T -> DMA ring.
+                                   ; autotuned at install (copybreak_autotune): T = c_setup / a_PIO.
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286 path)
 g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking COPY ring (movsd) for send_pkt; 0 = 286 -> blocking single-transfer
 g_async:        resb 1             ; 1 = zero-copy async TX ring available (AH=0xF1): any bus-master config (>=286)
@@ -440,6 +443,14 @@ global resident_end
 .dma_report:
         call    print_str
 
+        call    copybreak_autotune  ; RX copybreak threshold T = c_setup / a_PIO (cost model + PIT-timed probe)
+        mov     dx, msg_cb
+        call    print_str
+        mov     ax, [g_copybreak_t]
+        call    print_hex16
+        mov     dx, msg_crlf
+        call    print_str
+
         call    compose_resident    ; ax = emitted length, fills resident_image + g_off
         or      ax, ax
         jz      .fail
@@ -654,6 +665,9 @@ bm_test_buf:    db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
 
 ; el3_init -- operational bring-up of the activated card (MAC, media, RX/TX enable).
 %include "el3_init.asm"
+
+; copybreak_autotune -- compute the RX copybreak threshold T (cost model + PIT-timed PIO probe).
+%include "copybreak.asm"
 
 %ifdef CFG_PNP
 ; detect_nic_pnp -- direct ISA PnP isolation (3C515 / PnP-mode 3C509B). >=286-gated by caller.
