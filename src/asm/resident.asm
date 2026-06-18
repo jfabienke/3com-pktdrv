@@ -699,7 +699,9 @@ dbg_logb:
 
 ;--- XMS DMA QUERY: return capability flags in BX, max slot size in DX ---
 f_xms_query:
-        mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE
+        ; CONV (conventional zero-copy ring) uses the same UpList DMA + in-place deliver as VCPI/DPMI,
+        ; so advertise it alongside the base caps (CONFIGURE gates on actual bus-master availability).
+        mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE | XMS_CAP_CONV
         cmp     byte [g_tx_ring], 0
         je      .no_ring
         or      bx, XMS_CAP_RING | XMS_CAP_VCPI | XMS_CAP_DPMI
