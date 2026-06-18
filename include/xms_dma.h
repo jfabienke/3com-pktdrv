@@ -30,6 +30,7 @@
 #define XMS_CAP_XMS_COPY    0x0004u /* INT 15h AH=87h copy path (286+)      */
 #define XMS_CAP_RING        0x0008u /* ring descriptor mode (386+)           */
 #define XMS_CAP_SINGLE      0x0010u /* single-transfer descriptor mode (286) */
+#define XMS_CAP_CONV        0x0020u /* conventional-memory zero-copy ring (deliver in place; Phase 3) */
 
 /* ---- memory policy ----------------------------------------------------- */
 
@@ -37,8 +38,9 @@ typedef enum {
     XMS_POLICY_VCPI     = 0,   /* XMS + VCPI DE05h → V86 linear mapping; zero CPU copies  */
     XMS_POLICY_DPMI     = 1,   /* XMS + DPMI 1.0 AX=0508h mapping;       zero CPU copies  */
     XMS_POLICY_XMS_COPY = 2,   /* XMS + INT 15h AH=87h staging copy;      one CPU copy    */
+    XMS_POLICY_CONV     = 3,   /* ring in CONVENTIONAL memory (phys=seg*16); deliver in place, NO copy
+                                * -- the doc-10 zero-copy landing ring (mandatory on 286/386). */
 } xms_mem_policy_t;
-/* MEM_CONVENTIONAL (sub-386 / no XMS): no extension call; standard Crynwr PIO path */
 
 /* ---- error codes (DH on CF=1) ------------------------------------------ */
 

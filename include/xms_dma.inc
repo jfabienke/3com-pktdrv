@@ -24,12 +24,16 @@ XMS_CAP_DPMI        equ 0x0002  ; DPMI 1.0 AX=0508h mapping (386+)
 XMS_CAP_XMS_COPY    equ 0x0004  ; INT 15h AH=87h copy path (286+)
 XMS_CAP_RING        equ 0x0008  ; ring descriptor mode (386+)
 XMS_CAP_SINGLE      equ 0x0010  ; single-transfer descriptor mode (286)
+XMS_CAP_CONV        equ 0x0020  ; conventional-memory zero-copy ring (deliver slot in place; Phase 3)
 
 ; ---- memory policy (xms_rx_cfg_t.policy field) --------------------------
 
 XMS_POLICY_VCPI     equ 0       ; XMS + VCPI DE05h -> zero CPU copies
 XMS_POLICY_DPMI     equ 1       ; XMS + DPMI 1.0 AX=0508h -> zero CPU copies
 XMS_POLICY_XMS_COPY equ 2       ; XMS + INT 15h AH=87h staging -> one CPU copy
+XMS_POLICY_CONV     equ 3       ; ring slots in CONVENTIONAL memory (phys = seg*16) -> deliver in place,
+                                ; NO copy. The doc-10 zero-copy landing ring (mandatory on 286/386).
+XMS_POLICY_MAX      equ 3       ; CONFIGURE validation bound (cfg.policy must be <= this)
 
 ; ---- error codes (DH on CF=1) -------------------------------------------
 

@@ -390,8 +390,9 @@ xms_rx_deliver:
         mov     [bp-6], di              ; lin_seg
 
         ; --- 6. Read 14-byte Ethernet header into hdr_buf ---
+        ; ONLY XMS_COPY (slot in XMS) needs INT 15h; VCPI/DPMI/CONV slots are CPU-addressable at lin_seg:0
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jae     .hdr_int15
+        je      .hdr_int15
 
         ; VCPI/DPMI: read 14 bytes from lin_seg:0 into hdr_buf
         mov     es, [bp-6]              ; ES = lin_seg
@@ -465,8 +466,9 @@ xms_rx_deliver:
         mov     [cur_handle], si
 
         ; --- 8. Upcall 1 (AX=0): request buffer ---
+        ; VCPI/DPMI/CONV hint the in-place slot (lin_seg:0); only XMS_COPY passes no hint
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jae     .up1_no_hint
+        je      .up1_no_hint
         mov     es, [bp-6]              ; VCPI/DPMI hint: lin_seg:0
         xor     di, di
         jmp     .up1_call
@@ -486,8 +488,9 @@ xms_rx_deliver:
         mov     [appbuf_off], di
 
         ; --- 9. XMS_COPY: INT 15h to copy full frame into appbuf ---
+        ; ONLY XMS_COPY needs the bulk INT 15h copy; VCPI/DPMI/CONV are already in place at the slot
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jb      .no_copy
+        jne     .no_copy
         ; src: phys_N, limit = rx_len - 1
         mov     ax, [bp-2]
         mov     cl, [bp-4]

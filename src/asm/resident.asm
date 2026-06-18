@@ -725,8 +725,8 @@ f_xms_configure:
         ; validate version
         cmp     byte [es:bx + XMS_CFG_version], XMS_CFG_VERSION
         jne     .ever
-        ; validate policy
-        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_COPY
+        ; validate policy (0=VCPI 1=DPMI 2=XMS_COPY 3=CONV; CONV = conventional-memory zero-copy ring)
+        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_MAX
         ja      .epol
         ; validate phys0 < 16 MB: byte[3] of the 32-bit physical address must be 0
         ; (if phys[31:24]=0 then phys ≤ 0x00FFFFFF = 16MB-1, within ISA DMA range)
