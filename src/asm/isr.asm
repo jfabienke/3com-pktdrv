@@ -305,12 +305,15 @@ xms_rx_deliver:
         mov     bp, sp
         sub     sp, 8
 
-        ; --- 1. Select completed slot's descriptor into SI ---
-        mov     si, xms_rx_desc0
-        cmp     byte [xms_slot_idx], 0
-        je      .gd
-        mov     si, xms_rx_desc1
-.gd:    mov     [bp-8], si              ; save for STATUS clear + phys/lin select
+        ; --- 1. Select completed slot's descriptor: desc[xms_slot_idx] (array-indexed -> handles the
+        ; 2-slot ping-pong AND the deep CONV ring uniformly). At entry xms_slot_idx = the completed slot
+        ; for every path (the cycle/286-toggle happens later). ---
+        mov     al, [xms_slot_idx]
+        mov     ah, EL3_DESC_SIZE
+        mul     ah                      ; ax = idx * EL3_DESC_SIZE (idx <= RX_RING_N-1 -> fits AL*AH)
+        mov     si, xms_rx_descs
+        add     si, ax
+        mov     [bp-8], si              ; save for STATUS clear + phys/lin select
 
         ; --- 2. Verify UP_COMPLETE in descriptor STATUS ---
         mov     ax, [si + EL3_DESC_STATUS]
@@ -357,37 +360,49 @@ xms_rx_deliver:
         ; SI still points to the COMPLETED (old) slot
 
 .no_prearm:
-        ; --- 5. Load phys + lin for the completed slot from cfg ---
+        ; --- 5. Load phys from the completed descriptor; derive lin_seg ---
+        ; The descriptor ADDR field holds the slot phys for EVERY policy (f_xms_configure wrote it), so
+        ; this works for the deep CONV ring (slots 2..N-1 aren't in the 2-entry cfg) and is identical to
+        ; cfg.phys0/phys1 for the 2-slot paths.
+        mov     si, [bp-8]              ; completed descriptor ptr
+        mov     ax, [si + EL3_DESC_ADDR]
+        mov     [bp-2], ax              ; phys_lo
+        mov     cx, [si + EL3_DESC_ADDR + 2]
+        mov     [bp-4], cx              ; phys_hi
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV
+        jne     .lin_from_cfg
+        ; CONV: conventional memory is identity-mapped -> lin_seg = phys >> 4
+        mov     cl, 4
+        shr     ax, cl                  ; ax = phys_lo >> 4
+        mov     dx, [bp-4]              ; phys_hi (<= 0x000F for conv < 1MB)
+        mov     cl, 12
+        shl     dx, cl
+        or      ax, dx
+        mov     [bp-6], ax              ; lin_seg
+        jmp     .addrs_got
+.lin_from_cfg:
+        ; VCPI/DPMI (lin = V86 mapping) / XMS_COPY (lin unused): take lin from the 2-entry cfg.
         push    es
         mov     es, [xms_cfg_seg]
         mov     bx, [xms_cfg_off]
-        mov     si, [bp-8]              ; completed descriptor ptr
         cmp     si, xms_rx_desc0
-        jne     .addrs1
-        mov     ax, [es:bx + XMS_CFG_phys0]
-        mov     cx, [es:bx + XMS_CFG_phys0 + 2]
+        jne     .lin1
         mov     di, [es:bx + XMS_CFG_lin0]
         mov     dx, [es:bx + XMS_CFG_lin0 + 2]
-        jmp     .addrs_got
-.addrs1:
-        mov     ax, [es:bx + XMS_CFG_phys1]
-        mov     cx, [es:bx + XMS_CFG_phys1 + 2]
+        jmp     .lin_got
+.lin1:
         mov     di, [es:bx + XMS_CFG_lin1]
         mov     dx, [es:bx + XMS_CFG_lin1 + 2]
-.addrs_got:
+.lin_got:
         pop     es
-        ; ax=phys_lo, cx=phys_hi, di=lin_lo, dx=lin_hi (for lin<1MB: dx=0)
-        mov     [bp-2], ax              ; phys_lo
-        mov     [bp-4], cx              ; phys_hi
-        ; lin_seg = ((dx << 12) | (di >> 4))  -- valid because lin_N is page-aligned
-        push    dx
+        ; lin_seg = ((lin_hi << 12) | (lin_lo >> 4))  -- valid because lin_N is page-aligned
         mov     cl, 12
         shl     dx, cl
         mov     cl, 4
         shr     di, cl
         or      di, dx
-        pop     dx                      ; (restore dx; value discarded -- used only as scratch above)
         mov     [bp-6], di              ; lin_seg
+.addrs_got:
 
         ; --- 6. Read 14-byte Ethernet header into hdr_buf ---
         ; ONLY XMS_COPY (slot in XMS) needs INT 15h; VCPI/DPMI/CONV slots are CPU-addressable at lin_seg:0
@@ -554,10 +569,17 @@ xms_rx_deliver:
         xor     ax, ax
         mov     [si + EL3_DESC_STATUS], ax
         mov     [si + EL3_DESC_STATUS + 2], ax
-        ; 386+ ring: toggle slot index AFTER delivery
+        ; 386+ ring: advance to the next slot AFTER delivery -- (idx+1) mod nslots. nslots=2 for the
+        ; XMS_COPY ring (cycles 0/1) and RX_RING_N for the deep CONV ring (0..N-1).
         cmp     byte [g_tx_ring], 0
-        je      .done                   ; 286: already toggled during pre-arm
-        xor     byte [xms_slot_idx], 1
+        je      .done                   ; 286: already advanced during pre-arm
+        mov     al, [xms_slot_idx]
+        inc     al
+        cmp     al, [xms_nslots]
+        jb      .idx_ok
+        xor     al, al
+.idx_ok:
+        mov     [xms_slot_idx], al
 
 .done:
         mov     sp, bp

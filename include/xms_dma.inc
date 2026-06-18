@@ -35,6 +35,12 @@ XMS_POLICY_CONV     equ 3       ; ring slots in CONVENTIONAL memory (phys = seg*
                                 ; NO copy. The doc-10 zero-copy landing ring (mandatory on 286/386).
 XMS_POLICY_MAX      equ 3       ; CONFIGURE validation bound (cfg.policy must be <= this)
 
+; ---- RX ring depth -----------------------------------------------------
+; CONV (conventional, contiguous) uses an N-slot ring so a windowed RX flood doesn't overrun the
+; 2-slot ping-pong (Phase-3a depth limit). cfg.phys0 = the base of N contiguous slot_size-byte slots;
+; slot i is at phys0 + i*slot_size. XMS_COPY stays 2 explicit slots (phys0/phys1, non-contiguous EMBs).
+RX_RING_N           equ 8       ; CONV ring depth (slots); must match dos-nvmeotcp xms.h XMS_RX_RING_N
+
 ; ---- error codes (DH on CF=1) -------------------------------------------
 
 XMS_ERR_BAD_VERSION equ 0x01   ; cfg.version != XMS_CFG_VERSION

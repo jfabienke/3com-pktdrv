@@ -147,9 +147,14 @@ payload-extraction copy — by deleting the *extra* XMS copy that `XMS_COPY` pay
 
 - **MTU-sized from QUERY.** The slot size is `max_slot` reported by `INT 60h AH=F0h` QUERY —
   Ethernet-sized in standard mode, FDDI-sized (~4.5 KB) when `g_use_large`. (Today `TX_SLOT_SZ`
-  is 1536, "FDDI later"; the ~4.5 KB slot is the target for this design.) Two ping-pong slots
-  ≈ 3 KB (Ethernet) or ≈ 9 KB (FDDI). Copybreak keeps small frames *off* the ring, so the ring only ever
-  holds large/FDDI frames — which is what keeps the slot count tiny and the conventional spend low.
+  is 1536, "FDDI later"; the ~4.5 KB slot is the target for this design.) The ring is `RX_RING_N`
+  slots deep (8): ≈ 12 KB (Ethernet) or ≈ 36 KB (FDDI). The depth matters — a 2-slot ping-pong
+  overruns under a windowed RX flood (window 4 collapsed it to ~0.14 Mbit/s); 8 slots sustain
+  window 4 at 16.8 Mbit/s on a 386-class cell and pin the ~48 Mbit/s ISA ceiling on a Pentium,
+  both `dropped=0`. Copybreak keeps small frames *off* the ring, so the ring only ever holds
+  large/FDDI frames — which is what keeps the depth modest and the conventional spend low.
+  (Updated 2026-06-18 17:12 CEST: depth raised 2 → `RX_RING_N`; a 286 still uses 2 single-transfer
+  slots since the deep ring needs the 386+ ring-mode engine.)
 - **Cache-line aligned + padded.** Align the base and pad each slot up to a cache-line multiple —
   **32 bytes** (covers 486's 16 and Pentium's 32; superset of the 3C515's dword DMA requirement).
   On a non-snooping ISA bus master this is a *correctness* item: it prevents a cache line shared

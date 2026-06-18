@@ -755,6 +755,15 @@ f_xms_configure:
         mov     [xms_cfg_off], bx
         mov     ax, es
         mov     [xms_cfg_seg], ax
+        ; --- descriptor build: CONV uses ONE contiguous block (cfg.phys0 = base; slot i at base +
+        ; i*slot_size), so it has its own builder (.build_conv) that derives every slot from the base --
+        ; 386+ gets a deep RX_RING_N NEXT-chained ring, the 286 gets 2 contiguous single-transfer slots
+        ; (cfg.phys1 is 0 for CONV, so the 2-slot-from-cfg path below MUST NOT be used for it). XMS_COPY/
+        ; VCPI/DPMI keep the 2 explicit-from-cfg slots (phys0/phys1 = two separate EMBs). ---
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV
+        je      .build_conv
+.build_2slot:
+        mov     byte [xms_nslots], 2
         ; build descriptor 0: ADDR=phys0, LEN=slot_size, STATUS=0, NEXT set below
         mov     ax, [es:bx + XMS_CFG_phys0]
         mov     [xms_rx_desc0 + EL3_DESC_ADDR], ax
@@ -881,6 +890,71 @@ f_xms_configure:
         mov     es, ax                  ; restore ES = our segment
         clc
         ret
+
+        ; --- CONV builder: descriptors carved from the ONE contiguous block (cfg.phys0 = base; slot i at
+        ; base + i*slot_size). Depth = RX_RING_N on a 386+ (ring-mode, NEXT-chained), or 2 on a 286 (single-
+        ; transfer, NEXT=0 -> the ISR re-arms). ES:BX = cfg on entry. The running 32-bit slot phys is stashed
+        ; in xms_gdt[0..3]: CONV never uses the INT 15h GDT, and .next_done overwrites it with the (unused-
+        ; for-CONV) GDT setup afterward, so it is free cold scratch. ---
+.build_conv:
+        mov     byte [xms_nslots], 2            ; 286 single-transfer default
+        cmp     byte [g_tx_ring], 0
+        je      .conv_depth_set
+        mov     byte [xms_nslots], RX_RING_N    ; 386+ deep ring
+.conv_depth_set:
+        mov     ax, [es:bx + XMS_CFG_phys0]     ; running slot phys := phys0 (contiguous block base)
+        mov     [xms_gdt + 0], ax
+        mov     ax, [es:bx + XMS_CFG_phys0 + 2]
+        mov     [xms_gdt + 2], ax
+        xor     bx, bx                          ; i = 0 (BX = loop counter; cfg no longer needed)
+        mov     si, xms_rx_descs                ; SI = &desc[i]
+.cloop:
+        mov     ax, [xms_gdt + 0]               ; ADDR = running slot phys
+        mov     [si + EL3_DESC_ADDR], ax
+        mov     ax, [xms_gdt + 2]
+        mov     [si + EL3_DESC_ADDR + 2], ax
+        mov     ax, [xms_slot_sz]               ; LEN = slot_size (high word 0)
+        mov     [si + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [si + EL3_DESC_LEN + 2], ax
+        mov     [si + EL3_DESC_STATUS], ax      ; STATUS = 0
+        mov     [si + EL3_DESC_STATUS + 2], ax
+        ; NEXT: 386+ ring -> phys(desc[(i+1) mod nslots]); 286 single-transfer -> 0 (ISR re-arms)
+        cmp     byte [g_tx_ring], 0
+        jne     .cnext_ring
+        xor     ax, ax
+        mov     [si + EL3_DESC_NEXT], ax
+        mov     [si + EL3_DESC_NEXT + 2], ax
+        jmp     .cnext_done
+.cnext_ring:
+        mov     di, si                          ; desc[i+1] = SI + EL3_DESC_SIZE; wrap last -> head
+        add     di, EL3_DESC_SIZE
+        mov     al, bl
+        inc     al
+        cmp     al, [xms_nslots]
+        jb      .cnowrap
+        mov     di, xms_rx_descs
+.cnowrap:
+        mov     ax, cs                          ; phys(CS:di) = (cs<<4) + di
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, di
+        adc     dx, 0
+        mov     [si + EL3_DESC_NEXT], ax
+        mov     [si + EL3_DESC_NEXT + 2], dx
+.cnext_done:
+        mov     ax, [xms_slot_sz]               ; running slot phys += slot_size
+        add     [xms_gdt + 0], ax
+        adc     word [xms_gdt + 2], 0
+        add     si, EL3_DESC_SIZE
+        inc     bx
+        cmp     bl, [xms_nslots]
+        jb      .cloop
+        jmp     .next_done
+
 .ever:  mov     dh, XMS_ERR_BAD_VERSION
         jmp     .err
 .epol:  mov     dh, XMS_ERR_BAD_POLICY

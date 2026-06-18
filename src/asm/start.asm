@@ -233,15 +233,18 @@ global resident_end_single
 ; 386+: kept through resident_end (includes tx_slots for the TX ring).
 xms_dma_armed:  resb 1             ; 0 = PIO / not configured; 1 = XMS ring armed
 xms_rx_policy:  resb 1             ; xms_mem_policy_t (VCPI=0, DPMI=1, XMS_COPY=2)
-xms_slot_idx:   resb 1             ; current ping-pong slot index (0 or 1)
-                resb 1             ; pad to word alignment
+xms_slot_idx:   resb 1             ; current ring slot index (0..xms_nslots-1; cycles mod nslots)
+xms_nslots:     resb 1             ; ring depth: 2 (XMS_COPY/286 ping-pong) or RX_RING_N (CONV+386 deep ring)
 xms_cfg_off:    resw 1             ; far ptr to caller's xms_rx_cfg_t (offset)
 xms_cfg_seg:    resw 1             ; far ptr to caller's xms_rx_cfg_t (segment)
 xms_slot_sz:    resw 1             ; bytes per XMS slot
                 resw 1             ; pad to dword alignment
                 alignb 16
-xms_rx_desc0:   resb EL3_DESC_SIZE ; RX up-descriptor slot 0 (16 bytes, 16-byte aligned)
-xms_rx_desc1:   resb EL3_DESC_SIZE ; RX up-descriptor slot 1
+; RX up-descriptor ring: RX_RING_N entries (16-byte aligned). CONV uses all N (deeper ring, contiguous
+; slots); XMS_COPY / 286 single-transfer use the first 2. desc[i] = xms_rx_descs + i*EL3_DESC_SIZE.
+xms_rx_descs:   resb RX_RING_N * EL3_DESC_SIZE
+xms_rx_desc0    equ xms_rx_descs                    ; slot-0 alias (the XMS_COPY / 286 2-slot path)
+xms_rx_desc1    equ xms_rx_descs + EL3_DESC_SIZE    ; slot-1 alias
 xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; access bytes pre-set)
 
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)

@@ -57,23 +57,40 @@ the V86 real-mode address range from user code. Both policies fall back to
 
 ## DMA descriptor mode vs. CPU tier
 
-Both DMA modes use the same two-slot ping-pong layout (`phys0`/`phys1`).
-The mode is an internal detail of `3cpd.exe`'s JIT — the caller provides
-both slot addresses identically regardless.
+_Last updated: 2026-06-18 17:12 CEST — CONV ring deepened 2 → `RX_RING_N` (8) slots._
 
-| CPU | RX DMA mode | `EL3_DESC_NEXT` |
-|-----|-------------|-----------------|
-| 286 | Single-transfer | 0 (no chain) — ISR re-arms immediately after each completion |
-| 386+ | Ring | → descriptor 1 / → descriptor 0 (circular) — NIC auto-advances |
+Ring **depth** and **layout** depend on the memory policy:
+
+- **`XMS_COPY` / VCPI / DPMI** — two explicit slots (`phys0`/`phys1`), each a
+  separate XMS EMB. The caller hands both slot addresses; the descriptors are
+  not contiguous.
+- **`XMS_POLICY_CONV`** — one *contiguous* block of `RX_RING_N` slots. The
+  caller passes only `phys0` (the block base); slot _i_ lives at
+  `phys0 + i·slot_size`, and `3cpd.exe` builds every descriptor from that base.
+  A 2-slot ping-pong overruns under a windowed RX flood (a window of 4 collapsed
+  the old 2-slot CONV ring to ~0.14 Mbit/s); the deep ring absorbs the burst
+  (window 4 → 16.8 Mbit/s on a 386-class cell, `dropped=0`; the bus ceiling
+  ~48 Mbit/s on a Pentium, `dropped=0`).
+
+| CPU | RX DMA mode | depth | `EL3_DESC_NEXT` |
+|-----|-------------|-------|-----------------|
+| 286 | Single-transfer | 2 | 0 (no chain) — ISR re-arms immediately after each completion |
+| 386+ `XMS_COPY` | Ring | 2 | → descriptor 1 / → descriptor 0 (circular) — NIC auto-advances |
+| 386+ `CONV` | Ring | `RX_RING_N` (8) | → next descriptor (circular over all N) — NIC auto-advances |
 
 **Single-transfer ping-pong (286):** on completion the ISR immediately arms
 the *other* slot and kicks `START_DMA_UP` before processing the current frame,
-minimising the gap during which a new frame could be dropped.
+minimising the gap during which a new frame could be dropped. (A 286 `CONV`
+ring also uses 2 single-transfer slots, both carved from the contiguous base —
+the deep ring requires the 386+ ring-mode engine.)
 
-**Ring mode (386+):** `EL3_DESC_NEXT` chains the two descriptors into a
-circle. The NIC advances to slot 1 the moment slot 0 completes, with zero
-inter-frame gap. The ISR clears the completed descriptor's status; no
-explicit re-arm is needed.
+**Ring mode (386+):** `EL3_DESC_NEXT` chains the descriptors into a circle
+(2 for `XMS_COPY`, all `RX_RING_N` for `CONV`). The NIC advances to the next
+descriptor the moment the current one completes, with zero inter-frame gap.
+The ISR clears the completed descriptor's status and cycles its slot index
+`mod nslots`; no explicit re-arm is needed. The NIC overrun-drops only when it
+laps the driver — i.e. the next descriptor still carries `UP_COMPLETE` because
+the driver has not yet recycled it (a deeper ring raises the lap threshold).
 
 ```
 TX: CPU frag  ×  DMA tier    (PIO / single-xfer 286 / ring 386+)
