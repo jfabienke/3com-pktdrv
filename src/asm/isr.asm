@@ -466,9 +466,12 @@ xms_rx_deliver:
         mov     [cur_handle], si
 
         ; --- 8. Upcall 1 (AX=0): request buffer ---
-        ; VCPI/DPMI/CONV hint the in-place slot (lin_seg:0); only XMS_COPY passes no hint
+        ; VCPI/DPMI reference the slot in place (hint lin_seg:0). XMS_COPY + CONV copy the frame into
+        ; the receiver's OWN buffer (no hint), so the slot can be recycled immediately -- the conv slot
+        ; is a zero-copy *landing*, but the one mandatory payload-extraction copy (slot -> receiver ring)
+        ; still happens; CONV just does it as a fast rep movs instead of XMS_COPY's INT 15h (see step 9).
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        je      .up1_no_hint
+        jae     .up1_no_hint
         mov     es, [bp-6]              ; VCPI/DPMI hint: lin_seg:0
         xor     di, di
         jmp     .up1_call
@@ -487,10 +490,12 @@ xms_rx_deliver:
         mov     [appbuf_seg], es
         mov     [appbuf_off], di
 
-        ; --- 9. XMS_COPY: INT 15h to copy full frame into appbuf ---
-        ; ONLY XMS_COPY needs the bulk INT 15h copy; VCPI/DPMI/CONV are already in place at the slot
+        ; --- 9. Frame copy into the receiver buffer (the one mandatory payload-extraction pass):
+        ; VCPI/DPMI reference the slot in place (no copy); XMS_COPY copies via INT 15h (XMS slot not
+        ; CPU-addressable); CONV copies via a fast rep movs (conv slot IS addressable -> no INT 15h). ---
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jne     .no_copy
+        jb      .no_copy                ; VCPI/DPMI: in-place reference
+        ja      .conv_copy              ; CONV: rep movs conv-slot -> appbuf (one copy, no slot race)
         ; src: phys_N, limit = rx_len - 1
         mov     ax, [bp-2]
         mov     cl, [bp-4]
@@ -558,6 +563,26 @@ xms_rx_deliver:
         mov     sp, bp
         pop     bp
         ret
+
+.conv_copy:
+        ; CONV one-pass copy: conventional slot (lin_seg:0, CPU-addressable) -> receiver buffer (appbuf).
+        ; Done HERE in the ISR (before the STATUS clear + re-arm below), so the slot is fully read before
+        ; the emulator can recycle it -- no deferred-read race, and no INT 15h (fast rep movs). DS=CS in,
+        ; DS=CS out. All DS-relative operands are read before DS is repointed at the slot.
+        mov     ax, [bp-6]              ; lin_seg (conv slot segment)
+        mov     es, [appbuf_seg]        ; ES:DI = receiver buffer (copy destination)
+        mov     di, [appbuf_off]
+        mov     cx, [rx_len]
+        mov     ds, ax                  ; DS:SI = conv slot, offset 0
+        xor     si, si
+        shr     cx, 1                   ; word count (CF = odd trailing byte)
+        rep     movsw
+        jnc     .conv_dn
+        movsb
+.conv_dn:
+        push    cs
+        pop     ds                      ; restore DS = CS
+        jmp     .no_copy                ; -> Upcall 2 (deliver appbuf)
 
 ;------------------------------------------------------------------------------
 ; isr_wait_cmd -- bounded poll on CmdInProgress (EL3_ST_CMD_BUSY) after a slow command.
