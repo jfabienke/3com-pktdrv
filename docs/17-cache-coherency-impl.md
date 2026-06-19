@@ -103,12 +103,23 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ## Build order
 
-1. `dma.h` verdict fields + the resident `cache_flush` helper scaffold (default `NONE`) + `call` sites in the
-   TX/RX DMA paths (batched). **Verify on QEMU:** still works, helper is `ret` (coherent), no regression.
-2. The RX-direction self-test in `phase_validate_dma`. **Verify on QEMU:** probe runs, concludes coherent
-   (no cache modeled), no regression; a `FORCE_FLUSH` build flag makes the helper `WBINVD` and the driver
-   still works (proves the flush path is harmless under TCG).
-3. Descriptor coherency (Piece 3) + alignment (Piece 4).
+1. **DONE** (3cpd `ae7326f`). `cache.asm` helper scaffold (`cache_flush_none` = bare `ret`,
+   `cache_flush_wbinvd` = `0F 09`) + `g_cache_flush_fn` resident pointer + batched `call` sites in the TX/RX
+   DMA paths (`tx_kick`, `dma_tx_single`, `f_xms_poll` drain top). **Verified on QEMU:** 386@sh7 conv ring
+   unchanged at 15.12 dropped=0 (helper is `ret`); a `CFG_FORCE_FLUSH` build (WBINVD every TX kick + RX drain)
+   stays 15.11 dropped=0 — WBINVD harmless under TCG, the reg/flag-preserving contract holds.
+2. **DONE** (3cpd `30331b9` + elink-qemu `054c3a3`). `phase_validate_coherency` (its own cold phase after the
+   bus-master TX test, not folded into `phase_validate_dma`) runs the RX-direction loopback self-test → records
+   `g_flush_tier` (FLUSH_TIER_NONE/WBINVD/EVICT); `install` maps it to the helper. **The emulator's internal
+   loopback was a stub** (nothing set `c->internal_loopback`; even when set, no TX→RX feedback), so the faithful
+   path was implemented in `el3_core.c`: a Window-4 NET_DIAG bit-5 write arms `internal_loopback`, and a
+   bus-master TX in that mode is fed into `el3_core_dma_rx_single` (armed up-descriptor) instead of the wire —
+   matching real 3c515 silicon. **Verified on QEMU:** the cold banner reads `CACHE FLUSH=NONE (coherent)` — the
+   probe runs end-to-end, the loopback delivers pattern B, all 3 trials read fresh → tier NONE → no flush;
+   conv ring unchanged at 15.12 dropped=0 (486@sh7) / Pentium@sh3. `CFG_FORCE_FLUSH` still overrides to WBINVD.
+   (Chose faithful emulator loopback over a driver-only timeout fallback so the probe's readback-compare path
+   actually executes on the emulator, not just on real HW.)
+3. Descriptor coherency (Piece 3) + alignment (Piece 4). **(next)**
 4. (separate milestone) NC-region lift (Piece 5), behind the re-test gate.
 
 ## What this does and doesn't prove
@@ -120,4 +131,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-19 12:20 CEST._
+_Last updated: 2026-06-19 22:15 CEST (steps 1–2 landed: flush scaffold + RX loopback self-test; faithful el3 internal loopback added to the emulator)._
