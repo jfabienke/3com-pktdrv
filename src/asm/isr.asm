@@ -94,8 +94,21 @@ nic_isr:
         jz      .no_updone
         cmp     byte [xms_dma_armed], 0
         je      .no_updone
-        push    ax                      ; preserve card status across xms_rx_deliver
-        call    xms_rx_deliver
+        ; NAPI: don't drain the conv ring in the ISR -- a fast wire would re-fire UP_COMPLETE faster than
+        ; the stack's net_poll can process, starving it (receive livelock). Instead MASK UP_COMPLETE and
+        ; hand the drain to the task (pkt_xms_poll, AL=0x03), which re-arms when the ring empties. Skip if
+        ; already masked (a drain is pending). The .recv_done AckIntr (0x07FF) still clears int_status.
+        cmp     byte [g_rx_irq_masked], 0
+        jne     .no_updone
+        mov     byte [g_rx_irq_masked], 1
+        push    ax
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, [g_intr_enb_full]
+        and     ax, ~EL3_ST_UP_COMPLETE & 0xFFFF   ; SetIntrEnb with UP_COMPLETE cleared
+        out     dx, ax
+        pop     dx
         pop     ax
 .no_updone:
         test    ax, EL3_ST_ADAPTER_FAILURE

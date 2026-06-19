@@ -8,6 +8,17 @@
 ; 0x18bc; ~1.4 KB of cold code reclaimed). Copy-down interleaving could trim further later.
 
 install:
+        ; Zero resident control flags that live in _TEXT (resb -- NOT load-zeroed by DOS) and are read
+        ; before they are written. Done HERE: post-compose (the JIT writes resident_image, so a pre-compose
+        ; clear doesn't survive) and pre-ISR-hook (before the vector below goes live). A non-zero
+        ; xms_dma_armed makes the first runtime CONFIGURE return ALREADY_CFG -> the conv RX-DMA ring never
+        ; arms and RX silently falls back to PIO; a non-zero g_isr_busy makes the ISR skip all RX. The TX
+        ; ring counters get the same treatment in tx_ring_init. DS = resident segment.
+        mov     byte [xms_dma_armed], 0
+        mov     byte [xms_slot_idx], 0
+        mov     byte [xms_nslots], 0
+        mov     byte [g_rx_irq_masked], 0
+        mov     byte [g_isr_busy], 0
         ; save the previous owner of the packet interrupt
         mov     ax, 0x3500 | PKTINT             ; AH=35h get-vector
         int     0x21                            ; -> ES:BX

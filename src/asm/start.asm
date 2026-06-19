@@ -238,7 +238,11 @@ xms_nslots:     resb 1             ; ring depth: 2 (XMS_COPY/286 ping-pong) or R
 xms_cfg_off:    resw 1             ; far ptr to caller's xms_rx_cfg_t (offset)
 xms_cfg_seg:    resw 1             ; far ptr to caller's xms_rx_cfg_t (segment)
 xms_slot_sz:    resw 1             ; bytes per XMS slot
-                resw 1             ; pad to dword alignment
+g_rx_irq_masked: resb 1            ; NAPI: 1 = UP_COMPLETE IRQ masked under RX load; the conv-ring drain
+                                   ; is deferred to pkt_xms_poll (task) so the ISR can't starve net_poll
+                resb 1             ; pad to word alignment
+g_intr_enb_full: resw 1           ; full SetIntrEnb mask (incl UP_COMPLETE) saved at configure; the ISR
+                                   ; masks UP_COMPLETE out of it, pkt_xms_poll re-arms with the full value
                 alignb 16
 ; RX up-descriptor ring: RX_RING_N entries (16-byte aligned). CONV uses all N (deeper ring, contiguous
 ; slots); XMS_COPY / 286 single-transfer use the first 2. desc[i] = xms_rx_descs + i*EL3_DESC_SIZE.

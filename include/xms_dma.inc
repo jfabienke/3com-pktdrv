@@ -16,6 +16,8 @@ XMS_DMA_FUNC        equ 0xF0    ; INT 60h AH value
 XMS_DMA_QUERY       equ 0x00    ; AL: query driver capabilities
 XMS_DMA_CONFIGURE   equ 0x01    ; AL: configure XMS DMA receive ring (ES:DI -> cfg)
 XMS_DMA_RELEASE     equ 0x02    ; AL: release ring, stop DMA
+XMS_DMA_POLL        equ 0x03    ; AL: NAPI poll -- drain the conv ring from task context + re-arm the
+                                ; UP_COMPLETE IRQ (the ISR masks it under load to avoid receive livelock)
 
 ; ---- capability flags (BX on successful QUERY) --------------------------
 

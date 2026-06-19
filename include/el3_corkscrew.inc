@@ -40,6 +40,11 @@ EL3_IO_EXTENT_CORKSCREW equ 32       ; I/O port range per NIC (vs 16 on the 3C50
 EL3_CS_DMA_BASE         equ 0x20     ; bus-master register block offset from io_base
 EL3_CS_DOWN_LIST_PTR    equ 0x24     ; TX descriptor list pointer (32-bit; two 16-bit OUTs at 0x24/0x26)
 EL3_CS_UP_LIST_PTR      equ 0x38     ; RX descriptor list pointer
+EL3_CS_RX_COPYBREAK     equ 0x3C     ; MODEL-PRIVATE (el3 emulator, not real silicon): the driver writes
+                                     ; its autotuned copybreak T here so the emulator routes len<=T to PIO
+                                     ; and len>T to the deep DMA ring -- closing the autotune loop. A real
+                                     ; 3C515 ignores base+0x3C; on real hardware the driver does the
+                                     ; routing itself (this register has no effect, harmless to write).
 
 ; ---- bus-master commands (high 5 bits select, low 11 = param; see EL3_CMD encoding).
 ; StartDma is cmd 0x14 (<<11 = 0xA000): param != 0 -> down (TX), param 0 -> up (RX).

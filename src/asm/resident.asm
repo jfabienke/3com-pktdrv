@@ -120,6 +120,8 @@ pkt_do_xms:
         je      .xc
         cmp     al, XMS_DMA_RELEASE
         je      .xr
+        cmp     al, XMS_DMA_POLL
+        je      .xp
         mov     dh, PD_ERR_BADCMD
         stc
         jmp     pkt_error
@@ -128,6 +130,8 @@ pkt_do_xms:
 .xc:    call    f_xms_configure
         jmp     pkt_xms_ret
 .xr:    call    f_xms_release
+        jmp     pkt_xms_ret
+.xp:    call    f_xms_poll
         jmp     pkt_xms_ret
 pkt_xms_ret:
         jc      pkt_error
@@ -856,6 +860,14 @@ f_xms_configure:
         mov     [xms_gdt + 46], ax
         ; slot index = 0
         mov     byte [xms_slot_idx], 0
+        ; close the copybreak autotune loop: hand the emulator our autotuned threshold T so its size-
+        ; routing (len<=T -> PIO FIFO, len>T -> this DMA ring) matches the driver's live decision. The
+        ; el3 model register at EL3_CS_RX_COPYBREAK consumes it; a real 3C515 ignores base+0x3C (the
+        ; driver does the routing itself on real silicon), so this is a harmless write there.
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_RX_COPYBREAK
+        mov     ax, [g_copybreak_t]
+        out     dx, ax
         ; arm UP_LIST_PTR <- phys(CS:xms_rx_desc0)
         mov     ax, cs
         mov     cl, 4
@@ -883,6 +895,9 @@ f_xms_configure:
         je      .intr_no_tx
         or      ax, EL3_ST_TX_COMPLETE
 .intr_no_tx:
+        mov     [g_intr_enb_full], ax           ; save the full mask: ISR masks UP_COMPLETE out of it under
+                                                ; load, pkt_xms_poll re-arms with it (NAPI livelock guard)
+        mov     byte [g_rx_irq_masked], 0       ; start in interrupt mode
         out     dx, ax
         ; mark armed
         mov     byte [xms_dma_armed], 1
@@ -994,6 +1009,7 @@ f_xms_release:
         out     dx, ax
         ; clear state
         mov     byte [xms_dma_armed], 0
+        mov     byte [g_rx_irq_masked], 0
         xor     ax, ax
         mov     [xms_cfg_off], ax
         mov     [xms_cfg_seg], ax
@@ -1001,6 +1017,41 @@ f_xms_release:
         ret
 .enot:  mov     dh, XMS_ERR_NOT_CFG
         stc
+        ret
+
+;--- XMS DMA POLL (AL=0x03): NAPI drain. The ISR masks UP_COMPLETE under RX load (so the interrupt can't
+;    preempt-starve the stack's net_poll -> receive livelock) and defers the work here. Drain EVERY
+;    completed conv-ring slot from task context -- driven by the descriptor STATUS bit, so it's immune to
+;    the el3 coalescing several slot-completions into one UP_COMPLETE int bit -- then re-arm the IRQ. The
+;    stack calls this from net_poll when its receiver ring runs dry. DS=CS. No CF error. ---
+f_xms_poll:
+        cmp     byte [xms_dma_armed], 0
+        je      .p_ret                  ; ring not configured -> nothing to drain
+        ; Hold off ISR reentrancy on the shared receiver ring while we drain + upcall (the ISR honours
+        ; g_isr_busy and no-ops; the level-triggered source re-fires after we clear it).
+        mov     byte [g_isr_busy], 1
+.p_loop:
+        mov     al, [xms_slot_idx]      ; desc = xms_rx_descs + xms_slot_idx * EL3_DESC_SIZE
+        mov     ah, EL3_DESC_SIZE
+        mul     ah
+        mov     si, xms_rx_descs
+        add     si, ax
+        test    word [si + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
+        jz      .p_drained              ; current slot not filled -> ring drained
+        call    xms_rx_deliver          ; deliver desc[xms_slot_idx] (upcall); advances xms_slot_idx
+        jmp     .p_loop
+.p_drained:
+        mov     byte [g_isr_busy], 0
+        ; re-arm UP_COMPLETE if the ISR masked it (return to interrupt mode now the ring is empty)
+        cmp     byte [g_rx_irq_masked], 0
+        je      .p_ret
+        mov     byte [g_rx_irq_masked], 0
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, [g_intr_enb_full]   ; SetIntrEnb with UP_COMPLETE re-enabled
+        out     dx, ax
+.p_ret:
+        clc
         ret
 
 f_bad:
