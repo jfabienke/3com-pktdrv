@@ -84,6 +84,30 @@ bus-master trust share one cold pass and one chipset lookup.
 - Carry the model + the ~8 ISA chipset ops above; skip the 62-table, the Pentium/PCI NC parts, and
   cache-kit's TUI (`07` skip list).
 
+## Update 2026-06-19 — NC is an OPTIONAL optimization, not the lead (Phase 2)
+
+A pre-implementation audit of cache-kit (the lift source) plus hardware research changed the risk posture.
+The NC-region model above is right, but it is **not** the foundation — it rides on top of an always-correct
+flush path.
+
+- **cache-kit's NC encodings are emulator-validated only, never run on real hardware.** The base-unit
+  encodings for the very chipsets we'd carry are flagged UNVERIFIED in cache-kit itself: OPTi/UMC/Eteq
+  "base unit 64 KB vs 16 KB — VERIFY on 86Box vs datasheet" (a 4× error fences the wrong physical addresses,
+  silent DMA corruption); SiS 460/Rabbit base-bit ambiguity. A wrong size-code marks the *wrong* region NC →
+  the DMA buffer stays cacheable → stale-read corruption, **worse than the flush it replaced**.
+- **The stub landmine is real** (confirmed in cache-kit): C&T PEAK/SCAT, ALi Finis, VLSI VL82C311, Faraday
+  FE3600 (`nc_count=3` but ops stubbed), VIA VT82C310 all advertise `nc_count>0` with `hal_stub_*` ops.
+  Gate on **`ops.nc_write != hal_stub_*`**, never `nc_count` — as `§3` already says, now verified necessary.
+- **The emulator cannot test NC at all** — QEMU models no cache *and* none of these chipsets, so the NC
+  register writes go to unimplemented I/O and the re-test can never confirm a real effect there (`13` caveat).
+
+**Consequence — reordered.** The driver leads with the safe core (coherency self-test + `WBINVD`/software-
+eviction, universally correct — `13`). NC-region marking is attempted **only** when (a) a recognized chipset
+exposes a **real** `nc_write` op, **and** (b) a post-marking **re-test** of the self-test flips the result to
+fresh. If either fails, fall back to the flush path. So NC can only ever *remove a flush*, never corrupt — the
+re-test is the safety net under the unverified encodings. The ~8 ISA chipset ops here are lifted **after** the
+safe core lands, behind that gate.
+
 ## Status & relationship
 
 - Detailed plan for `07` Tier A′ (NC-region model). Escapes the worst cell in `11`/`10`; the
@@ -92,8 +116,9 @@ bus-master trust share one cold pass and one chipset lookup.
 - After NC detection, the irreducible worst case narrows to **486 + 3C515 + a stubbed legacy
   chipset** (C&T / Headland / VLSI / Faraday …) with no NC and no ISA-master snoop — batched WBINVD
   only, and only latency-bound single-frame I/O can't hide it.
-- Not yet implemented; part of the 386+ cache-tier milestone.
+- Reframed 2026-06-19 as an optional, re-test-gated optimization on top of the safe flush core; lifted
+  after the core (`17`). Not yet implemented.
 
 ---
 
-_Last updated: 2026-06-15 09:32 CEST._
+_Last updated: 2026-06-19 12:20 CEST._
