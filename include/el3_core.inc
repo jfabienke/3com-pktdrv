@@ -112,10 +112,12 @@ EL3_RXF_BROADCAST       equ 0x04
 ; ---- Window 2: station address (6 byte registers at offsets 0..5) ----
 EL3_W2_STATION_REG      equ 0x00
 
-; ---- Window 4: media / transceiver ----
+; ---- Window 4: media / transceiver / diagnostics ----
 EL3_W4_MEDIA_STATUS     equ 0x0A     ; media type/status register
 EL3_MEDIA_LBEAT_ENABLE  equ 0x0080   ; enable 10BaseT link beat
 EL3_MEDIA_JABBER_ENABLE equ 0x0040   ; enable 10BaseT jabber guard
+EL3_W4_NET_DIAG         equ 0x06     ; NetworkDiagnostics register (Window 4)
+EL3_NET_DIAG_INTERNAL_LB equ 0x0020  ; bit 5: internal MAC loopback (TX loops back into the RX path)
 
 ; ---- EEPROM (shared word layout + read opcode) ----
 EL3_EE_READ             equ 0x80     ; OR with word addr to issue a read

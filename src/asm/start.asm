@@ -57,6 +57,10 @@ msg_dma     db 'DMA=', '$'
 msg_dma_on  db 'ON', 13, 10, '$'
 msg_dma_pio db 'PIO', 13, 10, '$'
 msg_cb      db 'COPYBREAK T=0x', '$'
+msg_coh        db 'CACHE FLUSH=', '$'           ; Phase 2 RX coherency verdict report
+msg_coh_none   db 'NONE (coherent)', 13, 10, '$'
+msg_coh_wbinvd db 'WBINVD (non-coherent)', 13, 10, '$'
+msg_coh_evict  db 'SW-EVICT (non-coherent, 386)', 13, 10, '$'
 
 ; uninstall (`3cpd /u`)
 sig_pktdrvr db 'PKT DRVR'                       ; resident signature (handler + 3); 8 bytes
@@ -153,6 +157,9 @@ g_rx_cksum_val: resw 1             ; folded native-LE ones-complement sum of the
 g_cache_flush_fn: resw 1           ; Phase 2: offset of the selected DMA cache-flush helper (cache.asm). The
                                    ; DMA paths `call word [g_cache_flush_fn]`; the cold coherency self-test
                                    ; (docs/17) picks the tier. Default cache_flush_none (coherent) until then.
+g_flush_tier:   resb 1             ; Phase 2: FLUSH_TIER_* verdict from phase_validate_coherency (cold). install
+                                   ; maps it -> g_cache_flush_fn. Set NONE at the top of the cold probe so the
+                                   ; PIO path (probe skipped) still has a defined value.
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
@@ -454,6 +461,21 @@ global resident_end
 .dma_report:
         call    print_str
 
+        ; Phase 2: RX cache-coherency self-test (MAC internal loopback) -> g_flush_tier. On QEMU (no
+        ; cache modelled) this concludes coherent -> NONE; on a non-coherent 486+ it picks WBINVD.
+        call    phase_validate_coherency
+        mov     dx, msg_coh
+        call    print_str
+        mov     dx, msg_coh_none
+        cmp     byte [g_flush_tier], FLUSH_TIER_NONE
+        je      .coh_report
+        mov     dx, msg_coh_wbinvd
+        cmp     byte [g_flush_tier], FLUSH_TIER_WBINVD
+        je      .coh_report
+        mov     dx, msg_coh_evict
+.coh_report:
+        call    print_str
+
         call    copybreak_autotune  ; RX copybreak threshold T = c_setup / a_PIO (cost model + PIT-timed probe)
         mov     dx, msg_cb
         call    print_str
@@ -670,6 +692,172 @@ phase_validate_dma:
 ; proves the card DMA-read it). Cold (reclaimed after install).
 bm_test_buf:    db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
                 times (BM_TEST_LEN - 6) db 0x00
+
+;------------------------------------------------------------------------------
+; phase_validate_coherency (>=286 DMA cold phase, AFTER phase_validate_dma) -- Phase 2 RX cache-
+; coherency self-test (docs/17). With the bus-master engine proven, decide whether the CPU sees the
+; card's RX-DMA writes WITHOUT a cache flush. Mechanism (the RX failure mode that matters most):
+;   - warm a dest buffer with pattern A (the "stale" marker), in the instruction just before the DMA
+;   - enable MAC internal loopback (Window 4 NET_DIAG bit 5): a bus-master TX is received back into the
+;     armed RX up-descriptor instead of reaching the wire
+;   - TX a frame carrying pattern B (B != A) -> the card RX-DMAs B into the dest buffer
+;   - poll UP_COMPLETE, then read the dest with NO flush: == B -> COHERENT (tier NONE);
+;     == A -> the CPU read a stale cached line -> NON-COHERENT (WBINVD on 486+, SW-evict on 386)
+; Three trials; any stale OR a timeout -> non-coherent (conservative -- can't prove coherent, don't assume
+; it). On QEMU/TCG (no cache modelled) the loopback delivers B and every trial reads fresh -> NONE: this
+; is the structural verification (probe runs end-to-end, concludes coherent, no flush, no regression). The
+; verdict lands in g_flush_tier; install maps it to the resident cache_flush helper. Cold; clobbers
+; AX,BX,CX,DX,SI and ES (ES restored). DS = DGROUP. Leaves the card in Window 1 (el3_init's operating win).
+;------------------------------------------------------------------------------
+COH_BUF_LEN     equ 128                     ; RX dest capacity (small -> fits any cache; copybreak is 0 here)
+COH_FRAME_LEN   equ 64                      ; loopback frame length (min Ethernet payload)
+COH_TRIALS      equ 3
+COH_PAT_A       equ 0xA5A5                  ; "stale" marker pre-warmed into the dest (both words)
+COH_PAT_B       equ 0x5B5B                  ; "fresh" marker the card DMA-writes via loopback (both words)
+phase_validate_coherency:
+        mov     byte [g_flush_tier], FLUSH_TIER_NONE    ; coherent default (also the PIO answer)
+        cmp     byte [g_use_dma], 0
+        je      .pvc_done                               ; PIO floor: no bus-master path to protect
+
+        push    es
+        ; --- enable internal MAC loopback: Window 4, NET_DIAG |= INTERNAL_LB ---
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W4_MEDIA
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_W4_NET_DIAG
+        in      ax, dx
+        or      ax, EL3_NET_DIAG_INTERNAL_LB
+        out     dx, ax
+
+        mov     byte [coh_trials_left], COH_TRIALS
+.pvc_trial:
+        ; warm the dest with A immediately before arming the DMA (single-threaded cold init -> nothing
+        ; evicts it in the gap; a non-coherent cache keeps A over the card's later write to the same line).
+        mov     word [coh_rx_buf],     COH_PAT_A
+        mov     word [coh_rx_buf + 2], COH_PAT_A
+        mov     word [coh_tx_buf],     COH_PAT_B         ; (re)stamp the loopback source with B
+        mov     word [coh_tx_buf + 2], COH_PAT_B
+
+        ; up-descriptor: NEXT=0, STATUS=0, ADDR=phys(coh_rx_buf), LEN=capacity
+        mov     si, coh_rx_buf
+        call    cs_phys                                 ; -> dx:ax
+        mov     [coh_up_desc + EL3_DESC_ADDR], ax
+        mov     [coh_up_desc + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [coh_up_desc + EL3_DESC_NEXT], ax
+        mov     [coh_up_desc + EL3_DESC_NEXT + 2], ax
+        mov     [coh_up_desc + EL3_DESC_STATUS], ax
+        mov     [coh_up_desc + EL3_DESC_STATUS + 2], ax
+        mov     word [coh_up_desc + EL3_DESC_LEN], COH_BUF_LEN
+        mov     [coh_up_desc + EL3_DESC_LEN + 2], ax
+        ; down-descriptor (reuse tx_descs): NEXT=0, STATUS=0, ADDR=phys(coh_tx_buf), LEN=frame
+        mov     si, coh_tx_buf
+        call    cs_phys
+        mov     [tx_descs + EL3_DESC_ADDR], ax
+        mov     [tx_descs + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [tx_descs + EL3_DESC_NEXT], ax
+        mov     [tx_descs + EL3_DESC_NEXT + 2], ax
+        mov     [tx_descs + EL3_DESC_STATUS], ax
+        mov     [tx_descs + EL3_DESC_STATUS + 2], ax
+        mov     word [tx_descs + EL3_DESC_LEN], COH_FRAME_LEN
+        mov     [tx_descs + EL3_DESC_LEN + 2], ax
+
+        ; arm RX: UpListPtr <- phys(coh_up_desc); StartDmaUp
+        mov     si, coh_up_desc
+        call    cs_phys
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax                                  ; low word
+        pop     ax                                      ; high word
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        ; kick TX (loopback): DownListPtr <- phys(tx_descs); StartDmaDown
+        mov     si, tx_descs
+        call    cs_phys
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_DOWN
+        out     dx, ax
+
+        ; poll the up-descriptor UP_COMPLETE, bounded by elapsed BIOS ticks
+        xor     ax, ax
+        mov     es, ax
+        mov     bx, [es:BIOS_TICK_COUNT]
+.pvc_wait:
+        test    word [coh_up_desc + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
+        jnz     .pvc_rxdone
+        mov     ax, [es:BIOS_TICK_COUNT]
+        sub     ax, bx
+        cmp     ax, EL3_DMA_TX_TICKS
+        jb      .pvc_wait
+        jmp     .pvc_noncoherent                        ; loopback never returned -> can't prove coherent
+.pvc_rxdone:
+        ; read the dest with NO cache flush: B -> fresh/coherent; anything else (A) -> stale/non-coherent
+        cmp     word [coh_rx_buf], COH_PAT_B
+        jne     .pvc_noncoherent
+        cmp     word [coh_rx_buf + 2], COH_PAT_B
+        jne     .pvc_noncoherent
+        dec     byte [coh_trials_left]
+        jnz     .pvc_trial
+        jmp     .pvc_cleanup                            ; all trials fresh -> g_flush_tier stays NONE
+
+.pvc_noncoherent:
+        ; CPU saw a stale line (or the probe couldn't run): pick the safe always-correct flush tier.
+        ; 486+ -> WBINVD; 386/286 (no WBINVD) -> software-evict (DEFERRED, docs/17 step 4). On QEMU this
+        ; branch is unreachable (no cache -> loopback always reads fresh).
+        mov     byte [g_flush_tier], FLUSH_TIER_EVICT
+        cmp     byte [g_cpu_class], CPU_80486
+        jb      .pvc_cleanup
+        mov     byte [g_flush_tier], FLUSH_TIER_WBINVD
+
+.pvc_cleanup:
+        ; clear loopback (Window 4 NET_DIAG &= ~INTERNAL_LB), then restore Window 1 (operating)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_W4_NET_DIAG
+        in      ax, dx
+        and     ax, (~EL3_NET_DIAG_INTERNAL_LB) & 0xFFFF
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W1_OPERATING
+        out     dx, ax
+        pop     es
+.pvc_done:
+        ret
+
+; cs_phys -- 20-bit physical address of CS:si -> dx:ax (dx = top 4 bits). Clobbers CX only. Cold helper.
+cs_phys:
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, si
+        adc     dx, 0
+        ret
+
+; coherency-probe cold scratch (reclaimed after install): a loopback TX source carrying pattern B (its
+; down-list reuses tx_descs), a dedicated RX up-descriptor, and the RX dest the card DMA-writes into.
+coh_tx_buf:      times COH_FRAME_LEN db 0
+coh_trials_left: db 0
+coh_up_desc:     times EL3_DESC_SIZE db 0
+coh_rx_buf:      times COH_BUF_LEN db 0
 
 ; detect_nic / id_read_eeprom / io_delay -- the real 3C509B ISA probe + activation.
 %include "el3_probe.asm"

@@ -16,6 +16,13 @@
 ; WBINVD is the safe universal flush (writes back THEN invalidates); never INVD (0F08) -- it discards dirty
 ; lines (data loss) and is only safe on a proven-write-through hierarchy. See docs/13.
 
+; Flush-tier ids -- the cold RX coherency self-test (phase_validate_coherency) records its verdict in
+; g_flush_tier; install maps the id to the resident helper below. (Kept as small ints, not helper
+; offsets, so the cold pass needn't know the resident layout.)
+FLUSH_TIER_NONE         equ 0                   ; coherent -> cache_flush_none
+FLUSH_TIER_WBINVD       equ 1                   ; non-coherent, 486+ -> cache_flush_wbinvd
+FLUSH_TIER_EVICT        equ 2                   ; non-coherent 386 software sweep -- DEFERRED (docs/17 step 4)
+
 cache_flush_none:
         ret                                     ; coherent: snoop / no cache / NC-effective / emulator
 

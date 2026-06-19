@@ -19,14 +19,20 @@ install:
         mov     byte [xms_nslots], 0
         mov     byte [g_rx_irq_masked], 0
         mov     byte [g_isr_busy], 0
-        ; Phase 2: default the DMA cache-flush helper to the coherent (no-flush) body. The cold coherency
-        ; self-test (docs/17 step 2) overrides it to WBINVD/evict on a non-coherent cache; until then -- and
-        ; on a snooping cache / no cache / the emulator -- it is a bare `ret`. A CFG_FORCE_FLUSH build forces
-        ; WBINVD to prove that path executes harmlessly under TCG (which models no cache).
+        ; Phase 2: bind the DMA cache-flush helper from the cold coherency verdict (g_flush_tier, set by
+        ; phase_validate_coherency before us). WBINVD on a non-coherent 486+; a bare `ret` (cache_flush_none)
+        ; otherwise -- coherent, a snooping cache, no cache, or the emulator. (FLUSH_TIER_EVICT, the non-
+        ; coherent-386 software sweep, is deferred per docs/17 step 4 and maps to none until it lands;
+        ; unreachable on QEMU, which models no cache so the probe always reads coherent.) A CFG_FORCE_FLUSH
+        ; build forces WBINVD to prove that path executes harmlessly under TCG.
 %ifdef CFG_FORCE_FLUSH
         mov     word [g_cache_flush_fn], cache_flush_wbinvd
 %else
         mov     word [g_cache_flush_fn], cache_flush_none
+        cmp     byte [g_flush_tier], FLUSH_TIER_WBINVD
+        jne     .flush_set
+        mov     word [g_cache_flush_fn], cache_flush_wbinvd
+.flush_set:
 %endif
         ; save the previous owner of the packet interrupt
         mov     ax, 0x3500 | PKTINT             ; AH=35h get-vector
