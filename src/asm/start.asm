@@ -134,6 +134,7 @@ segment _TEXT public class=CODE use16
 ;==============================================================================
 %include "resident.asm"             ; pkt_handler (INT 60h API)
 %include "isr.asm"                  ; nic_isr (RX + receiver upcall)
+%include "cache.asm"                ; bus-master DMA cache-coherency flush helper (Phase 2)
 
 g_nic_io:       resw 1              ; detected I/O base (command reg at +0x0E, windowed cfg at +0x00..)
 g_nic_irq:      resw 1              ; detected IRQ
@@ -149,6 +150,9 @@ g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking COPY ring (movsd) 
 g_async:        resb 1             ; 1 = zero-copy async TX ring available (AH=0xF1): any bus-master config (>=286)
 g_rx_cksum:     resb 1             ; 1 = RX checksum offload on -> sum IP+TCP+payload during the PIO drain (AH=0xF2)
 g_rx_cksum_val: resw 1             ; folded native-LE ones-complement sum of the last drained frame
+g_cache_flush_fn: resw 1           ; Phase 2: offset of the selected DMA cache-flush helper (cache.asm). The
+                                   ; DMA paths `call word [g_cache_flush_fn]`; the cold coherency self-test
+                                   ; (docs/17) picks the tier. Default cache_flush_none (coherent) until then.
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address

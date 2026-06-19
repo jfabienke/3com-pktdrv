@@ -434,6 +434,10 @@ dma_tx_enqueue:
 ; phys to DownListPtr and issue StartDmaDown. Sets tx_dma_busy. Enter DS=CS. Clobbers ax,bx,cx,dx.
 ;------------------------------------------------------------------------------
 tx_kick:
+        ; Phase 2: write back the frame bytes + descriptor before the bus master reads them (a write-back
+        ; cache could still hold the CPU's writes). Coherent/write-through/emulator -> a bare `ret`. Helper
+        ; preserves all GP regs + flags. (One flush per slot kick; a future opt could batch a burst.)
+        call    word [g_cache_flush_fn]
         mov     bx, [tx_ring_tail]
         mov     cl, 4
         shl     bx, cl                          ; tail * 16
@@ -569,6 +573,9 @@ dma_tx_single:
         pop     ax                      ; high word -> ax
         add     dx, 2
         out     dx, ax                  ; high word
+        ; Phase 2: write back the caller's frame + the descriptor before the card reads them (write-back
+        ; cache hazard). Coherent/write-through/emulator -> bare `ret`. Preserves all GP regs + flags.
+        call    word [g_cache_flush_fn]
         ; arm completion, then kick StartDmaDown (cmd 0x14, param != 0)
         mov     byte [g_tx_done], 0     ; cleared with IF=0, so the ISR can't race ahead
         mov     dx, [g_nic_io]
@@ -1030,6 +1037,10 @@ f_xms_poll:
         ; Hold off ISR reentrancy on the shared receiver ring while we drain + upcall (the ISR honours
         ; g_isr_busy and no-ops; the level-triggered source re-fires after we clear it).
         mov     byte [g_isr_busy], 1
+        ; Phase 2: ONE batched cache invalidate before reading any descriptor STATUS or slot payload, so a
+        ; non-coherent cache doesn't spin on a stale descriptor (the card wrote UP_COMPLETE) or read a stale
+        ; slot. Coherent/emulator -> a bare `ret` (nil cost). Helper preserves all GP regs + flags.
+        call    word [g_cache_flush_fn]
 .p_loop:
         mov     al, [xms_slot_idx]      ; desc = xms_rx_descs + xms_slot_idx * EL3_DESC_SIZE
         mov     ah, EL3_DESC_SIZE
