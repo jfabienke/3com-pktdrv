@@ -57,7 +57,8 @@ the V86 real-mode address range from user code. Both policies fall back to
 
 ## DMA descriptor mode vs. CPU tier
 
-_Last updated: 2026-06-18 17:12 CEST — CONV ring deepened 2 → `RX_RING_N` (8) slots._
+_Last updated: 2026-06-19 04:47 CEST — CONV ring deepened to `RX_RING_N` (8) slots;
+windowed-RX-DMA collapse traced to receive livelock and fixed with NAPI + backpressure._
 
 Ring **depth** and **layout** depend on the memory policy:
 
@@ -67,10 +68,26 @@ Ring **depth** and **layout** depend on the memory policy:
 - **`XMS_POLICY_CONV`** — one *contiguous* block of `RX_RING_N` slots. The
   caller passes only `phys0` (the block base); slot _i_ lives at
   `phys0 + i·slot_size`, and `3cpd.exe` builds every descriptor from that base.
-  A 2-slot ping-pong overruns under a windowed RX flood (a window of 4 collapsed
-  the old 2-slot CONV ring to ~0.14 Mbit/s); the deep ring absorbs the burst
-  (window 4 → 16.8 Mbit/s on a 386-class cell, `dropped=0`; the bus ceiling
-  ~48 Mbit/s on a Pentium, `dropped=0`).
+
+**Windowed RX-DMA needs three things working together** (an earlier note here
+credited the deep ring alone — that was measured on a misconfigured run that had
+silently fallen back to PIO; corrected below):
+
+1. **A deep ring** (`RX_RING_N` slots) to buffer the in-flight window.
+2. **Backpressure, not drop** — the el3 returns RETRY (not a phantom "delivered")
+   when the bus is busy or the ring is full, so the closed-loop source doesn't
+   advance its sequence over a frame the guest never got.
+3. **NAPI** (the real lever) — at 100 Mbit the RX IRQ rate outruns a CPU-bound
+   guest, so a per-IRQ ISR drain starves the stack's `net_poll` (**receive
+   livelock**): a window of 4 collapsed to ~0.14 Mbit/s regardless of ring depth.
+   The ISR masks `UP_COMPLETE` under load and defers; the stack drains the whole
+   ring from task context via `INT 60h AH=0xF0 AL=0x03`, then re-arms.
+
+With all three: window 4 → **15.1 Mbit/s** on a 386-class cell (486@shift7,
+`dropped=0`, and win 4/8 > win 1), **48.8 Mbit/s** (ISA ceiling) on a faster 486,
+and **9.6 Mbit/s = 96 % of wire** at 10 Mbit. The collapse was livelock, *not*
+ring depth — confirmed by 10 Mbit (slow enough that the guest keeps up) sustaining
+96 % at window 4 with the old 2-slot behaviour.
 
 | CPU | RX DMA mode | depth | `EL3_DESC_NEXT` |
 |-----|-------------|-------|-----------------|
