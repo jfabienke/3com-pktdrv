@@ -119,8 +119,18 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
    conv ring unchanged at 15.12 dropped=0 (486@sh7) / Pentium@sh3. `CFG_FORCE_FLUSH` still overrides to WBINVD.
    (Chose faithful emulator loopback over a driver-only timeout fallback so the probe's readback-compare path
    actually executes on the emulator, not just on real HW.)
-3. Descriptor coherency (Piece 3) + alignment (Piece 4). **(next)**
-4. (separate milestone) NC-region lift (Piece 5), behind the re-test gate.
+3. **DONE** (3cpd `ea57980`). Alignment (Piece 4): `tx_descs` `alignb 4→32`, `xms_rx_descs` `16→32`,
+   `tx_slots` (was unaligned) `→32` — descriptor blocks end on a cache line so they never false-share with
+   the CPU-hot ring counters (+48 resident bytes, DMA paths only). Descriptor coherency (Piece 3): the READ
+   side is already covered by step 1 + NAPI (the ISR only masks UP_COMPLETE and defers the armed conv ring to
+   `f_xms_poll`, whose batched invalidate precedes every descriptor STATUS read + the sole `xms_rx_deliver`;
+   PIO RX is uncacheable port I/O). Added the WRITE side: `f_xms_configure` writes back the just-built
+   descriptors before `StartDmaUp` (else a write-back cache could hand the bus master a STALE buffer ADDR →
+   DMA into the wrong memory = corruption). The hot per-slot RECYCLE-write race is the remaining non-coherent
+   gap NC closes (step 4). **Verified on QEMU:** 486@sh7 conv ring default NONE 15.12 dropped=0, FORCE_FLUSH
+   (WBINVD now also at the arm) 15.11 dropped=0 — no regression. (286 single-transfer keep boundary is
+   structural-only: QEMU i386 has no 286/386 CPU model, lower gens are a 486 model scaled by icount.)
+4. (separate milestone) NC-region lift (Piece 5), behind the re-test gate. **(next — the safe core is done)**
 
 ## What this does and doesn't prove
 
@@ -131,4 +141,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-19 22:15 CEST (steps 1–2 landed: flush scaffold + RX loopback self-test; faithful el3 internal loopback added to the emulator)._
+_Last updated: 2026-06-19 23:05 CEST (steps 1–3 landed: flush scaffold + RX loopback self-test + faithful el3 internal loopback + descriptor coherency/alignment; the safe core is complete — only the optional NC lift (step 4) remains)._
