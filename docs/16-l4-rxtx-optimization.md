@@ -1,6 +1,6 @@
 # 16 — L4 raw-TCP RX/TX optimization (the final matrix)
 
-_Last updated: 2026-06-17 17:34 CEST_
+_Last updated: 2026-06-19 12:04 CEST_
 
 This note records the end state of the L4 raw-TCP throughput work: the per-CPU RX/TX matrix with every
 optimization enabled, the levers that produced it, and — crucially — **which levers the `-icount` model
@@ -42,6 +42,40 @@ Two regimes, cleanly separated:
 | RX verify    | 12.21 | 20.20 | **+65%** |
 | TX sync      | 22.72 | 24.80 | +9% |
 | TX async     | 32.59 | 37.04 | +14% |
+
+## Conventional RX-DMA ring (`XMS_POLICY_CONV`) — experimental DMA-RX path
+
+The matrix above is the **PIO** RX path (the production datapath). The driver also has an experimental
+zero-copy **DMA** RX path — the doc-10 conventional landing ring (`XMS_POLICY_CONV`, 386+, bus-master `/d`).
+Measured separately (`MODE=rxvz`, `CBREAK=0` forces every frame onto the DMA ring), all `dropped=0`:
+
+| CPU (shift)  | 100M win=1 | 100M win=4 | 100M win=8 | 10M win=4       | bound by        |
+|--------------|-----------:|-----------:|-----------:|----------------:|-----------------|
+| 386 (sh7)    | 13.93      | 15.12      | 15.13      | 9.64 (96% wire) | CPU (tcp_input) |
+| 486 (sh5)    | —          | 48.82      | —          | —               | ISA bus ~48     |
+| Pentium (sh3)| —          | 48.83      | —          | —               | ISA bus ~48     |
+
+Windowing **helps** here (win 4/8 ≥ win 1) and the fast cells pin the ISA ceiling — but only after fixing a
+chain of bugs. The path needs **all three** of:
+
+1. **A deep ring** (`RX_RING_N` = 8) to buffer the in-flight window.
+2. **el3 backpressure** — the model returns RETRY (not a phantom "delivered") on bus-busy / ring-full, so
+   the closed-loop source can't advance its sequence over un-received frames.
+3. **NAPI** — at 100 Mbit the RX IRQ rate outruns a CPU-bound guest, so a per-IRQ ISR drain starves the
+   stack's poll loop (**receive livelock**): a window of 4 collapsed to ~0.14 Mbit/s at *any* ring depth.
+   The ISR masks `UP_COMPLETE` under load and the stack drains the whole ring from task context
+   (`INT 60h AH=0xF0 AL=0x03 f_xms_poll`), then re-arms.
+
+The collapse was **receive livelock, not ring depth** — confirmed by 10 Mbit (slow enough for the guest to
+keep up) sustaining 96 % of wire with the old 2-slot behavior. Two more fixes were required to even get
+clean numbers: a latent **BSS-zero bug** (the ring silently never armed, so an earlier "deep ring fixes it"
+claim was actually measuring PIO) and an **EEPROM busy-bit poll** (the Pentium read a bad MAC at the fast
+shift). See [`10-copybreak-pipelines.md`](10-copybreak-pipelines.md) for the ring design.
+
+> Pentium conv-ring cells are slow in **wall** time (~400 s to fill the 1.0 s-virtual window at shift=3, since
+> virtual time = guest-instructions × 2^shift); `l4-tx-test.sh` scales its watchdog default with the shift to
+> cover it. This is an `-icount` artifact, not a guest hang. The conv ring is experimental; the PIO matrix
+> above is the headline.
 
 ## The levers — and what the harness can see
 
