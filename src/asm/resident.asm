@@ -891,6 +891,12 @@ f_xms_configure:
         pop     ax
         add     dx, 2
         out     dx, ax
+        ; Phase 2 (docs/17 Piece 3, write side): write back the just-built descriptors (ADDR/LEN/STATUS)
+        ; before the card DMA-reads them. On a write-back cache those writes could still sit in cache, so
+        ; the bus master would read a STALE buffer address and DMA frames to the wrong physical memory --
+        ; corruption, not just a stall. Coherent / emulator -> a bare `ret`. (The hot per-slot RECYCLE write
+        ; race is the remaining non-coherent-HW gap that the NC descriptor region closes -- docs/17 step 4.)
+        call    word [g_cache_flush_fn]
         ; issue StartDmaUp
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD

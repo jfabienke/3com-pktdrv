@@ -217,11 +217,14 @@ global resident_end_pio
 
 ; bus-master TX-DMA structures -- kept ONLY when the DMA path is active (gated on g_use_dma), so
 ; they sit past resident_end_pio and the PIO floor drops them. RX is always PIO (no RX-DMA buffer/
-; descriptor), so only the TX descriptors + ring slots live here. dword-aligned; descriptor layout
-; matches the emulator EL3 Down desc (next/status/addr/length). tx_descs[0] doubles as the 286
-; single-transfer down descriptor (the ring is 386+ only); the TX slots below the single boundary
-; exist only for the 386+ ring, so the 286 path drops them too.
-                alignb 4
+; descriptor), so only the TX descriptors + ring slots live here. Descriptor layout matches the
+; emulator EL3 Down desc (next/status/addr/length). tx_descs[0] doubles as the 286 single-transfer
+; down descriptor (the ring is 386+ only); the TX slots below the single boundary exist only for the
+; 386+ ring, so the 286 path drops them too.
+; Phase 2 (docs/17 Piece 3/4): cache-line (32-byte) align the card-DMA-touched descriptor block so it
+; never shares a line with the CPU-hot ring counters below it (TX_RING_N*16 = 64 B = a clean 2 lines,
+; so the counters start on a fresh line) -- a future line-granular flush then can't corrupt either.
+                alignb 32
 tx_descs:       resb TX_RING_N * EL3_DESC_SIZE  ; TX ring descriptors (card DMA-reads them); [0] also serves the 286 single-transfer
                 alignb 4
 ; TX ring counters -- resident on ALL bus-master configs (incl. 286): the zero-copy async ring
@@ -254,9 +257,12 @@ g_rx_irq_masked: resb 1            ; NAPI: 1 = UP_COMPLETE IRQ masked under RX l
                 resb 1             ; pad to word alignment
 g_intr_enb_full: resw 1           ; full SetIntrEnb mask (incl UP_COMPLETE) saved at configure; the ISR
                                    ; masks UP_COMPLETE out of it, pkt_xms_poll re-arms with the full value
-                alignb 16
-; RX up-descriptor ring: RX_RING_N entries (16-byte aligned). CONV uses all N (deeper ring, contiguous
-; slots); XMS_COPY / 286 single-transfer use the first 2. desc[i] = xms_rx_descs + i*EL3_DESC_SIZE.
+                alignb 32
+; RX up-descriptor ring: RX_RING_N entries, cache-line (32-byte) aligned (Phase 2, docs/17 Piece 3:
+; the card writes UP_COMPLETE here and the CPU polls it -- a non-coherent cache must invalidate this
+; line before the poll, so it must not share a line with neighbouring CPU-written state; RX_RING_N*16 =
+; 128 B = a clean 4 lines). CONV uses all N (deeper ring, contiguous slots); XMS_COPY / 286 single-
+; transfer use the first 2. desc[i] = xms_rx_descs + i*EL3_DESC_SIZE.
 xms_rx_descs:   resb RX_RING_N * EL3_DESC_SIZE
 xms_rx_desc0    equ xms_rx_descs                    ; slot-0 alias (the XMS_COPY / 286 2-slot path)
 xms_rx_desc1    equ xms_rx_descs + EL3_DESC_SIZE    ; slot-1 alias
@@ -265,6 +271,9 @@ xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; acc
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
 
+                alignb 32                       ; Phase 2 (docs/17 Piece 4): cache-line align the DMA TX slots
+                                                ; (card reads them; TX_SLOT_SZ=1536 is a multiple of 32, so
+                                                ; every slot stays line-aligned) -- 386+-only, past the 286 boundary
 tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ COPY-ring frame slots (dma_tx_enqueue movsd's the frame in)
 
 resident_end:                      ; <== TSR keep boundary for the 386+ ring DMA path
