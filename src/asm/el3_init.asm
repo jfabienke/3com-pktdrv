@@ -91,9 +91,11 @@ el3_init:
 ; activation, before el3_init writes it back to Window 2.
 ;
 ; Generation-aware: the 3C515 (Corkscrew) relocated the EEPROM registers to the +0x2000 ISA
-; alias (cmd io+0x200A, data +2), vs the 3C509's io+0x0A/0x0C (Linux 3c515 + iPXE). A fixed
-; io_delay (~300 us > the 162 us read latency) covers both, sidestepping the differing busy
-; bit. Cold. Clobbers AX, BX, CX, DX, SI, DI, BP.
+; alias (cmd io+0x200A, data +2), vs the 3C509's io+0x0A/0x0C (Linux 3c515 + iPXE). Both put the
+; EepromBusy bit in command-register bit 15, so we POLL it after each read command -- a fixed
+; io_delay under-waits at a fast -icount shift (the read latency is virtual-time-gated), leaving
+; the driver to read the 0x8000 busy placeholder as the MAC (seen as MYMAC=800080008000 on the
+; Pentium cell). Cold. Clobbers AX, BX, CX, DX, SI, DI, BP.
 ;------------------------------------------------------------------------------
 el3_load_mac_io:
         mov     bx, [g_nic_io]
@@ -114,7 +116,20 @@ el3_load_mac_io:
         mov     ax, di
         or      ax, EL3_EE_READ            ; 0x80 | word addr -> issue read
         out     dx, ax
-        call    io_delay                   ; fixed wait > 162 us EEPROM read latency
+        ; Poll EepromBusy (command-register bit 15) until the read completes. Each IN advances the
+        ; emulator's virtual-time read gate, so this waits the true ~162 us latency at ANY -icount shift
+        ; (a fixed delay loop under-waits at a fast shift -> reads the 0x8000 busy value). Bounded so a
+        ; card/model that never asserts busy just falls through; io_delay then covers the latency.
+        push    cx
+        xor     cx, cx                     ; up to 65536 polls; exits early the moment busy clears
+.eebusy:
+        in      ax, dx                     ; command register: bit 15 = EepromBusy
+        test    ax, 0x8000
+        jz      .eeready
+        loop    .eebusy
+.eeready:
+        pop     cx
+        call    io_delay                   ; latency margin (busy-bit-less HW; harmless over-wait)
         mov     dx, bx
         add     dx, bp
         add     dx, 2                      ; data register = command + 2
