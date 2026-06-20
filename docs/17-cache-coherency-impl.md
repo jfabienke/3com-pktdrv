@@ -130,7 +130,27 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
    gap NC closes (step 4). **Verified on QEMU:** 486@sh7 conv ring default NONE 15.12 dropped=0, FORCE_FLUSH
    (WBINVD now also at the arm) 15.11 dropped=0 — no regression. (286 single-transfer keep boundary is
    structural-only: QEMU i386 has no 286/386 CPU model, lower gens are a 486 model scaled by icount.)
-4. (separate milestone) NC-region lift (Piece 5), behind the re-test gate. **(next — the safe core is done)**
+4. **NC-region lift (Piece 5), opt-in + re-test-gated. Split during implementation into 4a (done) + 4b (next):**
+   - **4a — DONE** (3cpd `5e5dece`). The framework: `/n=<id>` opt-in (1=OPTi 2=Eteq 3=UMC 4=SiS 254=synth;
+     explicit chipset, *not* a probe, so an unrecognized board never gets a speculative `0x22` write); `nc.asm`
+     resident per-chipset NC encode/write lifted from cache-kit (in-scope ISA ops flagged UNVERIFIED — the 4x
+     base-unit landmine — real-HW only); and the **re-test gate** — when the cold self-test finds the cache
+     non-coherent *and* `/n` is set, `phase_validate_coherency` marks a VIRGIN probe region NC (covering the
+     probe **descriptor + payload**, so it validates the card-write coherency the conv ring needs) and re-runs
+     the loopback trial. Fresh → `g_nc_effective`; stale → keep the flush. A wrong encoding can only KEEP the
+     flush (costs the optimization, never correctness). `f_xms_configure` marks the live conv pool NC when
+     validated. **Verified on QEMU:** `/n` absent → NONE 15.12 dropped=0; `/n=4` on the coherent emulator →
+     "NC=requested, not effective", 15.12 dropped=0; `CFG_FORCE_NC` + `/n=254` (synth, no port writes) drives
+     the whole flow → "NC=validated", WBINVD kept, 15.11 dropped=0. Inert by default (coherent verdict → NC
+     skipped); the effect needs real non-coherent 386/486 HW.
+   - **4b — NEXT (the flush-drop).** 4a marks the pool NC but **keeps the per-drain flush**, because the RX
+     descriptors live in the cached driver region (`xms_rx_descs`, ~33 near access sites) — the card writes
+     `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* doesn't cover them. So NC saves
+     nothing yet (the WBINVD that covers the descriptors is the cost). Closing it needs the descriptors in NC
+     too: either (a) **relocate** them into the NC pool (one region covers descriptors + payload; pervasive —
+     the 33 near sites become far) or (b) a **dedicated cache-line/granule-isolated descriptor block** that can
+     be NC-fenced without fencing hot driver memory (localized but +resident). 4b is the real datapath
+     decision; 4a is the validated, safe foundation under it.
 
 ## What this does and doesn't prove
 
@@ -141,4 +161,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-19 23:05 CEST (steps 1–3 landed: flush scaffold + RX loopback self-test + faithful el3 internal loopback + descriptor coherency/alignment; the safe core is complete — only the optional NC lift (step 4) remains)._
+_Last updated: 2026-06-20 00:05 CEST (steps 1–3 + 4a landed: safe core + the opt-in, re-test-gated NC framework. Implementation split step 4 into 4a (framework, done) and 4b (descriptor relocation to unlock the flush-drop, next))._
