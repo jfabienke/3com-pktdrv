@@ -897,6 +897,40 @@ f_xms_configure:
         ; corruption, not just a stall. Coherent / emulator -> a bare `ret`. (The hot per-slot RECYCLE write
         ; race is the remaining non-coherent-HW gap that the NC descriptor region closes -- docs/17 step 4.)
         call    word [g_cache_flush_fn]
+        ; --- Phase 2 step 4a (opt-in /n): if the cold re-test validated this chipset's NC mechanism, fence
+        ; the conv pool non-cacheable so the card's payload DMA is coherent. The per-drain flush is KEPT: the
+        ; RX descriptors still live in the cached driver region (xms_rx_descs) -- dropping the flush needs
+        ; them in NC too (descriptor relocation, docs/17 step 4b). CONV only (one contiguous phys pool). ---
+        cmp     byte [g_nc_effective], 0
+        je      .nc_skip
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV
+        jne     .nc_skip
+        mov     al, [xms_nslots]                ; ring_kb = ceil(nslots * slot_sz / 1024)
+        xor     ah, ah
+        mul     word [xms_slot_sz]              ; DX:AX = ring bytes (conv ring fits AX)
+        add     ax, 1023
+        mov     cl, 10
+        shr     ax, cl                          ; AX = ring_kb
+        push    ax
+        mov     es, [xms_cfg_seg]               ; base_kb = phys0 >> 10  (phys0 < 16 MB, validated above)
+        mov     bx, [xms_cfg_off]
+        mov     ax, [es:bx + XMS_CFG_phys0]
+        mov     dx, [es:bx + XMS_CFG_phys0 + 2]
+        mov     cl, 10
+        shr     ax, cl                          ; phys0_low >> 10
+        push    ax
+        mov     ax, dx
+        mov     cl, 6
+        shl     ax, cl                          ; phys0_high << 6 (its weight in phys >> 10)
+        pop     cx
+        or      ax, cx                          ; AX = base_kb
+        mov     bx, ax
+        and     bx, 0xFFC0                      ; BX = base aligned DOWN to 64 KB
+        sub     ax, bx                          ; AX = slack (base - aligned)
+        pop     cx                              ; CX = ring_kb
+        add     cx, ax                          ; CX = size_kb (slack + ring; nc_mark_region rounds to gran)
+        call    nc_mark_region                  ; BX=base_kb, CX=size_kb; CF=1 (can't encode) -> just skip
+.nc_skip:
         ; issue StartDmaUp
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
