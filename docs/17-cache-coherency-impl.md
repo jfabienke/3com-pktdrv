@@ -143,7 +143,7 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
      "NC=requested, not effective", 15.12 dropped=0; `CFG_FORCE_NC` + `/n=254` (synth, no port writes) drives
      the whole flow → "NC=validated", WBINVD kept, 15.11 dropped=0. Inert by default (coherent verdict → NC
      skipped); the effect needs real non-coherent 386/486 HW.
-   - **4b — IN PROGRESS. Split into the WB gate (done) + the descriptor relocation / flush-drop (next).**
+   - **4b — IN PROGRESS. WB gate (done) + VDS/COMMONBUF NC reachability (done) + descriptor relocation (next).**
      - **WB discriminator — DONE.** Chipset NC fences only help **386+ write-BACK** caches. They make no sense
        on a 286 (no on-chip cache; its DMA path is the single-transfer 2-slot, not the deep CONV ring), on a
        386+ with no cache (already coherent → tier NONE, NC never armed), or on a 386+ **write-through** cache
@@ -160,6 +160,25 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
        **Verified on QEMU:** default 3c515 `/5 /d` → `CACHE FLUSH=NONE (coherent)`, full conv-ring + NVMe
        round-trip PASS; `CFG_FORCE_NC` `/n=254` → the discriminator runs end-to-end (no hang), `CACHE
        FLUSH=WBINVD`, `NC=validated`, PASS. The WB/WT *logic* is real-HW-only (TCG models no cache).
+     - **VDS / COMMONBUF — NC reachable on real write-back machines — DONE.** A WB cache ⇒ 386+/486 ⇒ a paging
+       memory manager (EMM386/QEMM) is almost always loaded ⇒ **VDS** ⇒ the DMA ring lives in VDS-managed
+       memory, *not* the conventional `CONV` pool (the no-manager path). 4a fenced NC only under `CONV`, so on
+       the very WB machines NC exists for, it never fired. Closed that gap end to end:
+       - **Stack** (`dos-nvmeotcp` `vds.c`/`vds.h`, lifted from the old repo): VDS presence (BIOS 40:7Bh bit 5 +
+         Get Version), V86 detection (`SMSW` CR0.PE), and `vds_lock_region` — lock the conv ring **in place**
+         and take `DDS.physical` as the **true bus address** (`seg<<4` is a lie under a paging VMM). Contiguity
+         test = `buffer_id == 0` (VDS didn't need a bounce buffer) + a `< 16 MB` ISA range check. (Trust **CF**
+         for success, *not* AL — JEMM386 leaves AL≠0 on a successful lock.) `conv_ring_init` now returns the new
+         `COMMONBUF` policy under V86+VDS (`phys0` = bus address, `lin0` = the V86 segment the CPU reads in
+         place), or `CONV` in real mode, or PIO if V86 without usable VDS. Lock held until `xms_release`.
+       - **Driver** (`XMS_POLICY_COMMONBUF`): routes through the same contiguous CONV descriptor builder, but
+         delivers in place via `lin0` — a resident `g_lin_delta = lin0 - phys0` (0 for CONV) added to each
+         descriptor phys in the ISR. The NC-marking gate now covers `CONV` **and** `COMMONBUF`, fencing the
+         **true VDS physical** (`phys0`).
+       - **Verified on QEMU under JEMM386 (V86 + VDS):** `VDS avail=1 v86=1`, lock `rc=0 bid=0 isa=1`,
+         `CONVRING=on pol=4` (COMMONBUF), conv RX-DMA `[L4RX] delivered=6104260 dropped=0` (= the CONV path, no
+         regression); with `CFG_FORCE_NC /n=254` → `NC=validated` marking the VDS physical, still `dropped=0`.
+         Real-mode (HIMEMX only) stays `CONV pol=3`, unchanged. Harness: `JEMM386=1` env on `l4-tx-test.sh`.
      - **Descriptor relocation / flush-drop — NEXT.** 4a marks the pool NC but **keeps the per-drain flush**,
        because the RX descriptors live in the cached driver region (`xms_rx_descs`, ~33 near access sites) —
        the card writes `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* doesn't cover
@@ -178,4 +197,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-21 10:42 CEST (4b WB discriminator landed: `coh_is_writeback` gates NC to 386+ write-back caches — 286 / no-cache / write-through never arm it. Descriptor relocation (the flush-drop) is the remaining 4b piece. Steps 1–3 + 4a + the 4b WB gate are in; 4a refactored coh_one_trial into coh_build_descs/coh_start_dma)._
+_Last updated: 2026-06-21 14:18 CEST (4b VDS/COMMONBUF landed: lifted VDS (stack vds.c) + the COMMONBUF policy so NC is reachable on real write-back/EMM386 machines — the conv ring is VDS-locked for its true bus physical (contiguity + <16 MB test) and NC fences that physical; verified under JEMM386. Earlier 4b: WB discriminator (coh_is_writeback gates NC to 386+ WB). Steps 1–3 + 4a + 4b WB gate + 4b VDS/COMMONBUF are in; descriptor relocation (the flush-drop) is the remaining 4b piece)._

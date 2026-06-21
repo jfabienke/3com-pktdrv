@@ -773,6 +773,8 @@ f_xms_configure:
         ; VCPI/DPMI keep the 2 explicit-from-cfg slots (phys0/phys1 = two separate EMBs). ---
         cmp     byte [xms_rx_policy], XMS_POLICY_CONV
         je      .build_conv
+        cmp     byte [xms_rx_policy], XMS_POLICY_COMMONBUF      ; VDS-locked conv ring (same contiguous builder)
+        je      .build_conv
 .build_2slot:
         mov     byte [xms_nslots], 2
         ; build descriptor 0: ADDR=phys0, LEN=slot_size, STATUS=0, NEXT set below
@@ -898,13 +900,17 @@ f_xms_configure:
         ; race is the remaining non-coherent-HW gap that the NC descriptor region closes -- docs/17 step 4.)
         call    word [g_cache_flush_fn]
         ; --- Phase 2 step 4a (opt-in /n): if the cold re-test validated this chipset's NC mechanism, fence
-        ; the conv pool non-cacheable so the card's payload DMA is coherent. The per-drain flush is KEPT: the
+        ; the DMA pool non-cacheable so the card's payload DMA is coherent. The per-drain flush is KEPT: the
         ; RX descriptors still live in the cached driver region (xms_rx_descs) -- dropping the flush needs
-        ; them in NC too (descriptor relocation, docs/17 step 4b). CONV only (one contiguous phys pool). ---
+        ; them in NC too (descriptor relocation, docs/17 step 4b). CONV + COMMONBUF only (one contiguous phys
+        ; pool); for COMMONBUF phys0 is the TRUE VDS bus address (the chipset NC fences physical, docs/12). ---
         cmp     byte [g_nc_effective], 0
         je      .nc_skip
         cmp     byte [xms_rx_policy], XMS_POLICY_CONV
+        je      .nc_pool
+        cmp     byte [xms_rx_policy], XMS_POLICY_COMMONBUF
         jne     .nc_skip
+.nc_pool:
         mov     al, [xms_nslots]                ; ring_kb = ceil(nslots * slot_sz / 1024)
         xor     ah, ah
         mul     word [xms_slot_sz]              ; DX:AX = ring bytes (conv ring fits AX)
@@ -959,6 +965,15 @@ f_xms_configure:
         ; in xms_gdt[0..3]: CONV never uses the INT 15h GDT, and .next_done overwrites it with the (unused-
         ; for-CONV) GDT setup afterward, so it is free cold scratch. ---
 .build_conv:
+        ; Phase 2 4b: g_lin_delta = cfg.lin0 - cfg.phys0 (the in-place delivery linear-vs-physical offset).
+        ; 0 for CONV (lin0 == phys0, identity-mapped real mode); the V86 offset for COMMONBUF (lin0 = the
+        ; segment the CPU polls, phys0 = the VDS bus address). The ISR adds it to each descriptor phys.
+        mov     ax, [es:bx + XMS_CFG_lin0]
+        sub     ax, [es:bx + XMS_CFG_phys0]
+        mov     [g_lin_delta], ax
+        mov     ax, [es:bx + XMS_CFG_lin0 + 2]
+        sbb     ax, [es:bx + XMS_CFG_phys0 + 2]
+        mov     [g_lin_delta + 2], ax
         mov     byte [xms_nslots], 2            ; 286 single-transfer default
         cmp     byte [g_tx_ring], 0
         je      .conv_depth_set

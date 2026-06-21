@@ -383,13 +383,22 @@ xms_rx_deliver:
         mov     cx, [si + EL3_DESC_ADDR + 2]
         mov     [bp-4], cx              ; phys_hi
         cmp     byte [xms_rx_policy], XMS_POLICY_CONV
+        je      .lin_conv
+        cmp     byte [xms_rx_policy], XMS_POLICY_COMMONBUF
         jne     .lin_from_cfg
-        ; CONV: conventional memory is identity-mapped -> lin_seg = phys >> 4
+.lin_conv:
+        ; CONV/COMMONBUF: the slot is delivered IN PLACE; the CPU's segment = lin >> 4 where lin = the
+        ; descriptor's bus phys + g_lin_delta. Delta is 0 for CONV (identity-mapped real mode) and the V86
+        ; linear-vs-physical offset for COMMONBUF (VDS-locked under a paging VMM). conv buffer < 1 MB so the
+        ; result fits a 16-bit segment.
+        mov     ax, [bp-2]              ; phys_lo
+        add     ax, [g_lin_delta]
+        mov     dx, [bp-4]              ; phys_hi
+        adc     dx, [g_lin_delta + 2]  ; dx:ax = lin (CPU V86 linear of the slot)
         mov     cl, 4
-        shr     ax, cl                  ; ax = phys_lo >> 4
-        mov     dx, [bp-4]              ; phys_hi (<= 0x000F for conv < 1MB)
+        shr     ax, cl                  ; ax = lin_lo >> 4
         mov     cl, 12
-        shl     dx, cl
+        shl     dx, cl                  ; dx = lin_hi << 12  (lin < 1 MB -> lin_hi <= 0x000F)
         or      ax, dx
         mov     [bp-6], ax              ; lin_seg
         jmp     .addrs_got

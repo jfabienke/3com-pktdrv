@@ -35,7 +35,10 @@ XMS_POLICY_DPMI     equ 1       ; XMS + DPMI 1.0 AX=0508h -> zero CPU copies
 XMS_POLICY_XMS_COPY equ 2       ; XMS + INT 15h AH=87h staging -> one CPU copy
 XMS_POLICY_CONV     equ 3       ; ring slots in CONVENTIONAL memory (phys = seg*16) -> deliver in place,
                                 ; NO copy. The doc-10 zero-copy landing ring (mandatory on 286/386).
-XMS_POLICY_MAX      equ 3       ; CONFIGURE validation bound (cfg.policy must be <= this)
+XMS_POLICY_COMMONBUF equ 4      ; CONV under a paging VMM: the buffer is VDS-locked so phys0 is the TRUE
+                                ; bus address (!= seg<<4) and lin0 is the V86 segment the CPU polls/reads.
+                                ; Contiguous + <16 MB by VDS construction -> the chipset NC fence covers it.
+XMS_POLICY_MAX      equ 4       ; CONFIGURE validation bound (cfg.policy must be <= this)
 
 ; ---- RX ring depth -----------------------------------------------------
 ; CONV (conventional, contiguous) uses an N-slot ring so a windowed RX flood doesn't overrun the

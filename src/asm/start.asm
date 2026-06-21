@@ -167,6 +167,11 @@ g_nc_chipset:   resb 1             ; Phase 2 step 4: /n=<id> opt-in NC chipset (
                                    ; cold arg scan, read at f_xms_configure (resident) -> must NOT be in cold BSS.
 g_nc_effective: resb 1             ; 1 = the cold NC re-test confirmed NC fences the cache -> f_xms_configure marks
                                    ; the ring NC and drops the flush. 0 (default/emulator) -> keep the flush tier.
+g_lin_delta:    resd 1             ; Phase 2 4b: CONV/COMMONBUF in-place delivery linear-vs-physical offset =
+                                   ; cfg.lin0 - cfg.phys0 (set in f_xms_configure .build_conv). 0 for CONV (real
+                                   ; mode, identity-mapped). Under a paging VMM (COMMONBUF/VDS) phys0 is the bus
+                                   ; address and lin0 the V86 linear the CPU uses; the ISR recovers each slot's
+                                   ; CPU segment as (descriptor.phys + g_lin_delta) >> 4. RESIDENT (ISR reads it).
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
