@@ -143,14 +143,31 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
      "NC=requested, not effective", 15.12 dropped=0; `CFG_FORCE_NC` + `/n=254` (synth, no port writes) drives
      the whole flow → "NC=validated", WBINVD kept, 15.11 dropped=0. Inert by default (coherent verdict → NC
      skipped); the effect needs real non-coherent 386/486 HW.
-   - **4b — NEXT (the flush-drop).** 4a marks the pool NC but **keeps the per-drain flush**, because the RX
-     descriptors live in the cached driver region (`xms_rx_descs`, ~33 near access sites) — the card writes
-     `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* doesn't cover them. So NC saves
-     nothing yet (the WBINVD that covers the descriptors is the cost). Closing it needs the descriptors in NC
-     too: either (a) **relocate** them into the NC pool (one region covers descriptors + payload; pervasive —
-     the 33 near sites become far) or (b) a **dedicated cache-line/granule-isolated descriptor block** that can
-     be NC-fenced without fencing hot driver memory (localized but +resident). 4b is the real datapath
-     decision; 4a is the validated, safe foundation under it.
+   - **4b — IN PROGRESS. Split into the WB gate (done) + the descriptor relocation / flush-drop (next).**
+     - **WB discriminator — DONE.** Chipset NC fences only help **386+ write-BACK** caches. They make no sense
+       on a 286 (no on-chip cache; its DMA path is the single-transfer 2-slot, not the deep CONV ring), on a
+       386+ with no cache (already coherent → tier NONE, NC never armed), or on a 386+ **write-through** cache
+       (CPU writes reach memory immediately → the card reads them fresh → invalidation, not chipset NC, is the
+       right tool). But the base self-test only probes the card-WRITE→CPU-READ direction, which reads stale on
+       **both** WT and WB — so a WT board would look NC-eligible. Added `coh_is_writeback` (`start.asm`): on a
+       486+ it builds the loopback descriptors, writes `OLD` to a cached src + `WBINVD` (lands descriptors AND
+       `src=OLD` in memory so the card reads them coherently on the very WB cache being probed), writes `NEW`
+       with **no** flush, then loopback-reads src into a **virgin** dest — `dest==OLD` ⇒ the card saw stale
+       memory ⇒ write-back (NC-eligible); `dest==NEW` ⇒ write-through/no-cache ⇒ keep the flush. The `.pvc_nc`
+       gate now requires 486+ **and** a WB verdict before marking NC (`<486` skips — the 386 evict tier is
+       deferred). `CFG_FORCE_NC` runs the probe then forces the WB verdict so the synth NC re-test stays
+       exercised. Factored the loopback into `coh_build_descs` + `coh_start_dma` (shared with `coh_one_trial`).
+       **Verified on QEMU:** default 3c515 `/5 /d` → `CACHE FLUSH=NONE (coherent)`, full conv-ring + NVMe
+       round-trip PASS; `CFG_FORCE_NC` `/n=254` → the discriminator runs end-to-end (no hang), `CACHE
+       FLUSH=WBINVD`, `NC=validated`, PASS. The WB/WT *logic* is real-HW-only (TCG models no cache).
+     - **Descriptor relocation / flush-drop — NEXT.** 4a marks the pool NC but **keeps the per-drain flush**,
+       because the RX descriptors live in the cached driver region (`xms_rx_descs`, ~33 near access sites) —
+       the card writes `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* doesn't cover
+       them. So NC saves nothing yet (the WBINVD that covers the descriptors is the cost). Closing it needs the
+       descriptors in NC too: **(a) relocate** them into the NC pool (one region covers descriptors + payload;
+       the 33 near sites become far) is preferred over **(b)** a dedicated granule-isolated block (needs a
+       scarce 2nd chipset region). Gated so the proven path (286/no-cache/WT/coherent) is untouched and only
+       the 386+ WB CONV ring relocates + drops the flush.
 
 ## What this does and doesn't prove
 
@@ -161,4 +178,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-20 00:05 CEST (steps 1–3 + 4a landed: safe core + the opt-in, re-test-gated NC framework. Implementation split step 4 into 4a (framework, done) and 4b (descriptor relocation to unlock the flush-drop, next))._
+_Last updated: 2026-06-21 10:42 CEST (4b WB discriminator landed: `coh_is_writeback` gates NC to 386+ write-back caches — 286 / no-cache / write-through never arm it. Descriptor relocation (the flush-drop) is the remaining 4b piece. Steps 1–3 + 4a + the 4b WB gate are in; 4a refactored coh_one_trial into coh_build_descs/coh_start_dma)._

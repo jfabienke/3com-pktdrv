@@ -802,6 +802,21 @@ phase_validate_coherency:
         ; flush stays armed here -- it is dropped only at configure, only after the ring is actually marked. ---
         cmp     byte [g_nc_chipset], NC_CHIP_NONE
         je      .pvc_cleanup
+        ; --- Phase 2 step 4b GATE: chipset NC fences only help WRITE-BACK caches. The base test above flags
+        ; non-coherence from the RX-READ direction (card writes, CPU reads stale), which fires identically on
+        ; write-through AND write-back -- but on a write-through cache the CPU's writes reach memory at once
+        ; (the card reads them fresh) so chipset NC is the WRONG tool; invalidation already suffices there.
+        ; Probe the CPU-WRITE->card-READ direction to tell WB from WT. <486 can't WBINVD-probe and the 386
+        ; software-evict tier is deferred (docs/17), so don't arm NC below a 486. ---
+        cmp     byte [g_cpu_class], CPU_80486
+        jb      .pvc_cleanup                            ; <486: no WB probe -> keep the flush, never mark NC
+        call    coh_is_writeback                        ; CF=1 -> write-back (NC-eligible); CF=0 -> write-through
+%ifdef CFG_FORCE_NC
+        stc                                             ; structural test: the cacheless emulator probes as
+                                                        ; write-through, so force the WB verdict to keep the
+                                                        ; NC mark + re-test path exercised under CFG_FORCE_NC
+%endif
+        jnc     .pvc_cleanup                            ; write-through / no cache -> NC not the tool -> keep flush
         ; Base the NC window on coh_up_desc (the probe DESCRIPTOR the card writes UP_COMPLETE into, which
         ; coh_one_trial polls) so the re-test validates BOTH descriptor + payload coherency under NC, not
         ; just the payload. 128 KB span robustly covers coh_up_desc..coh_nc_buf even across a 64 KB boundary.
@@ -853,58 +868,9 @@ coh_one_trial:
         mov     word [di + 2], COH_PAT_A
         mov     word [coh_tx_buf],     COH_PAT_B        ; (re)stamp the loopback source with B
         mov     word [coh_tx_buf + 2], COH_PAT_B
-        ; up-descriptor: NEXT=0, STATUS=0, ADDR=phys(DI), LEN=capacity
-        mov     si, di
-        call    cs_phys
-        mov     [coh_up_desc + EL3_DESC_ADDR], ax
-        mov     [coh_up_desc + EL3_DESC_ADDR + 2], dx
-        xor     ax, ax
-        mov     [coh_up_desc + EL3_DESC_NEXT], ax
-        mov     [coh_up_desc + EL3_DESC_NEXT + 2], ax
-        mov     [coh_up_desc + EL3_DESC_STATUS], ax
-        mov     [coh_up_desc + EL3_DESC_STATUS + 2], ax
-        mov     word [coh_up_desc + EL3_DESC_LEN], COH_BUF_LEN
-        mov     [coh_up_desc + EL3_DESC_LEN + 2], ax
-        ; down-descriptor (reuse tx_descs): ADDR=phys(coh_tx_buf), LEN=frame
-        mov     si, coh_tx_buf
-        call    cs_phys
-        mov     [tx_descs + EL3_DESC_ADDR], ax
-        mov     [tx_descs + EL3_DESC_ADDR + 2], dx
-        xor     ax, ax
-        mov     [tx_descs + EL3_DESC_NEXT], ax
-        mov     [tx_descs + EL3_DESC_NEXT + 2], ax
-        mov     [tx_descs + EL3_DESC_STATUS], ax
-        mov     [tx_descs + EL3_DESC_STATUS + 2], ax
-        mov     word [tx_descs + EL3_DESC_LEN], COH_FRAME_LEN
-        mov     [tx_descs + EL3_DESC_LEN + 2], ax
-        ; arm RX: UpListPtr <- phys(coh_up_desc); StartDmaUp
-        mov     si, coh_up_desc
-        call    cs_phys
-        push    dx
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CS_UP_LIST_PTR
-        out     dx, ax
-        pop     ax
-        add     dx, 2
-        out     dx, ax
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_UP
-        out     dx, ax
-        ; kick TX (loopback): DownListPtr <- phys(tx_descs); StartDmaDown
-        mov     si, tx_descs
-        call    cs_phys
-        push    dx
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CS_DOWN_LIST_PTR
-        out     dx, ax
-        pop     ax
-        add     dx, 2
-        out     dx, ax
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_DOWN
-        out     dx, ax
+        mov     si, coh_tx_buf                          ; SI=src, DI=dest -> build descriptors + start the DMA
+        call    coh_build_descs
+        call    coh_start_dma
         ; poll UP_COMPLETE, bounded by elapsed BIOS ticks
         xor     ax, ax
         mov     es, ax
@@ -929,6 +895,125 @@ coh_one_trial:
         stc
         ret
 
+;------------------------------------------------------------------------------
+; coh_build_descs -- build the internal-loopback descriptor pair: RX up-descriptor dest=DI (LEN=COH_BUF_LEN
+; capacity), TX down-descriptor src=SI (LEN=COH_FRAME_LEN, reuses tx_descs); NEXT/STATUS=0. Does NOT touch
+; the buffer contents. Preserves DI,SI; clobbers AX,BX,CX,DX. Split from coh_start_dma so the WB probe can
+; WBINVD BETWEEN building the descriptors and starting the DMA (so the flush also lands the descriptors in
+; memory -> the card reads them coherently on the very write-back cache being probed). Cold.
+;------------------------------------------------------------------------------
+coh_build_descs:
+        push    di
+        push    si
+        mov     si, di                                  ; up-descriptor: ADDR=phys(DI)
+        call    cs_phys
+        mov     [coh_up_desc + EL3_DESC_ADDR], ax
+        mov     [coh_up_desc + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [coh_up_desc + EL3_DESC_NEXT], ax
+        mov     [coh_up_desc + EL3_DESC_NEXT + 2], ax
+        mov     [coh_up_desc + EL3_DESC_STATUS], ax
+        mov     [coh_up_desc + EL3_DESC_STATUS + 2], ax
+        mov     word [coh_up_desc + EL3_DESC_LEN], COH_BUF_LEN
+        mov     [coh_up_desc + EL3_DESC_LEN + 2], ax
+        pop     si                                      ; down-descriptor (tx_descs): ADDR=phys(SI=src)
+        push    si
+        call    cs_phys
+        mov     [tx_descs + EL3_DESC_ADDR], ax
+        mov     [tx_descs + EL3_DESC_ADDR + 2], dx
+        xor     ax, ax
+        mov     [tx_descs + EL3_DESC_NEXT], ax
+        mov     [tx_descs + EL3_DESC_NEXT + 2], ax
+        mov     [tx_descs + EL3_DESC_STATUS], ax
+        mov     [tx_descs + EL3_DESC_STATUS + 2], ax
+        mov     word [tx_descs + EL3_DESC_LEN], COH_FRAME_LEN
+        mov     [tx_descs + EL3_DESC_LEN + 2], ax
+        pop     si
+        pop     di
+        ret
+
+;------------------------------------------------------------------------------
+; coh_start_dma -- kick the loopback: UpListPtr <- phys(coh_up_desc) + StartDmaUp, then DownListPtr <-
+; phys(tx_descs) + StartDmaDown. Reads only the descriptor ADDRESSES (cs_phys, not memory) so it leaves the
+; just-flushed descriptor bytes untouched. Clobbers AX,CX,DX,SI. Cold.
+;------------------------------------------------------------------------------
+coh_start_dma:
+        mov     si, coh_up_desc                         ; arm RX
+        call    cs_phys
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        mov     si, tx_descs                            ; kick TX (loopback)
+        call    cs_phys
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_DOWN
+        out     dx, ax
+        ret
+
+;------------------------------------------------------------------------------
+; coh_is_writeback -- WRITE-BACK vs write-through discriminator (486+; WBINVD available). Chipset NC fences
+; only help write-back caches: on a write-through cache the CPU's writes reach memory immediately so the bus
+; master reads them fresh, and chipset NC is the wrong tool (invalidation already suffices). Probe the
+; CPU-WRITE->card-READ direction (the base test only probes card-WRITE->CPU-READ, which is stale on BOTH WT
+; and WB):
+;   - build the descriptors, write OLD into the (cached) src, then WBINVD -> memory holds the descriptors
+;     AND src=OLD, cache clean
+;   - write NEW into src with NO flush -> WB: cache=NEW dirty, memory[src] STILL OLD; WT: memory[src]=NEW
+;   - loopback src -> a VIRGIN dest (the card DMA-reads memory[src]); read the dest (virgin first-touch is a
+;     fresh memory read): dest == OLD -> the card saw stale memory -> WRITE-BACK (CF=1, NC-eligible)
+;                         dest == NEW -> the card saw fresh memory -> write-through / no cache (CF=0)
+; coh_wb_dst is 32-aligned + untouched after the WBINVD so its first cache line can't be pre-loaded (which
+; would fake a fresh read). The settle poll is non-coherent on a cached system -> it just bounds a delay; the
+; verdict is the virgin dest. On the cacheless emulator memory always = NEW -> CF=0 (correctly not-WB; the
+; CFG_FORCE_NC call site overrides to keep the NC structural test alive). Clobbers AX,BX,CX,DX,SI,DI,ES. Cold.
+;------------------------------------------------------------------------------
+WB_PAT_OLD      equ 0x0F0F                              ; pre-flush memory value (seen iff writes sit dirty in cache)
+WB_PAT_NEW      equ 0xF0F0                              ; post-flush value written WITHOUT a flush
+coh_is_writeback:
+        mov     di, coh_wb_dst                          ; dest = virgin; src = coh_wb_src
+        mov     si, coh_wb_src
+        call    coh_build_descs                         ; build BEFORE the WBINVD so the flush lands them too
+        mov     word [coh_wb_src],     WB_PAT_OLD       ; src = OLD (cached, dirty)
+        mov     word [coh_wb_src + 2], WB_PAT_OLD
+        db      0x0F, 0x09                              ; WBINVD: descriptors + src(OLD) -> memory; invalidate
+        mov     word [coh_wb_src],     WB_PAT_NEW       ; src = NEW, NO flush (WB: memory stays OLD; WT: -> NEW)
+        mov     word [coh_wb_src + 2], WB_PAT_NEW
+        call    coh_start_dma                           ; card DMA-reads memory[src] -> virgin dest
+        xor     ax, ax
+        mov     es, ax
+        mov     bx, [es:BIOS_TICK_COUNT]
+.wb_wait:
+        test    word [coh_up_desc + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
+        jnz     .wb_settled
+        mov     ax, [es:BIOS_TICK_COUNT]
+        sub     ax, bx
+        cmp     ax, EL3_DMA_TX_TICKS
+        jb      .wb_wait
+.wb_settled:
+        cmp     word [coh_wb_dst], WB_PAT_OLD           ; virgin -> fresh memory read; OLD -> WRITE-BACK
+        jne     .wb_through
+        stc                                             ; write-back -> NC-eligible
+        ret
+.wb_through:
+        clc                                             ; write-through / no cache -> NC not the tool
+        ret
+
 ; cs_phys -- 20-bit physical address of CS:si -> dx:ax (dx = top 4 bits). Clobbers CX only. Cold helper.
 cs_phys:
         mov     ax, cs
@@ -949,6 +1034,13 @@ coh_up_desc:     times EL3_DESC_SIZE db 0
 coh_rx_buf:      times COH_BUF_LEN db 0
 coh_nc_buf:      times COH_BUF_LEN db 0          ; VIRGIN buffer for the NC re-test (untouched until then, so no
                                                 ; stale cached line from the base trials can fake a "fresh" read)
+; WB-discriminator buffers (coh_is_writeback): the card reads coh_wb_src (CPU-written) and RX-DMAs into the
+; VIRGIN coh_wb_dst. 32-byte aligned so coh_wb_dst's first cache line is never shared with coh_wb_src -- else
+; writing coh_wb_src=NEW would pre-cache coh_wb_dst's line and fake a "fresh" read on a write-back cache.
+        alignb 32
+coh_wb_src:      times COH_FRAME_LEN db 0
+        alignb 32
+coh_wb_dst:      times COH_BUF_LEN db 0
 
 ; detect_nic / id_read_eeprom / io_delay -- the real 3C509B ISA probe + activation.
 %include "el3_probe.asm"
