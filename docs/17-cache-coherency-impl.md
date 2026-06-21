@@ -179,6 +179,27 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
          `CONVRING=on pol=4` (COMMONBUF), conv RX-DMA `[L4RX] delivered=6104260 dropped=0` (= the CONV path, no
          regression); with `CFG_FORCE_NC /n=254` → `NC=validated` marking the VDS physical, still `dropped=0`.
          Real-mode (HIMEMX only) stays `CONV pol=3`, unchanged. Harness: `JEMM386=1` env on `l4-tx-test.sh`.
+     - **DMA fallback ladder + V86 safety — DONE.** What happens when the zero-copy ring can't be set up safely:
+       - **WB w/o VDS (V86, no VDS host).** The driver now makes the documented `DMA_POLICY_FORBID` explicit:
+         `dma_v86_forbid_check` (`build_plan`) does `SMSW` (CR0.PE) + the BIOS-data VDS flag (40:7Bh bit 5);
+         **V86 && no VDS → force PIO** (`g_use_dma`/`g_async`/`g_tx_ring` = 0). Real mode keeps DMA; V86 *with*
+         VDS keeps DMA. (Note: even without this, TX DMA was already safe — `phase_validate_dma` DMAs with
+         `seg<<4` and polls the descriptor at its V86-linear; under a remapping map those target different
+         physical → timeout → PIO. So the guard is the *explicit, fast* form of what test-before-trust already
+         enforced empirically.) Verified on QEMU: real mode `DMA=ON` CONV pol=3; JEMM386 (V86+VDS) `DMA=ON`
+         COMMONBUF pol=4; forced no-VDS `DMA=PIO` (RX falls to PIO, dropped=0).
+       - **>16 MB / non-contiguous → PIO** (for the *zero-copy* ring). A conventional buffer is always <1 MB so
+         `>16 MB` can't actually arise here; non-contiguous can only happen on a remapping VMM that fragments
+         the conv block's physical pages — there `vds_lock_region` reports a bounce (`buffer_id != 0`) /
+         `vds_phys_isa_ok` fails → `conv_ring_init` returns NONE → the caller uses **PIO**. A VDS *common
+         buffer* (`request_buffer`) would keep DMA alive but only via Copy-In/Out per frame — i.e. a copy
+         model, which is exactly the **existing `XMS_COPY` policy** (extended EMBs are contiguous by XMS
+         construction and their XMS-lock physical is correct under V86, since EMM386 doesn't page extended
+         memory). So the layered fallback is: **COMMONBUF/CONV** (zero-copy) → **XMS_COPY** (copy-DMA, the path
+         the TSR already uses) → **PIO** (floor). Reimplementing `request_buffer` for the conv ring would just
+         duplicate `XMS_COPY`, so it's deliberately not added; scatter-gather (a descriptor per fragment) is the
+         only zero-copy-preserving option for the fragmented case and isn't worth its complexity for that rare
+         combo (remapping VMM + slow CPU).
      - **Descriptor relocation / flush-drop — NEXT.** 4a marks the pool NC but **keeps the per-drain flush**,
        because the RX descriptors live in the cached driver region (`xms_rx_descs`, ~33 near access sites) —
        the card writes `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* doesn't cover
@@ -197,4 +218,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-21 14:18 CEST (4b VDS/COMMONBUF landed: lifted VDS (stack vds.c) + the COMMONBUF policy so NC is reachable on real write-back/EMM386 machines — the conv ring is VDS-locked for its true bus physical (contiguity + <16 MB test) and NC fences that physical; verified under JEMM386. Earlier 4b: WB discriminator (coh_is_writeback gates NC to 386+ WB). Steps 1–3 + 4a + 4b WB gate + 4b VDS/COMMONBUF are in; descriptor relocation (the flush-drop) is the remaining 4b piece)._
+_Last updated: 2026-06-21 20:51 CEST (4b DMA fallback ladder + V86 safety landed: driver `dma_v86_forbid_check` makes DMA_POLICY_FORBID explicit (V86 + no VDS → PIO); documented the COMMONBUF/CONV → XMS_COPY → PIO ladder for >16 MB / non-contiguous. Earlier 4b: WB discriminator + VDS/COMMONBUF (NC reaches real WB/EMM386 machines). Steps 1–3 + 4a + 4b WB gate + 4b VDS/COMMONBUF + 4b fallback/V86-guard are in; descriptor relocation (the flush-drop) is the remaining 4b piece)._

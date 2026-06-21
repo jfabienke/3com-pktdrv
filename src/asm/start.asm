@@ -1121,6 +1121,34 @@ build_plan:
         mov     byte [g_use_large], 1
         mov     word [g_rx_len_mask], 0x1FFF     ; 13-bit length field (FDDI-sized RX)
 .large_resolved:
+        call    dma_v86_forbid_check    ; V86 + no VDS -> force the PIO floor (dma.h DMA_POLICY_FORBID)
+        ret
+
+;------------------------------------------------------------------------------
+; dma_v86_forbid_check -- under a paging memory manager (V86) WITHOUT VDS we cannot get a safe bus-master
+; physical (seg<<4 is a lie when low memory is remapped, and there's no VDS to translate/lock), so fall
+; back to the PIO floor -- dma.h's DMA_POLICY_FORBID. Real mode keeps DMA (seg<<4 valid). V86 *with* VDS
+; keeps DMA too: TX seg<<4 correctness is then proven empirically by phase_validate_dma (its descriptor
+; poll mismatches under a remapping map -> timeout -> PIO) and the RX conv ring gets the true physical from
+; the VDS-locking stack (XMS_POLICY_COMMONBUF). Cold; clobbers AX, ES. Only reached on >=286 (SMSW).
+;------------------------------------------------------------------------------
+dma_v86_forbid_check:
+        cmp     byte [g_use_dma], 0
+        je      .dvf_done               ; already PIO -> nothing to forbid
+        push    es
+        db      0x0F, 0x01, 0xE0        ; SMSW AX (bytes: legal in V86, 286+; the DMA path is >=286)
+        test    ax, 1                   ; CR0.PE: 1 = a protected-mode host is paging us (V86); 0 = real mode
+        jz      .dvf_keep               ; real mode -> seg<<4 is the bus address -> keep DMA
+        xor     ax, ax
+        mov     es, ax
+        test    byte [es:0x047B], 0x20  ; BIOS data 0040:007Bh bit 5 = VDS available
+        jnz     .dvf_keep               ; V86 + VDS -> keep DMA (phys proven by the bus-master test + stack VDS)
+        mov     byte [g_use_dma], 0     ; V86 + no VDS -> can't address safely -> PIO floor
+        mov     byte [g_async], 0
+        mov     byte [g_tx_ring], 0
+.dvf_keep:
+        pop     es
+.dvf_done:
         ret
 
 ;------------------------------------------------------------------------------
