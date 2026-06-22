@@ -143,7 +143,7 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
      "NC=requested, not effective", 15.12 dropped=0; `CFG_FORCE_NC` + `/n=254` (synth, no port writes) drives
      the whole flow → "NC=validated", WBINVD kept, 15.11 dropped=0. Inert by default (coherent verdict → NC
      skipped); the effect needs real non-coherent 386/486 HW.
-   - **4b — IN PROGRESS. WB gate (done) + VDS/COMMONBUF NC reachability (done) + descriptor relocation (next).**
+   - **4b — DONE. WB gate + VDS/COMMONBUF NC reachability + DMA fallback ladder + descriptor relocation.**
      - **WB discriminator — DONE.** Chipset NC fences only help **386+ write-BACK** caches. They make no sense
        on a 286 (no on-chip cache; its DMA path is the single-transfer 2-slot, not the deep CONV ring), on a
        386+ with no cache (already coherent → tier NONE, NC never armed), or on a 386+ **write-through** cache
@@ -200,14 +200,31 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
          duplicate `XMS_COPY`, so it's deliberately not added; scatter-gather (a descriptor per fragment) is the
          only zero-copy-preserving option for the fragmented case and isn't worth its complexity for that rare
          combo (remapping VMM + slow CPU).
-     - **Descriptor relocation / flush-drop — NEXT.** 4a marks the pool NC but **keeps the per-drain flush**,
-       because the RX descriptors live in the cached driver region (`xms_rx_descs`, ~33 near access sites) —
-       the card writes `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* doesn't cover
-       them. So NC saves nothing yet (the WBINVD that covers the descriptors is the cost). Closing it needs the
-       descriptors in NC too: **(a) relocate** them into the NC pool (one region covers descriptors + payload;
-       the 33 near sites become far) is preferred over **(b)** a dedicated granule-isolated block (needs a
-       scarce 2nd chipset region). Gated so the proven path (286/no-cache/WT/coherent) is untouched and only
-       the 386+ WB CONV ring relocates + drops the flush.
+     - **Descriptor relocation / flush-drop — DONE.** 4a marked the pool NC but *kept* the per-drain flush,
+       because the RX descriptors lived in the cached driver region (`xms_rx_descs`) — the card writes
+       `UP_COMPLETE` there for the CPU to poll, and an NC region over the *pool* didn't cover them. So NC saved
+       nothing (the WBINVD covering the descriptors was still the cost). Closed it by relocating the descriptors
+       **into the NC pool** (chosen over a dedicated granule-isolated block, which needs a scarce 2nd chipset
+       region): one region now covers descriptors + payload, so the per-drain flush drops.
+       - **One parameterised path, not dual.** Three resident vars locate the descriptor block: `g_desc_far`
+         (CPU far ptr), `g_desc_phys` (card-facing physical), `g_rx_flush_fn` (the *per-drain* RX helper,
+         separate from the TX `g_cache_flush_fn`). Every descriptor access (the `.build_conv` loop, the
+         `UP_LIST`/`NEXT` arm, the ISR `xms_rx_deliver` STATUS/ADDR/recycle, the `f_xms_poll` drain) goes
+         through them. Defaults (`CS:xms_rx_descs`, `phys(CS:xms_rx_descs)`, the flush tier) reproduce the
+         cached path byte-for-byte — verified by no-regression. The 286 2-slot pre-arm stays near (it never
+         relocates: `g_nc_effective` ⇒ 486+ ⇒ deep ring).
+       - **Layout.** The stack reserves a `DESC_BLOCK` (`RX_RING_N * 16 B`) at the **pool END** (past the
+         slots). When `g_nc_effective` + CONV/COMMONBUF + 386+ ring, `f_xms_configure` points `g_desc_far`/
+         `g_desc_phys` at `lin0`/`phys0 + ring_bytes` and sets `g_rx_flush_fn = cache_flush_none`. The one-time
+         configure writeback (`g_cache_flush_fn`) still pushes the cached initial descriptor build to memory
+         *before* the NC marking; the 64 KB NC granule already covers the +128 B block.
+       - **Verified on QEMU.** Real-mode CONV `pol=3` and JEMM386 COMMONBUF `pol=4` both `[L4RX]
+         delivered=6104260 dropped=0` (no regression from the far-pointer refactor). `CFG_FORCE_NC` `/n=254`
+         → `NC=validated (pool+desc NC; RX flush dropped)`, descriptors relocated to the pool end, per-drain
+         flush dropped, still `dropped=0`. The flush-drop *effect* is real-HW-only (TCG models no cache); the
+         relocated datapath itself is fully exercised.
+       This completes Phase 2 step 4 (the whole NC track: safe core → WB gate → VDS/COMMONBUF → fallback ladder
+       → descriptor relocation).
 
 ## What this does and doesn't prove
 
@@ -218,4 +235,4 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-21 20:51 CEST (4b DMA fallback ladder + V86 safety landed: driver `dma_v86_forbid_check` makes DMA_POLICY_FORBID explicit (V86 + no VDS → PIO); documented the COMMONBUF/CONV → XMS_COPY → PIO ladder for >16 MB / non-contiguous. Earlier 4b: WB discriminator + VDS/COMMONBUF (NC reaches real WB/EMM386 machines). Steps 1–3 + 4a + 4b WB gate + 4b VDS/COMMONBUF + 4b fallback/V86-guard are in; descriptor relocation (the flush-drop) is the remaining 4b piece)._
+_Last updated: 2026-06-22 06:00 CEST (4b descriptor relocation landed — Phase 2 step 4 COMPLETE: the conv RX descriptors relocate into the NC pool end when g_nc_effective, parameterised via g_desc_far/g_desc_phys/g_rx_flush_fn (one path; defaults reproduce the cached path), so the per-drain WBINVD drops. Verified: real CONV pol=3 + JEMM386 COMMONBUF pol=4 dropped=0 (no regression); CFG_FORCE_NC → NC=validated, flush dropped, dropped=0. The whole 4 track is in: safe core → WB gate → VDS/COMMONBUF → fallback ladder → relocation)._

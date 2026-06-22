@@ -61,7 +61,7 @@ msg_coh        db 'CACHE FLUSH=', '$'           ; Phase 2 RX coherency verdict r
 msg_coh_none   db 'NONE (coherent)', 13, 10, '$'
 msg_coh_wbinvd db 'WBINVD (non-coherent)', 13, 10, '$'
 msg_coh_evict  db 'SW-EVICT (non-coherent, 386)', 13, 10, '$'
-msg_nc_eff     db 'NC=validated (pool fenced; flush kept, docs/17 4b)', 13, 10, '$'
+msg_nc_eff     db 'NC=validated (pool+desc NC; RX flush dropped)', 13, 10, '$'
 msg_nc_off     db 'NC=requested, not effective (flush kept)', 13, 10, '$'
 
 ; uninstall (`3cpd /u`)
@@ -172,6 +172,16 @@ g_lin_delta:    resd 1             ; Phase 2 4b: CONV/COMMONBUF in-place deliver
                                    ; mode, identity-mapped). Under a paging VMM (COMMONBUF/VDS) phys0 is the bus
                                    ; address and lin0 the V86 linear the CPU uses; the ISR recovers each slot's
                                    ; CPU segment as (descriptor.phys + g_lin_delta) >> 4. RESIDENT (ISR reads it).
+; Phase 2 4b descriptor relocation: the conv RX descriptors normally live in the CACHED driver region
+; (xms_rx_descs); the card writes UP_COMPLETE there and the CPU polls it, so the per-drain RX flush is
+; required. When NC is effective the descriptors are RELOCATED into the (NC-fenced) DMA pool so that flush
+; can be DROPPED. These three vars parameterise the descriptor block's location so one code path serves
+; both: g_desc_far = CPU far ptr (seg:off), g_desc_phys = the card-facing physical base, g_rx_flush_fn =
+; the RX-side flush helper (separate from the TX g_cache_flush_fn so only the RX flush drops). Defaults
+; (set at install/configure) reproduce the cached path exactly: CS:xms_rx_descs + the selected flush tier.
+g_desc_far:     resd 1             ; descriptor block far ptr (offset, then segment) -- CPU access (ISR/build/poll)
+g_desc_phys:    resd 1             ; descriptor block physical base -- card UP_LIST/NEXT
+g_rx_flush_fn:  resw 1             ; RX-drain cache helper (= g_cache_flush_fn, or cache_flush_none when NC-relocated)
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address

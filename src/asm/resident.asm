@@ -766,6 +766,63 @@ f_xms_configure:
         mov     [xms_cfg_off], bx
         mov     ax, es
         mov     [xms_cfg_seg], ax
+        ; Phase 2 4b: descriptor-block location defaults = the cached CS-resident array (g_desc_far =
+        ; CS:xms_rx_descs, g_desc_phys = phys of it) and the RX flush = the TX tier helper. The NC-relocate
+        ; branch (.nc_pool) overrides these to the NC pool + drops the RX flush. Preserves ES:BX (= cfg).
+        mov     word [g_desc_far], xms_rx_descs
+        mov     [g_desc_far + 2], cs
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, xms_rx_descs
+        adc     dx, 0
+        mov     [g_desc_phys], ax
+        mov     [g_desc_phys + 2], dx
+        mov     ax, [g_cache_flush_fn]
+        mov     [g_rx_flush_fn], ax
+        ; Phase 2 4b RELOCATE: when NC is effective, move the descriptors into the NC pool (at the pool END,
+        ; past the slots: phys0/lin0 + RX_RING_N*slot_size -- the stack reserves DESC_BLOCK there) so the card
+        ; writes UP_COMPLETE into NC memory and the per-drain RX flush DROPS. Only the 386+ deep ring under
+        ; CONV/COMMONBUF (g_nc_effective implies 486+ -> g_tx_ring=1). The one-time writeback (g_cache_flush_fn)
+        ; still pushes the initial cached descriptor build to memory before the NC marking below.
+        cmp     byte [g_nc_effective], 0
+        je      .desc_default
+        cmp     byte [g_tx_ring], 0
+        je      .desc_default
+        cmp     byte [xms_rx_policy], XMS_POLICY_CONV
+        je      .desc_reloc
+        cmp     byte [xms_rx_policy], XMS_POLICY_COMMONBUF
+        jne     .desc_default
+.desc_reloc:
+        mov     ax, RX_RING_N
+        mul     word [xms_slot_sz]              ; dx:ax = RX_RING_N * slot_size = ring_bytes (fits ax; conv ring <64K)
+        mov     cx, ax                          ; cx = ring_bytes (offset of the desc block past the slots)
+        mov     ax, [es:bx + XMS_CFG_phys0]     ; g_desc_phys = phys0 + ring_bytes (card-facing, in the NC pool)
+        add     ax, cx
+        mov     dx, [es:bx + XMS_CFG_phys0 + 2]
+        adc     dx, 0
+        mov     [g_desc_phys], ax
+        mov     [g_desc_phys + 2], dx
+        mov     ax, [es:bx + XMS_CFG_lin0]      ; CPU linear of the desc block = lin0 + ring_bytes
+        add     ax, cx
+        mov     dx, [es:bx + XMS_CFG_lin0 + 2]
+        adc     dx, 0                           ; dx:ax = lin0 + ring_bytes
+        push    bx
+        mov     bx, ax
+        and     bx, 0x000F
+        mov     [g_desc_far], bx               ; g_desc_far offset (32-aligned -> 0)
+        pop     bx
+        mov     cl, 4
+        shr     ax, cl                          ; lin_lo >> 4
+        mov     cl, 12
+        shl     dx, cl                          ; lin_hi << 12
+        or      ax, dx
+        mov     [g_desc_far + 2], ax           ; g_desc_far segment
+        mov     word [g_rx_flush_fn], cache_flush_none   ; descriptors now in NC -> drop the per-drain RX flush
+.desc_default:
         ; --- descriptor build: CONV uses ONE contiguous block (cfg.phys0 = base; slot i at base +
         ; i*slot_size), so it has its own builder (.build_conv) that derives every slot from the base --
         ; 386+ gets a deep RX_RING_N NEXT-chained ring, the 286 gets 2 contiguous single-transfer slots
@@ -877,15 +934,10 @@ f_xms_configure:
         add     dx, EL3_CS_RX_COPYBREAK
         mov     ax, [g_copybreak_t]
         out     dx, ax
-        ; arm UP_LIST_PTR <- phys(CS:xms_rx_desc0)
-        mov     ax, cs
-        mov     cl, 4
-        shl     ax, cl
-        mov     dx, cs
-        mov     cl, 12
-        shr     dx, cl
-        add     ax, xms_rx_desc0
-        adc     dx, 0
+        ; arm UP_LIST_PTR <- g_desc_phys (descriptor block base; phys(CS:xms_rx_descs) by default, the NC
+        ; pool when relocated -- step 4b). desc[0] == xms_rx_desc0 in the default layout.
+        mov     ax, [g_desc_phys]
+        mov     dx, [g_desc_phys + 2]
         push    dx
         mov     dx, [g_nic_io]
         add     dx, EL3_CS_UP_LIST_PTR
@@ -896,8 +948,9 @@ f_xms_configure:
         ; Phase 2 (docs/17 Piece 3, write side): write back the just-built descriptors (ADDR/LEN/STATUS)
         ; before the card DMA-reads them. On a write-back cache those writes could still sit in cache, so
         ; the bus master would read a STALE buffer address and DMA frames to the wrong physical memory --
-        ; corruption, not just a stall. Coherent / emulator -> a bare `ret`. (The hot per-slot RECYCLE write
-        ; race is the remaining non-coherent-HW gap that the NC descriptor region closes -- docs/17 step 4.)
+        ; corruption, not just a stall. Coherent / emulator -> a bare `ret`. This is the ONE-TIME writeback of
+        ; the just-built descriptors -- it must run even when relocating (the descriptors are written cached
+        ; here, BEFORE the pool is marked NC below), so it stays g_cache_flush_fn (not the droppable per-drain).
         call    word [g_cache_flush_fn]
         ; --- Phase 2 step 4a (opt-in /n): if the cold re-test validated this chipset's NC mechanism, fence
         ; the DMA pool non-cacheable so the card's payload DMA is coherent. The per-drain flush is KEPT: the
@@ -984,44 +1037,39 @@ f_xms_configure:
         mov     ax, [es:bx + XMS_CFG_phys0 + 2]
         mov     [xms_gdt + 2], ax
         xor     bx, bx                          ; i = 0 (BX = loop counter; cfg no longer needed)
-        mov     si, xms_rx_descs                ; SI = &desc[i]
+        les     si, [g_desc_far]               ; ES:SI = &desc[0] (CS:xms_rx_descs, or the NC pool when relocated)
 .cloop:
         mov     ax, [xms_gdt + 0]               ; ADDR = running slot phys
-        mov     [si + EL3_DESC_ADDR], ax
+        mov     [es:si + EL3_DESC_ADDR], ax
         mov     ax, [xms_gdt + 2]
-        mov     [si + EL3_DESC_ADDR + 2], ax
+        mov     [es:si + EL3_DESC_ADDR + 2], ax
         mov     ax, [xms_slot_sz]               ; LEN = slot_size (high word 0)
-        mov     [si + EL3_DESC_LEN], ax
+        mov     [es:si + EL3_DESC_LEN], ax
         xor     ax, ax
-        mov     [si + EL3_DESC_LEN + 2], ax
-        mov     [si + EL3_DESC_STATUS], ax      ; STATUS = 0
-        mov     [si + EL3_DESC_STATUS + 2], ax
-        ; NEXT: 386+ ring -> phys(desc[(i+1) mod nslots]); 286 single-transfer -> 0 (ISR re-arms)
+        mov     [es:si + EL3_DESC_LEN + 2], ax
+        mov     [es:si + EL3_DESC_STATUS], ax   ; STATUS = 0
+        mov     [es:si + EL3_DESC_STATUS + 2], ax
+        ; NEXT: 386+ ring -> g_desc_phys + ((i+1) mod nslots)*EL3_DESC_SIZE; 286 single-transfer -> 0
         cmp     byte [g_tx_ring], 0
         jne     .cnext_ring
         xor     ax, ax
-        mov     [si + EL3_DESC_NEXT], ax
-        mov     [si + EL3_DESC_NEXT + 2], ax
+        mov     [es:si + EL3_DESC_NEXT], ax
+        mov     [es:si + EL3_DESC_NEXT + 2], ax
         jmp     .cnext_done
 .cnext_ring:
-        mov     di, si                          ; desc[i+1] = SI + EL3_DESC_SIZE; wrap last -> head
-        add     di, EL3_DESC_SIZE
-        mov     al, bl
+        mov     al, bl                          ; next = (i+1) mod nslots
         inc     al
         cmp     al, [xms_nslots]
         jb      .cnowrap
-        mov     di, xms_rx_descs
+        xor     al, al
 .cnowrap:
-        mov     ax, cs                          ; phys(CS:di) = (cs<<4) + di
-        mov     cl, 4
-        shl     ax, cl
-        mov     dx, cs
-        mov     cl, 12
-        shr     dx, cl
-        add     ax, di
+        mov     ah, EL3_DESC_SIZE
+        mul     ah                              ; ax = next * EL3_DESC_SIZE (next <= RX_RING_N-1 -> fits AL*AH)
+        add     ax, [g_desc_phys]               ; NEXT = g_desc_phys + next*EL3_DESC_SIZE (the card-facing base)
+        mov     dx, [g_desc_phys + 2]
         adc     dx, 0
-        mov     [si + EL3_DESC_NEXT], ax
-        mov     [si + EL3_DESC_NEXT + 2], dx
+        mov     [es:si + EL3_DESC_NEXT], ax
+        mov     [es:si + EL3_DESC_NEXT + 2], dx
 .cnext_done:
         mov     ax, [xms_slot_sz]               ; running slot phys += slot_size
         add     [xms_gdt + 0], ax
@@ -1094,15 +1142,17 @@ f_xms_poll:
         mov     byte [g_isr_busy], 1
         ; Phase 2: ONE batched cache invalidate before reading any descriptor STATUS or slot payload, so a
         ; non-coherent cache doesn't spin on a stale descriptor (the card wrote UP_COMPLETE) or read a stale
-        ; slot. Coherent/emulator -> a bare `ret` (nil cost). Helper preserves all GP regs + flags.
-        call    word [g_cache_flush_fn]
+        ; slot. Coherent/emulator -> a bare `ret` (nil cost). Helper preserves all GP regs + flags. RX-side,
+        ; so g_rx_flush_fn: drops to none once the descriptors live in the NC pool (step 4b relocation).
+        call    word [g_rx_flush_fn]
 .p_loop:
-        mov     al, [xms_slot_idx]      ; desc = xms_rx_descs + xms_slot_idx * EL3_DESC_SIZE
+        mov     al, [xms_slot_idx]      ; desc[idx] via g_desc_far (CS:xms_rx_descs, or the NC pool when relocated)
         mov     ah, EL3_DESC_SIZE
         mul     ah
-        mov     si, xms_rx_descs
+        mov     es, [g_desc_far + 2]
+        mov     si, [g_desc_far]
         add     si, ax
-        test    word [si + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
+        test    word [es:si + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
         jz      .p_drained              ; current slot not filled -> ring drained
         call    xms_rx_deliver          ; deliver desc[xms_slot_idx] (upcall); advances xms_slot_idx
         jmp     .p_loop

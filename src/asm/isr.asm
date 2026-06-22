@@ -324,12 +324,13 @@ xms_rx_deliver:
         mov     al, [xms_slot_idx]
         mov     ah, EL3_DESC_SIZE
         mul     ah                      ; ax = idx * EL3_DESC_SIZE (idx <= RX_RING_N-1 -> fits AL*AH)
-        mov     si, xms_rx_descs
+        mov     es, [g_desc_far + 2]    ; ES:SI = &desc[idx] (CS:xms_rx_descs, or the NC pool when relocated)
+        mov     si, [g_desc_far]
         add     si, ax
-        mov     [bp-8], si              ; save for STATUS clear + phys/lin select
+        mov     [bp-8], si              ; save the offset (ES reloaded from g_desc_far where it's clobbered)
 
         ; --- 2. Verify UP_COMPLETE in descriptor STATUS ---
-        mov     ax, [si + EL3_DESC_STATUS]
+        mov     ax, [es:si + EL3_DESC_STATUS]
         test    ax, EL3_DESC_UP_COMPLETE
         jz      .done
 
@@ -377,10 +378,11 @@ xms_rx_deliver:
         ; The descriptor ADDR field holds the slot phys for EVERY policy (f_xms_configure wrote it), so
         ; this works for the deep CONV ring (slots 2..N-1 aren't in the 2-entry cfg) and is identical to
         ; cfg.phys0/phys1 for the 2-slot paths.
-        mov     si, [bp-8]              ; completed descriptor ptr
-        mov     ax, [si + EL3_DESC_ADDR]
+        mov     si, [bp-8]              ; completed descriptor ptr (offset)
+        mov     es, [g_desc_far + 2]   ; ES = descriptor segment (reload; cleared on some delivery paths)
+        mov     ax, [es:si + EL3_DESC_ADDR]
         mov     [bp-2], ax              ; phys_lo
-        mov     cx, [si + EL3_DESC_ADDR + 2]
+        mov     cx, [es:si + EL3_DESC_ADDR + 2]
         mov     [bp-4], cx              ; phys_hi
         cmp     byte [xms_rx_policy], XMS_POLICY_CONV
         je      .lin_conv
@@ -587,10 +589,11 @@ xms_rx_deliver:
 
 .discard:
         ; --- 11. Clear completed slot STATUS ---
-        mov     si, [bp-8]              ; completed descriptor ptr (saved at start)
+        mov     si, [bp-8]              ; completed descriptor ptr (offset)
+        mov     es, [g_desc_far + 2]   ; ES = descriptor segment (reload; the hdr/lin paths clobbered ES)
         xor     ax, ax
-        mov     [si + EL3_DESC_STATUS], ax
-        mov     [si + EL3_DESC_STATUS + 2], ax
+        mov     [es:si + EL3_DESC_STATUS], ax
+        mov     [es:si + EL3_DESC_STATUS + 2], ax
         ; 386+ ring: advance to the next slot AFTER delivery -- (idx+1) mod nslots. nslots=2 for the
         ; XMS_COPY ring (cycles 0/1) and RX_RING_N for the deep CONV ring (0..N-1).
         cmp     byte [g_tx_ring], 0
