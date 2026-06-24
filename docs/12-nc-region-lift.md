@@ -117,8 +117,13 @@ safe core lands, behind that gate.
   chipset** (C&T / Headland / VLSI / Faraday …) with no NC and no ISA-master snoop — batched WBINVD
   only, and only latency-bound single-frame I/O can't hide it.
 - Reframed 2026-06-19 as an optional, re-test-gated optimization on top of the safe flush core; lifted
-  after the core (`17`). Not yet implemented.
+  after the core (`17`).
+- **IMPLEMENTED 2026-06-22** as Phase 2 step 4a (NC framework + re-test gate) and 4b (WB discriminator +
+  VDS/COMMONBUF + descriptor relocation): opt-in `/n`, re-test-gated, reached only on non-coherent 386+
+  write-back machines with a recognized chipset. NC effect is **structurally verified only** (QEMU/TCG
+  models no CPU cache — see `13`); the real cache benefit needs real 386/486 hardware. See
+  [`17-cache-coherency-impl.md`](17-cache-coherency-impl.md) step 4 for the build order + commits.
 
 ---
 
-_Last updated: 2026-06-19 12:20 CEST._
+_Last updated: 2026-06-24 19:42 CEST._

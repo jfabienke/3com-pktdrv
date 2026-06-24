@@ -50,6 +50,13 @@ with in-memory backing store).
   `NAS_MGMT_HOST=192.168.25.100 nvmeof-macos/scripts/spdk-up.sh` (mgmt `.50.100` is unreachable; the
   data-fabric SSH `.25.100` works). Then `TARGET_IP=192.168.25.100 ./tests/nvme-connect.sh`. The full
   DOS→slirp→NAS TCP path is already proven (handshake reaches the real NAS).
+- **In-emulator el3 nvmet target (deterministic bench):** the el3 device itself now terminates TCP and
+  serves the NVMe/TCP PDU state machine (`-device …,nvmet=on`), so the whole storage path runs **inside
+  QEMU under `-icount`** — fully deterministic, NAS-independent, and no host Python in the loop. This is
+  what produced the per-CPU storage-throughput matrix (8088→Pentium, reads + writes, windowed RX-DMA
+  ring). See [`elink-qemu/docs/el3-nvmet-target.md`](../../elink-qemu/docs/el3-nvmet-target.md). The
+  Python `nvmetgt.py` stub above remains the spec-faithful cross-check; the el3 target is the
+  deterministic measurement vehicle.
 
 Current green output (`nvmecon.exe`): `NVME=READY` + `IDENT mdts=5 nsze=16384 blocksize=4096 capacity=64MB` + `IOQ=READY qid=1` + `WRITE lba=0 OK` + `READ lba=0 got=4096: A0 A1 A2 ...`
 
@@ -185,3 +192,9 @@ raw 512-byte sectors as soon as the TSR is installed, before any partition or fo
 | other | — | returns AH=01h invalid command |
 
 Non-owned drive numbers are forwarded to the previous INT 13h handler unchanged.
+
+---
+
+_Last updated: 2026-06-24 19:42 CEST — added the in-emulator el3 nvmet target as the deterministic storage
+bench (see [`elink-qemu/docs/el3-nvmet-target.md`](../../elink-qemu/docs/el3-nvmet-target.md)); phase table
+above is the dos-nvmeotcp initiator roadmap (2026-05-26) and remains current for the real-initiator track._

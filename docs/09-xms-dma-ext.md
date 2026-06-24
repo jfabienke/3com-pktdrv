@@ -97,9 +97,11 @@ ring depth — confirmed by 10 Mbit (slow enough that the guest keeps up) sustai
 
 **Single-transfer ping-pong (286):** on completion the ISR immediately arms
 the *other* slot and kicks `START_DMA_UP` before processing the current frame,
-minimising the gap during which a new frame could be dropped. (A 286 `CONV`
-ring also uses 2 single-transfer slots, both carved from the contiguous base —
-the deep ring requires the 386+ ring-mode engine.)
+minimising the gap during which a new frame could be dropped. (A 286 **can**
+run `CONV` — but as a 2-slot single-transfer ring, both slots carved from the
+contiguous base. Only the deep `RX_RING_N=8` `NEXT`-chained ring needs the
+386+ ring-mode engine; the policy `CONV` is CPU-gated by *ring depth*, not by
+availability.)
 
 **Ring mode (386+):** `EL3_DESC_NEXT` chains the descriptors into a circle
 (2 for `XMS_COPY`, all `RX_RING_N` for `CONV`). The NIC advances to the next
@@ -328,5 +330,8 @@ nvmetsr.exe cold phase:
 
 ---
 
-_Last updated: 2026-06-13 20:49 CEST — scrubbed stale "no 64K crossing" note from the
-cold-phase sequence (the 3C515 first-party bus master has no 8237A counter wrap; cf. b7ab981)._
+_Last updated: 2026-06-24 19:42 CEST — clarified that `CONV` is CPU-gated by ring *depth*, not
+availability (a 286 runs `CONV` as a 2-slot single-transfer ring; only the deep `RX_RING_N=8`
+`NEXT`-chained ring needs the 386+ ring-mode engine). Prior: 2026-06-13 20:49 CEST — scrubbed stale
+"no 64K crossing" note from the cold-phase sequence (the 3C515 first-party bus master has no 8237A
+counter wrap; cf. b7ab981)._

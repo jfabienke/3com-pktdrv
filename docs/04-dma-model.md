@@ -113,3 +113,12 @@ If detection/test results are cached to skip re-probing:
   wrappers selected by `dma_policy`.
 - 386+/486: same, plus the matching cache-flush fragment for the chosen tier.
 - PCI Boomerang+: PCI ring-DMA fragments (32-bit addressing, no 16 MB limit).
+
+See also: the concrete RX-DMA ring depths and CPU tiers in [`09-xms-dma-ext.md`](09-xms-dma-ext.md),
+the cross-repo emulator-side model in [`elink-qemu/docs/dma-design.md`](../../elink-qemu/docs/dma-design.md),
+and the realized DMA storage throughput in [`elink-qemu/docs/el3-nvmet-target.md`](../../elink-qemu/docs/el3-nvmet-target.md).
+
+---
+
+_Last updated: 2026-06-24 19:42 CEST — added cross-links to the implemented ring depths (`09`) and the
+emulator-side DMA/storage results; the two-axis model itself is unchanged._
