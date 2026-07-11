@@ -322,7 +322,13 @@ nic_isr:
 %endif
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
-        mov     ax, EL3_CMD_ACK_INTR | 0x00FF   ; acknowledge all latched sources
+        ; Ack ALL sources incl. UpComplete(0x400)+DownComplete(0x200), not just the low byte.
+        ; The AckIntr arg field is 11 bits; on the level-triggered PCI 90x INTx an unacked
+        ; UpComplete keeps int_status&int_mask != 0, so el3_update_irq holds the line asserted
+        ; -> the ISR re-enters forever (interrupt storm) and starves the foreground. (Edge ISA
+        ; 515 is immune: a stuck bit raises no new edge -- which is why the low-byte ack sufficed
+        ; until RX-DMA went live on level-INTx. R1.c.)
+        mov     ax, EL3_CMD_ACK_INTR | 0x07FF   ; acknowledge all latched sources (incl. Up/DownComplete)
         out     dx, ax
         ; --- closed-window re-check (edge-triggered IRQ). A TxComplete that latches while the
         ; line is already high (mid-ISR) raises no new edge; if it lands after the final status
@@ -413,7 +419,18 @@ xms_rx_deliver:
         sub     sp, 8
 
         cmp     byte [xms_rx_n], 0      ; R1.c Stage 1: N-slot driver-resident RX-DMA ring active?
-        jne     .nring_start            ; yes -> drain the ring (claim + upcall each completed head)
+        jne     .nring_enter            ; yes -> drain the ring (claim + upcall each completed head)
+        jmp     .legacy_desc
+.nring_enter:
+%ifdef CFG_DEBUG
+        mov     al, 'N'
+        call    dbg_logb
+        mov     al, [xms_ring_tail]     ; which slot the drain starts on
+        add     al, '0'
+        call    dbg_logb
+%endif
+        jmp     .nring_start
+.legacy_desc:
 
         ; --- 1. Select completed slot's descriptor into SI ---
         mov     si, xms_rx_desc0
@@ -696,11 +713,11 @@ xms_rx_deliver:
         jmp     .done
 
 ; ---- R1.c Stage 1: N-slot driver-resident RX-DMA ring (docs/13) --------------------------------
-; Drain every completed head from xms_ring_tail forward. Buffers are conventional (phys < 1 MB),
-; so delivery is the CONV hint path (xms_rx_policy = CONV_RING): read the header direct, hand the
-; app the in-place slot via the shared .scan block. Each head is R1.a-claimed (STATUS=0) BEFORE the
-; upcall, so a level-INTx re-entry finds no work -> no dup delivery. Depth keeps the up engine from
-; starving in the re-arm gap (#6).
+; Drain every completed head from xms_ring_tail forward. Buffers are conventional (phys < 1 MB), so
+; delivery copies the slot into a receiver ring slot via the NO-HINT upcall (burst-safe). Each slot
+; is claimed (STATUS=0) at .nring_next -- AFTER its data is copied out -- because the circular ring
+; would otherwise let the up engine re-place a freed slot mid-copy. Depth keeps the up engine from
+; starving in the re-arm gap (#6); the g_isr_busy guard bars re-entry, so no early claim is needed.
 .nring_start:
         mov     al, [xms_ring_tail]
         xor     ah, ah
@@ -708,20 +725,36 @@ xms_rx_deliver:
         shl     ax, cl                  ; tail * 16 (EL3_DESC_SIZE)
         add     ax, xms_rx_ring
         mov     si, ax                  ; si = &ring[tail]
+        mov     [bp-8], si              ; save for the deferred claim (freed at .nring_next)
         mov     ax, [si + EL3_DESC_STATUS]
         test    ax, EL3_DESC_UP_COMPLETE
         jz      .nring_done             ; tail not complete -> ring drained this pass
-        ; claim (R1.a): clear STATUS lo+hi before any upcall
-        xor     cx, cx
-        mov     [si + EL3_DESC_STATUS], cx
-        mov     [si + EL3_DESC_STATUS + 2], cx
-        ; frame length from STATUS[12:0] (ax still = pre-claim status)
+        ; NOTE: do NOT clear STATUS here. This ring is CIRCULAR (NEXT never 0), so a freed slot is
+        ; immediately re-placeable by the up engine. The engine STALLS on a still-complete head, so
+        ; keeping UP_COMPLETE set until AFTER the frame is copied out guarantees the model can't DMA a
+        ; new frame over the slot mid-copy (a real race: the vCPU rep-movsb runs without the BQL while
+        ; the iothread runs the placer). The slot is claimed at .nring_next, once we're done reading
+        ; it. Re-delivery is already barred by the g_isr_busy re-entry guard, so the early R1.a claim
+        ; is unnecessary here -- and, on a circular ring, actively corrupting.
+        ; frame length from STATUS[12:0] (ax still = the live status word)
         and     ax, EL3_DESC_LEN_MASK
         mov     [rx_len], ax
         cmp     ax, 14
-        jb      .nring_next             ; runt -> drop but free/advance the slot
+        jae     .nring_len_ok
+%ifdef CFG_DEBUG
+        mov     al, 'u'                 ; runt -> drop but free/advance the slot
+        call    dbg_logb
+%endif
+        jmp     .nring_next
+.nring_len_ok:
         cmp     ax, [xms_slot_sz]
-        ja      .nring_next             ; over-long -> drop
+        jbe     .nring_len_ok2
+%ifdef CFG_DEBUG
+        mov     al, 'o'                 ; over-long -> drop
+        call    dbg_logb
+%endif
+        jmp     .nring_next
+.nring_len_ok2:
         ; slot buffer paragraph segment (frame source): (slotbuf + tail*stride) is 16-aligned
         mov     al, [xms_ring_tail]
         xor     ah, ah
@@ -761,6 +794,10 @@ xms_rx_deliver:
 .nring_scan_next:
         add     si, HANDLE_SIZE
         loop    .nring_scan
+%ifdef CFG_DEBUG
+        mov     al, 'h'                 ; no handler -> drop + advance
+        call    dbg_logb
+%endif
         jmp     .nring_next             ; no handler -> drop + advance
 .nring_hit:
         mov     [cur_handle], si
@@ -775,7 +812,13 @@ xms_rx_deliver:
         call    far [bx]
         mov     ax, es
         or      ax, di
-        jz      .nring_next             ; receiver ring full -> drop + advance
+        jnz     .nring_havebuf
+%ifdef CFG_DEBUG
+        mov     al, 'f'                 ; receiver ring full -> drop + advance
+        call    dbg_logb
+%endif
+        jmp     .nring_next
+.nring_havebuf:
         mov     [appbuf_seg], es
         mov     [appbuf_off], di
         ; copy rx_len bytes: slot_seg:0 -> appbuf_seg:appbuf_off (both conventional)
@@ -798,7 +841,19 @@ xms_rx_deliver:
         mov     ax, cs
         mov     ds, ax
         inc     word [stat_rx]
+%ifdef CFG_DEBUG
+        mov     al, 'p'                 ; delivered one frame into the receiver ring
+        call    dbg_logb
+%endif
 .nring_next:
+        ; claim NOW (all reads/copy of this slot are done): clear STATUS lo+hi to free the slot
+        ; back to the up engine. Deferred from .nring_start so the copy above ran against a slot the
+        ; engine could not overwrite. Reached by both the deliver path and every drop path, so a
+        ; dropped slot is freed too (else the engine would stall on it and wedge the ring).
+        mov     si, [bp-8]              ; &ring[tail] saved at .nring_start
+        xor     cx, cx
+        mov     [si + EL3_DESC_STATUS], cx
+        mov     [si + EL3_DESC_STATUS + 2], cx
         mov     al, [xms_ring_tail]
         inc     al
         cmp     al, [xms_rx_n]
@@ -808,6 +863,10 @@ xms_rx_deliver:
         mov     [xms_ring_tail], al
         jmp     .nring_start            ; drain the next slot
 .nring_done:
+%ifdef CFG_DEBUG
+        mov     al, 'z'                 ; drain reached end (tail slot not complete)
+        call    dbg_logb
+%endif
         ; the up engine stalls if it laps the driver (all N slots complete); UpUnstall resumes it.
         ; Harmless when not stalled -- issued once per IRQ after the drain.
         mov     dx, [g_nic_io]
