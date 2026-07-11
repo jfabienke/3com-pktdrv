@@ -186,11 +186,18 @@ QUERY withholds the RX-policy caps on PCI gens; XMS_TX + HWCSUM stay.
 mode (EtherType/IP-proto → FSH bits), not TX_SUBMIT2 — the stack's hot path is Crynwr
 `send_pkt`, so a TX_SUBMIT flags channel would never see the TCP frames.
 
-**Measurement caveats (task #75):** the 905 walker's dn_pend pacing over-throttles DMA TX
-under icount, and PCI RX is unpaced (timed-mode PCI reads over-report) — the PCI timed-mode
-*throughput* numbers await the same pacing-honesty work the ISA path got; the csum-lift
-isolation additionally needs a fixed-op-count bench mode. Correctness/completeness gates
-above are unaffected (instant-mode + integrity + pcap proofs).
+**Measurement validity (task #75, resolved):** PCI timed cells now use the icount bus-I/O
+model (`isa_mhz=33,isa_bus=16` ≈ 0.5 µs per 32-bit port access — the PCI I/O-cycle cost) so
+PIO no longer runs at CPU speed; the TX kick is synchronous (a per-frame BH dispatch cost
+virtual-time skew); and the PCI `dma_rate` defaults to the stable 6 MB/s completion cadence
+(the real-PCI 25 MB/s rate's ~121 µs cadence races the guest's wait entry under icount →
+PIT-quantum missed-wakeup stalls; 165→5509 KB/s at 32K writes across that change).
+Validated Pentium-tier timed numbers: 590 PIO ~4.8–6.4 MB/s, 905 DMA ~2.8–6.2 MB/s, all
+under the modeled ceilings, `recover=0`, VERIFY everywhere. Residual: ±2× run-to-run
+variance from the icount hlt-warp lottery — inherent to the rig, shared with the ISA cells.
+**Csum-lift finding** (fixed-op `o60` pair, 386 tier, 32K rows): **~3% — a wash on
+latency-bound NVMe ops.** The offload's CPU win applies to flood/CPU-saturated streaming
+(consistent with #40/#63); quantifying it there is flood-matrix territory, not bench13h.
 
 Non-goals: PCI BIOS shim, EISA/MCA/PCMCIA probers, Tornado beyond enum reservation,
 real-hardware validation (emulator-first; real HW later confirms the Cyclone claim — and,
