@@ -254,6 +254,16 @@ xms_rx_desc0:   resb EL3_DESC_SIZE ; RX up-descriptor slot 0 (16 bytes, 16-byte 
 xms_rx_desc1:   resb EL3_DESC_SIZE ; RX up-descriptor slot 1
 xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; access bytes pre-set)
 
+; R1.c Stage 1 (docs/13): driver-resident N-slot RX-DMA ring. xms_rx_n>0 selects this path in
+; xms_rx_deliver (else the legacy 2-descriptor path above). Present on the DMA tier only.
+xms_rx_n:       resb 1             ; active N-slot ring depth (0 = N-slot ring not configured)
+                resb 1             ; pad
+xms_ring_tail:  resw 1             ; ISR consume cursor (next slot to claim), 0..xms_rx_n-1
+                alignb 16
+xms_rx_ring:    resb EL3_RX_RING_N * EL3_DESC_SIZE      ; N UPDs (16 B each), NEXT-chained circular
+                alignb 16
+xms_rx_slotbuf: resb EL3_RX_RING_N * EL3_RX_SLOT_STRIDE ; N paragraph-aligned landing buffers
+
 ; 8b.2a: caller-phys TX pool (registered via TX_CONFIGURE) + a dedicated TX down-descriptor.
 ; Blocking single-transfer (caller-phys variant of dma_tx_single), used on ALL DMA tiers
 ; (gated on g_use_dma, independent of g_tx_ring); the dedicated descriptor never touches the

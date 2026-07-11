@@ -126,10 +126,12 @@ pkt_do_xms:
         je      .xts
         cmp     al, XMS_DMA_CSUM_CTL       ; 0x07 (Cyclone HW checksum on/off)
         je      .xcs
-        ; 0x03 RX_CONFIGURE2 and 0x06 RX_REFILL are defined but not implemented in this build:
-        ; return XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell "v2 known,
-        ; unimplemented" from a genuinely bad command. al is in {0x03,0x06} here (0x00-0x02/0x04/0x05
-        ; already dispatched above); a higher AL falls through to PD_ERR_BADCMD.
+        cmp     al, XMS_DMA_RX_CONFIGURE2  ; 0x03 (R1.c Stage 1: N-slot RX-DMA ring)
+        je      .x2
+        ; 0x06 RX_REFILL is defined but not implemented in this build (Stage 2): return
+        ; XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell "v2 known,
+        ; unimplemented" from a genuinely bad command. al is 0x06 here (0x00-0x05/0x07 already
+        ; dispatched above); a higher AL falls through to PD_ERR_BADCMD.
         cmp     al, XMS_DMA_RX_REFILL   ; 0x06 = top of the reserved v2 range
         jbe     .xstub
         mov     dh, PD_ERR_BADCMD
@@ -150,6 +152,8 @@ pkt_do_xms:
 .xts:   call    f_xms_tx_submit
         jmp     pkt_xms_ret
 .xcs:   call    f_xms_csum_ctl
+        jmp     pkt_xms_ret
+.x2:    call    f_xms_configure2
         jmp     pkt_xms_ret
 pkt_xms_ret:
         jc      pkt_error
@@ -891,14 +895,17 @@ f_xms_query:
         je      .no_ring
         or      bx, XMS_CAP_XMS_RING | XMS_CAP_RING | XMS_CAP_CONV_RING
 .no_ring:
-        ; PCI generations (Boomerang/Cyclone): withhold the RX-DMA policy caps -- RX stays
-        ; PIO (the project's proven RX-always-PIO policy for TCP; the RX-DMA vertical on
-        ; PCI is deferred with #6: level-INTx re-entry double-delivers on the upcall path).
-        ; TX keeps the full DMA ring + XMS_TX; Cyclone csum rides the TX DPDs.
+        ; PCI generations (Boomerang/Cyclone): withhold the LEGACY 2-slot RX-DMA policy caps --
+        ; those double-deliver on level-INTx (the #6 upcall re-entry). The N-slot v2 ring
+        ; (XMS_CAP_RX_DESC_V2, advertised below) is the safe RX-DMA path on PCI: deep enough to
+        ; never starve + R1.a-claimed per slot, so RX-DMA no longer has to stay PIO on 90x.
         cmp     word [g_uplist_off], EL3_UP_LIST_PCI
         jne     .rx_caps_ok
         and     bx, ~(XMS_CAP_CONV_SINGLE | XMS_CAP_CONV_RING | XMS_CAP_XMS_RING | XMS_CAP_RING)
 .rx_caps_ok:
+        ; R1.c Stage 1: advertise the driver-resident N-slot RX-DMA ring on every DMA tier
+        ; (ISA 515 + PCI 90x). RX_CONFIGURE2 wires it; delivery stays the Crynwr upcall.
+        or      bx, XMS_CAP_RX_DESC_V2
         cmp     byte [g_csum_ok], 0        ; Cyclone: HW checksum insertion available
         je      .no_csum_cap
         or      bx, XMS_CAP_HWCSUM
@@ -1110,6 +1117,132 @@ f_xms_configure:
         stc
         ret
 
+;--- XMS DMA RX_CONFIGURE2 (AL=0x03, R1.c Stage 1): ES:DI -> xms_rx_cfg2_t --------------------
+; Build a driver-resident N-slot circular UPD ring and arm the up engine. The N landing buffers
+; are the driver's own conventional-memory pool (xms_rx_slotbuf) -- phys < 1 MB, so ISA-DMA-safe
+; with no bounce/VDS. The stack passes only n_slots + slot_size (std-MTU); delivery stays the
+; classic Crynwr upcall (xms_rx_deliver drains the ring, R1.a-claiming each completed head). Depth
+; means the up engine never starves in the driver's re-arm gap (#6), and per-slot claim makes it
+; dup-safe on level-INTx (R1.a) -> RX-DMA is safe on PCI. Std-MTU only in Stage 1.
+f_xms_configure2:
+        cmp     byte [xms_dma_armed], 0
+        jne     .ec2_already
+        cmp     byte [g_use_dma], 0        ; N-slot RX-DMA ring requires a DMA-capable tier
+        je      .ec2_pol
+        mov     bx, [bp + F_DI]            ; cfg2 offset
+        mov     es, [bp + F_ES]            ; cfg2 segment
+        cmp     byte [es:bx + XMS_CFG2_version], XMS_CFG2_VERSION
+        jne     .ec2_ver
+        ; n_slots in [2, EL3_RX_RING_N] (read all cfg fields before repurposing BX below)
+        mov     ax, [es:bx + XMS_CFG2_n_slots]
+        cmp     ax, 2
+        jb      .ec2_nslots
+        cmp     ax, EL3_RX_RING_N
+        ja      .ec2_nslots
+        mov     [xms_rx_n], al             ; active depth (<= 4)
+        ; slot_size: Stage 1 is std-MTU only -> must equal the QUERY-advertised max frame
+        mov     ax, [es:bx + XMS_CFG2_slot_size]
+        cmp     ax, EL3_MAX_FRAME
+        jne     .ec2_size
+        mov     [xms_slot_sz], ax
+        ; policy drives the CONV (hint + no-copy) delivery branch in xms_rx_deliver; the N-slot
+        ; walk is selected by xms_rx_n != 0, so this stays a conventional-memory policy.
+        mov     byte [xms_rx_policy], XMS_POLICY_CONV_RING
+        mov     word [xms_ring_tail], 0
+        ; --- build N UPDs: ring[i].ADDR=phys(slotbuf+i*stride), LEN=slot_sz, STATUS=0,
+        ;     NEXT=phys(ring[(i+1) mod N]) --- (BX now free: reuse bh=N loop bound, bl=i)
+        mov     bh, [xms_rx_n]             ; bh = N (loop bound)
+        mov     si, xms_rx_ring            ; &ring[0]
+        mov     di, xms_rx_slotbuf         ; slot buffer offset for i=0
+        xor     bl, bl                     ; bl = i
+.ec2_build:
+        ; ADDR = phys(CS:di)
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, di
+        adc     dx, 0
+        mov     [si + EL3_DESC_ADDR], ax
+        mov     [si + EL3_DESC_ADDR + 2], dx
+        ; LEN = slot_sz, LEN_HI = 0
+        mov     ax, [xms_slot_sz]
+        mov     [si + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [si + EL3_DESC_LEN + 2], ax
+        ; STATUS = 0 (lo + hi) -> not UP_COMPLETE: the engine owns every slot
+        mov     [si + EL3_DESC_STATUS], ax
+        mov     [si + EL3_DESC_STATUS + 2], ax
+        ; NEXT = phys(CS : &ring[(i+1) mod N])
+        mov     al, bl
+        inc     al
+        cmp     al, bh                     ; wrap at N
+        jb      .ec2_nowrap
+        xor     al, al
+.ec2_nowrap:
+        xor     ah, ah
+        mov     cl, 4
+        shl     ax, cl                     ; nextidx * 16 (EL3_DESC_SIZE)
+        add     ax, xms_rx_ring            ; &ring[nextidx] offset
+        push    ax                         ; save the offset across the phys computation
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        pop     cx                         ; cx = next-descriptor offset
+        add     ax, cx
+        adc     dx, 0                      ; dx:ax = phys(next descriptor)
+        mov     [si + EL3_DESC_NEXT], ax
+        mov     [si + EL3_DESC_NEXT + 2], dx
+        add     si, EL3_DESC_SIZE          ; next descriptor
+        add     di, EL3_RX_SLOT_STRIDE     ; next slot buffer
+        inc     bl
+        cmp     bl, bh
+        jb      .ec2_build
+        ; --- arm UpListPtr <- phys(CS:xms_rx_ring[0]) ---
+        mov     ax, cs
+        mov     cl, 4
+        shl     ax, cl
+        mov     dx, cs
+        mov     cl, 12
+        shr     dx, cl
+        add     ax, xms_rx_ring
+        adc     dx, 0
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, [g_uplist_off]         ; per-gen: 0x418 ISA 515, 0x38 PCI 90x
+        out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax                     ; UpListPtr high -> up engine armed (hardware-true)
+        ; enable UP_COMPLETE interrupt (add to the existing mask)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH | EL3_ST_UP_COMPLETE | EL3_ST_TX_COMPLETE
+        out     dx, ax
+        mov     byte [xms_dma_armed], 1
+        mov     ax, cs
+        mov     es, ax
+        clc
+        ret
+.ec2_already: mov dh, XMS_ERR_ALREADY_CFG
+        jmp     .ec2_err
+.ec2_ver:   mov dh, XMS_ERR_BAD_VERSION
+        jmp     .ec2_err
+.ec2_pol:   mov dh, XMS_ERR_BAD_POLICY
+        jmp     .ec2_err
+.ec2_nslots: mov dh, XMS_ERR_BAD_NSLOTS
+        jmp     .ec2_err
+.ec2_size:  mov dh, XMS_ERR_SLOT_SIZE
+.ec2_err:   mov ax, cs
+        mov     es, ax
+        stc
+        ret
+
 ;--- XMS DMA RELEASE: stop DMA, clear UP_LIST_PTR, disarm ---
 f_xms_release:
         cmp     byte [xms_dma_armed], 0
@@ -1132,6 +1265,7 @@ f_xms_release:
         out     dx, ax
         ; clear state
         mov     byte [xms_dma_armed], 0
+        mov     byte [xms_rx_n], 0             ; R1.c: tear down the N-slot ring (0 = inactive)
         xor     ax, ax
         mov     [xms_cfg_off], ax
         mov     [xms_cfg_seg], ax

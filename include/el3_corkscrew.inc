@@ -89,6 +89,13 @@ EL3_MAX_FRAME_LARGE     equ 4490     ; max interoperable large (FDDI) TX frame, 
                                      ; emulator's EL3_LARGE_RX_MAX): a bigger frame is RX-dropped as
                                      ; oversize by a peer, so the TX path must not exceed it.
 
+; R1.c Stage 1 (docs/13): driver-resident N-slot RX-DMA ring. Circular NEXT-chained UPDs over a
+; conventional-memory buffer pool (phys < 1 MB -> ISA-DMA-safe by construction). Depth 4 gives the
+; up engine enough slack that it never starves in the driver's re-arm gap (#6). Std-MTU only; the
+; per-slot stride pads EL3_MAX_FRAME (1514) up to a paragraph so each slot begins seg:0.
+EL3_RX_RING_N           equ 4        ; N-slot ring depth (<= RX_DMA_SLOTS ABI max of 8)
+EL3_RX_SLOT_STRIDE      equ 1520     ; EL3_MAX_FRAME rounded up to 16 (paragraph-aligned slots)
+
 ; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done,
 ; bounded by ELAPSED time via the BIOS 18.2 Hz tick (0040:006C) -- NOT by a wakeup count, since
 ; RX (TCP-ACK) interrupts during a TX flood would otherwise drain a small spin budget and bail

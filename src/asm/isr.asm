@@ -412,6 +412,9 @@ xms_rx_deliver:
         mov     bp, sp
         sub     sp, 8
 
+        cmp     byte [xms_rx_n], 0      ; R1.c Stage 1: N-slot driver-resident RX-DMA ring active?
+        jne     .nring_start            ; yes -> drain the ring (claim + upcall each completed head)
+
         ; --- 1. Select completed slot's descriptor into SI ---
         mov     si, xms_rx_desc0
         cmp     byte [xms_slot_idx], 0
@@ -690,6 +693,127 @@ xms_rx_deliver:
         cmp     byte [g_tx_ring], 0
         je      .done                   ; XMS_COPY+286/386: already toggled during pre-arm
         xor     byte [xms_slot_idx], 1
+        jmp     .done
+
+; ---- R1.c Stage 1: N-slot driver-resident RX-DMA ring (docs/13) --------------------------------
+; Drain every completed head from xms_ring_tail forward. Buffers are conventional (phys < 1 MB),
+; so delivery is the CONV hint path (xms_rx_policy = CONV_RING): read the header direct, hand the
+; app the in-place slot via the shared .scan block. Each head is R1.a-claimed (STATUS=0) BEFORE the
+; upcall, so a level-INTx re-entry finds no work -> no dup delivery. Depth keeps the up engine from
+; starving in the re-arm gap (#6).
+.nring_start:
+        mov     al, [xms_ring_tail]
+        xor     ah, ah
+        mov     cl, 4
+        shl     ax, cl                  ; tail * 16 (EL3_DESC_SIZE)
+        add     ax, xms_rx_ring
+        mov     si, ax                  ; si = &ring[tail]
+        mov     ax, [si + EL3_DESC_STATUS]
+        test    ax, EL3_DESC_UP_COMPLETE
+        jz      .nring_done             ; tail not complete -> ring drained this pass
+        ; claim (R1.a): clear STATUS lo+hi before any upcall
+        xor     cx, cx
+        mov     [si + EL3_DESC_STATUS], cx
+        mov     [si + EL3_DESC_STATUS + 2], cx
+        ; frame length from STATUS[12:0] (ax still = pre-claim status)
+        and     ax, EL3_DESC_LEN_MASK
+        mov     [rx_len], ax
+        cmp     ax, 14
+        jb      .nring_next             ; runt -> drop but free/advance the slot
+        cmp     ax, [xms_slot_sz]
+        ja      .nring_next             ; over-long -> drop
+        ; slot buffer paragraph segment (frame source): (slotbuf + tail*stride) is 16-aligned
+        mov     al, [xms_ring_tail]
+        xor     ah, ah
+        mov     cx, EL3_RX_SLOT_STRIDE
+        mul     cx                      ; dx:ax = tail * stride (<= (N-1)*1520, fits ax)
+        add     ax, xms_rx_slotbuf      ; byte offset of the slot within CS (paragraph-aligned)
+        mov     cl, 4
+        shr     ax, cl                  ; -> paragraph offset
+        mov     dx, cs
+        add     ax, dx                  ; ax = slot buffer segment (frame at seg:0)
+        mov     [bp-6], ax              ; frame source segment
+        ; read the 14-byte Ethernet header for the EtherType scan
+        mov     es, ax
+        xor     bx, bx
+        mov     di, hdr_buf
+        mov     cx, 14
+.nring_hdr:
+        mov     al, [es:bx]
+        mov     [di], al
+        inc     bx
+        inc     di
+        dec     cx
+        jnz     .nring_hdr
+        push    cs
+        pop     es
+        ; scan htable for the EtherType handler (0 = wildcard entry)
+        mov     ax, [hdr_buf + 12]
+        mov     si, htable
+        mov     cx, MAX_HANDLES
+.nring_scan:
+        cmp     word [si + 2], 0
+        je      .nring_scan_next
+        cmp     word [si + 4], 0
+        je      .nring_hit
+        cmp     word [si + 4], ax
+        je      .nring_hit
+.nring_scan_next:
+        add     si, HANDLE_SIZE
+        loop    .nring_scan
+        jmp     .nring_next             ; no handler -> drop + advance
+.nring_hit:
+        mov     [cur_handle], si
+        ; upcall 1 (AX=0, NO hint): the receiver returns one of its own 16 ring slots. The N-slot
+        ; ring delivers MULTIPLE frames per IRQ, which would overrun the receiver's single hint
+        ; slot -- so copy into its ring (burst-safe). Stage 2's completion ring removes this copy.
+        xor     ax, ax
+        mov     es, ax
+        xor     di, di
+        mov     bx, [cur_handle]
+        mov     cx, [rx_len]
+        call    far [bx]
+        mov     ax, es
+        or      ax, di
+        jz      .nring_next             ; receiver ring full -> drop + advance
+        mov     [appbuf_seg], es
+        mov     [appbuf_off], di
+        ; copy rx_len bytes: slot_seg:0 -> appbuf_seg:appbuf_off (both conventional)
+        mov     cx, [rx_len]            ; capture length while DS = CS
+        mov     es, [appbuf_seg]
+        mov     di, [appbuf_off]
+        push    ds
+        mov     ds, [bp-6]              ; DS = frame source segment (bp is SS-relative, unaffected)
+        xor     si, si
+        cld
+        rep     movsb
+        pop     ds                      ; DS = CS
+        ; upcall 2 (AX=1): deliver
+        mov     si, [appbuf_off]
+        mov     cx, [rx_len]
+        mov     bx, [cur_handle]
+        mov     ax, 1
+        mov     ds, [appbuf_seg]
+        call    far [cs:bx]
+        mov     ax, cs
+        mov     ds, ax
+        inc     word [stat_rx]
+.nring_next:
+        mov     al, [xms_ring_tail]
+        inc     al
+        cmp     al, [xms_rx_n]
+        jb      .nring_tstore
+        xor     al, al
+.nring_tstore:
+        mov     [xms_ring_tail], al
+        jmp     .nring_start            ; drain the next slot
+.nring_done:
+        ; the up engine stalls if it laps the driver (all N slots complete); UpUnstall resumes it.
+        ; Harmless when not stalled -- issued once per IRQ after the drain.
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_UP_UNSTALL
+        out     dx, ax
 
 .done:
         mov     sp, bp
