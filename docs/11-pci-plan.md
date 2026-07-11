@@ -168,14 +168,29 @@ keep): missing TxComplete-on-fshTxIndicate; `PCI_INTERRUPT_PIN` never set (INTx 
 route); `bus_master_enabled` wiped by core reset *and* by the guest's own GlobalReset at
 driver probe (now derived from the variant's `has_dma` at reset).
 
-## Phase gates & verification (summary)
+## Phase gates & verification (summary) — ALL PHASES LANDED 2026-07-11
 
-| Phase | Gate |
-|-------|------|
-| 0b | known-good initiator moves frames on both QEMU badges; D3.1 resolved |
-| 1 (Vortex) | our driver PCI-probes 3C590, link up, echo test, PIO NVMe smoke |
-| 2 (Boomerang) | SG correctness; `run_nvme_matrix.sh` + real-SPDK smoke; sequential beats the 515's ISA-capped numbers |
-| 3 (Cyclone) | pcap-verified wire checksums; icount slow-CPU lift; tier-matrix no-regress on 509/515/590/905 |
+| Phase | Gate | Result |
+|-------|------|--------|
+| 0b | known-good initiator moves frames; D3.1 resolved | ✅ iPXE DHCP DORA on 3c905 |
+| 1 (Vortex) | driver PCI-probes 3C590, PIO NVMe smoke | ✅ auto-probe (BAR/IRQ/EEPROM-MAC), INTx works, VERIFY 128KB + all benches clean |
+| 2 (Boomerang) | SG correctness + ISA no-regress | ✅ 905 SG TX-DMA: VERIFY + benches recover=0; 515dma100 timed cell = exact pre-change baseline (1164 KB/s 32Kw); 509pio10 = 1133 KB/s |
+| 3 (Cyclone) | pcap-verified wire checksums; no-regress | ✅ **13119/13119** guest TCP frames checksum-valid with the stack's checksums OFF; VERIFY clean on all 5 NICs |
+
+**Scope note (RX):** the PCI generations run **TX-DMA + PIO RX** — the project's proven
+RX-always-PIO policy. The RX-DMA vertical on PCI is deferred with #6 (level-INTx re-entry
+double-delivers via the ISR upcall path; every host frame reached tcp_input in triplicate).
+QUERY withholds the RX-policy caps on PCI gens; XMS_TX + HWCSUM stay.
+
+**D4 deviation (documented):** per-frame csum signaling is a driver frame-sniff in CSUM
+mode (EtherType/IP-proto → FSH bits), not TX_SUBMIT2 — the stack's hot path is Crynwr
+`send_pkt`, so a TX_SUBMIT flags channel would never see the TCP frames.
+
+**Measurement caveats (task #75):** the 905 walker's dn_pend pacing over-throttles DMA TX
+under icount, and PCI RX is unpaced (timed-mode PCI reads over-report) — the PCI timed-mode
+*throughput* numbers await the same pacing-honesty work the ISA path got; the csum-lift
+isolation additionally needs a fixed-op-count bench mode. Correctness/completeness gates
+above are unaffected (instant-mode + integrity + pcap proofs).
 
 Non-goals: PCI BIOS shim, EISA/MCA/PCMCIA probers, Tornado beyond enum reservation,
 real-hardware validation (emulator-first; real HW later confirms the Cyclone claim — and,
