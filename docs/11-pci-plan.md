@@ -140,19 +140,33 @@ vocabulary is already sketched in `el3_core.h:112,140`. **Measurability:** icoun
 the win directly — an offloading guest executes fewer instructions → faster virtual time —
 so the Phase-3 claim is provable in the emulator before real hardware.
 
-## D5 — Go/no-go (fill at end of Phase 0b)
+## D5 — Go/no-go (filled at end of Phase 0b, 2026-07-11) → **GO to Phase 1**
 
-**GO to Phase 1 iff** all of:
-- [ ] D1 fork confirmed (NASM path; no C-HAL revival)
-- [ ] QEMU PCI model re-badged/split (3C590 PIO-only; 3C905 chain-DMA) and validated by a
-      known-good initiator (vendor DOS packet driver / iPXE 3c90x / Linux 3c59x) — probes,
-      links, moves frames on both badges
-- [ ] D3.1 completion-bit convention resolved against the refs; driver + models aligned
-- [ ] No spec-identified blocker requiring re-architecture; R6 floor safety confirmed
+- [x] D1 fork confirmed (NASM path; no C-HAL revival)
+- [x] QEMU PCI model re-badged/split (qemu `b8ed8e5`, fork branch): `-device 3c590`
+      (PIO-only) + `-device 3c905` (0x9050, DnListPtr/UpListPtr engines, hardware-true
+      semantics per Becker/iPXE — no ownership bit; fshDnComplete/upComplete write-backs;
+      fshTxIndicate → TxComplete; DnListPtr reads 0 when consumed; unstall resumes engines).
+      **Validated:** iPXE's 3c90x driver probes the 3c905, reads the EEPROM MAC, and
+      completes a full DHCP DORA through the descriptor engines (lease acquired over slirp).
+      *Caveats:* the 3C590 badge instantiates correctly but iPXE claims only 90x device IDs —
+      its PIO datapath validation lands with the Phase-1 driver bring-up (or a Linux 3c59x
+      run); iPXE polls, so INTx delivery is not yet exercised (Phase-1 driver will).
+      *Harness:* boot `ipxe.lkrn` via `-kernel` — the ISO's ISOLINUX handoff hangs on this
+      QEMU for any NIC.
+- [x] D3.1 convention resolved from sources (Becker 3c515.c/3c59x.c + iPXE, unanimous):
+      DN complete = FSH bit 16 write-back (+ DownListPtr progression/0), UP complete =
+      status bit 15, lastFrag = length bit 31, **no ownership bit**. The PCI model now
+      implements it (reference implementation). Driver + ISA-model alignment tracked as its
+      own task (task #70 — includes two further 515 findings: the ring path must not issue
+      StartDmaDown, and the real 515 DMA block is at +0x400 not +0x20).
+- [x] No re-architecture blocker found; R6 floor safety holds (no driver changes yet; all
+      planned PCI code is CFG_PCI-gated cold-phase ≥386).
 
-**NO-GO / defer if:** the model can't reach a probeable state in ~a week of effort
-(fallback would be real-hardware-only development — reconsider scope), or the C-HAL rewrite
-is chosen instead.
+Bugs fixed during 0b (all found by the known-good-initiator gate — the gate earned its
+keep): missing TxComplete-on-fshTxIndicate; `PCI_INTERRUPT_PIN` never set (INTx could not
+route); `bus_master_enabled` wiped by core reset *and* by the guest's own GlobalReset at
+driver probe (now derived from the variant's `has_dma` at reset).
 
 ## Phase gates & verification (summary)
 
