@@ -34,27 +34,40 @@ EL3_PNP_DEV_3C515TXEU   equ 0x5053   ; TCM5053  3c515-TX (EU)
 
 EL3_IO_EXTENT_CORKSCREW equ 32       ; I/O port range per NIC (vs 16 on the 3C509)
 
-; ---- bus-master DMA register block. On the Corkscrew (and the whole 3c59x family) the master
-; registers sit right after the windowed block at base+0x20..0x3F (so the real I/O extent is
-; 0x40, not 0x20). Offsets per the 3Com/Linux 3c515 map. Untouched in PIO mode.
-EL3_CS_DMA_BASE         equ 0x20     ; bus-master register block offset from io_base
-EL3_CS_DOWN_LIST_PTR    equ 0x24     ; TX descriptor list pointer (32-bit; two 16-bit OUTs at 0x24/0x26)
-EL3_CS_UP_LIST_PTR      equ 0x38     ; RX descriptor list pointer
+; ---- bus-master list-pointer registers. HARDWARE-TRUE offsets differ by bus (docs/11 D3.1,
+; from Becker 3c515.c `MasterCtrl` + iPXE 3c90x.h): the ISA 3C515 aliases the master block at
+; base+0x400 (its windowed ISA extent stops at 0x1F -- base+0x20 is NOT decoded); the PCI 90x
+; parts put it at BAR0+0x20. build_plan resolves the pair into the resident words
+; g_dnlist_off/g_uplist_off; all datapath code uses those. Writing a non-zero list pointer
+; STARTS the engine (the old StartDma command is the Vortex/515 Wn7 single-shot interface --
+; never issued on the list-DMA path). A 16-bit driver writes low half then high half; the
+; engine starts on the high-half write.
+EL3_DN_LIST_ISA         equ 0x404    ; 3C515: DownListPtr (base+0x404/0x406)
+EL3_UP_LIST_ISA         equ 0x418    ; 3C515: UpListPtr   (base+0x418/0x41A)
+EL3_DN_LIST_PCI         equ 0x24     ; 3C90x: DnListPtr   (BAR0+0x24/0x26)
+EL3_UP_LIST_PCI         equ 0x38    ; 3C90x: UpListPtr   (BAR0+0x38/0x3A)
 
-; ---- bus-master commands (high 5 bits select, low 11 = param; see EL3_CMD encoding).
-; StartDma is cmd 0x14 (<<11 = 0xA000): param != 0 -> down (TX), param 0 -> up (RX).
-EL3_CMD_START_DMA_DOWN  equ 0xA001   ; kick the down (TX) descriptor at DownListPtr
-EL3_CMD_START_DMA_UP    equ 0xA000   ; kick the up (RX) descriptor at UpListPtr
-
-; ---- down/up descriptor (16 bytes, little-endian). Matches the emulator EL3DownDesc:
-;   +0 next_desc (0 = single transfer)  +4 status  +8 buffer phys  +12 length
+; ---- down/up descriptor (16 bytes, little-endian; the Boomerang DPD/UPD shape):
+;   +0 next_desc (0 = end of list)  +4 status/FSH  +8 buffer phys  +12 length
+; Completion write-backs are HARDWARE-TRUE (Becker/iPXE, unanimous): the down engine sets
+; FSH bit 16 (fshDnComplete -> bit 0 of the word at +6); the up engine writes UpPktStatus =
+; upComplete (bit 15) | packet length into the dword at +4. There is NO ownership bit.
 EL3_DESC_NEXT           equ 0
-EL3_DESC_STATUS         equ 4
+EL3_DESC_STATUS         equ 4        ; low word of the status/FSH dword
+EL3_DESC_STATUS_HI      equ 6        ; high word of the status/FSH dword
 EL3_DESC_ADDR           equ 8
-EL3_DESC_LEN            equ 12
+EL3_DESC_LEN            equ 12       ; low word of the length dword
+EL3_DESC_LEN_HI         equ 14       ; high word of the length dword
 EL3_DESC_SIZE           equ 16
-EL3_DESC_DN_COMPLETE    equ 0x4000   ; card sets this in status when the down transfer is done
-EL3_DESC_UP_COMPLETE    equ 0x4000   ; card sets this in status when the up (RX) transfer is done
+EL3_DESC_DN_COMPLETE_HI equ 0x0001   ; FSH bit16 (in the word at +6): download complete
+EL3_DESC_UP_COMPLETE    equ 0x8000   ; UpPktStatus bit15 (in the word at +4): upload complete
+EL3_FSH_TX_INDICATE     equ 0x8000   ; FSH bit15 (word at +4): request TxComplete + TxStatus
+; Cyclone (3C905B+) checksum-insertion requests: FSH bits 25/26/27 (Linux AddIP/TCP/UDPChksum)
+; -- expressed as the word at +6 (EL3_DESC_STATUS_HI).
+EL3_FSH_ADD_IP_HI       equ 0x0200   ; insert IP header checksum
+EL3_FSH_ADD_TCP_HI      equ 0x0400   ; insert TCP checksum
+EL3_FSH_ADD_UDP_HI      equ 0x0800   ; insert UDP checksum
+EL3_DESC_LAST_FRAG_HI   equ 0x8000   ; length-dword bit31 (word at +14): last fragment
 EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 
 ; ---- non-blocking TX descriptor ring (software ring driven by single-transfer DMA + the

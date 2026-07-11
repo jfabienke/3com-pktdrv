@@ -24,6 +24,9 @@ XMS_DMA_RX_CONFIGURE2 equ 0x03  ; AL: N-slot RX ring + completion/free rings (ES
 XMS_DMA_TX_CONFIGURE  equ 0x04  ; AL: register caller TX slot pool, once (ES:DI -> xms_tx_cfg_t)
 XMS_DMA_TX_SUBMIT     equ 0x05  ; AL: submit one TX frame from caller phys (DX:CX=phys, BX=len)
 XMS_DMA_RX_REFILL     equ 0x06  ; AL: reserved RX free-ring doorbell
+XMS_DMA_CSUM_CTL      equ 0x07  ; AL: BX=1 enable / 0 disable Cyclone HW checksum insertion
+                                ;     (driver then requests IP+TCP/UDP checksums per DMA TX frame;
+                                ;      the stack must leave the checksum fields zero while enabled)
 
 ; ---- capability flags (BX on successful QUERY) --------------------------
 ; Caps are fixed at install time by JIT fragment selection (the ring tier is gated
@@ -39,6 +42,7 @@ XMS_CAP_RING        equ 0x0008  ; ring descriptor mode (486+)
 XMS_CAP_XMS_RING    equ 0x0020  ; XMS + INT 15h ring mode               (486+)
 XMS_CAP_RX_DESC_V2  equ 0x0040  ; N-slot RX ring + completion/free rings (advertised by the RX vertical)
 XMS_CAP_XMS_TX      equ 0x0080  ; caller-phys TX submit path             (advertised by the TX vertical)
+XMS_CAP_HWCSUM      equ 0x0100  ; Cyclone (3C905B+): HW IP/TCP/UDP checksum insertion on DMA TX
 
 ; ---- memory policy (xms_rx_cfg_t.policy field) --------------------------
 ; CONV_SINGLE(0) is the only single-transfer policy; CONFIGURE uses a single CMP.
@@ -63,6 +67,7 @@ XMS_ERR_NOT_V2      equ 0x0A   ; v2 sub-function recognized but not implemented 
 ; 0x0B is the packet-driver PD_ERR_BADCMD (genuinely-unknown AL) -- do not reuse for an XMS error
 XMS_ERR_TX_BUSY     equ 0x0C   ; a TX_SUBMIT single-transfer is already in flight (transient, retry)
 XMS_ERR_TX_TIMEOUT  equ 0x0D   ; no TxComplete within the bound -- card wedged (slot not safely reusable)
+XMS_ERR_NO_CSUM     equ 0x0E   ; CSUM_CTL on a NIC without HW checksum (not a Cyclone) or PIO mode
 
 ; ---- configuration structure (xms_rx_cfg_t) offsets --------------------
 ; Matches the C struct in include/xms_dma.h exactly (20 bytes total).

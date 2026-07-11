@@ -39,6 +39,7 @@
 #define XMS_DMA_TX_CONFIGURE  0x04u /* AL: register caller TX slot pool, once (ES:DI → xms_tx_cfg_t)      */
 #define XMS_DMA_TX_SUBMIT     0x05u /* AL: submit one TX frame from caller phys (DX:CX=phys, BX=len)       */
 #define XMS_DMA_RX_REFILL     0x06u /* AL: reserved RX free-ring doorbell                                  */
+#define XMS_DMA_CSUM_CTL      0x07u /* AL: BX=1 enable / 0 disable Cyclone HW checksum insertion           */
 
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
 /*
@@ -55,6 +56,7 @@
 #define XMS_CAP_XMS_RING    0x0020u /* XMS + INT 15h ring mode               (486+)  */
 #define XMS_CAP_RX_DESC_V2  0x0040u /* N-slot RX ring + completion/free rings (RX vertical) */
 #define XMS_CAP_XMS_TX      0x0080u /* caller-phys TX submit path             (TX vertical) */
+#define XMS_CAP_HWCSUM      0x0100u /* Cyclone: HW IP/TCP/UDP checksum insertion on DMA TX  */
 
 /* ---- memory policy ----------------------------------------------------- */
 /*
@@ -83,6 +85,7 @@ typedef enum {
 /* 0x0B is PD_ERR_BADCMD (genuinely-unknown AL) -- do not reuse for an XMS error */
 #define XMS_ERR_TX_BUSY     0x0Cu   /* a TX_SUBMIT single-transfer is already in flight (transient) */
 #define XMS_ERR_TX_TIMEOUT  0x0Du   /* no TxComplete within the bound -- card wedged */
+#define XMS_ERR_NO_CSUM     0x0Eu   /* CSUM_CTL on a non-Cyclone NIC or PIO mode     */
 
 /* ---- configuration structure (passed via ES:DI to CONFIGURE) ----------- */
 

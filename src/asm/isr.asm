@@ -116,7 +116,7 @@ nic_isr:
         mov     cl, 4
         shl     bx, cl                  ; tail * 16 (EL3_DESC_SIZE)
         add     bx, tx_descs            ; bx = &desc[tail]
-        test    word [bx + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        test    word [bx + EL3_DESC_STATUS_HI], EL3_DESC_DN_COMPLETE_HI
         jz      .tx_drained             ; tail still in flight -> no more completed; leave it
 %ifdef CFG_DEBUG
         inc     word [txd_drained]      ; one descriptor actually retired this pass
@@ -347,7 +347,7 @@ nic_isr:
         mov     cl, 4
         shl     bx, cl
         add     bx, tx_descs
-        test    word [bx + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        test    word [bx + EL3_DESC_STATUS_HI], EL3_DESC_DN_COMPLETE_HI
         jnz     .rc_drain
 %ifdef CFG_DEBUG
         mov     al, 'n'
@@ -455,14 +455,10 @@ xms_rx_deliver:
         adc     dx, 0                   ; dx:ax = phys(new descriptor)
         push    dx
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_UP_LIST_PTR
+        add     dx, [g_uplist_off]      ; per-gen list-ptr; high-half write re-arms the engine
         out     dx, ax
         pop     ax
         add     dx, 2
-        out     dx, ax
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_UP
         out     dx, ax
         ; SI still points to the COMPLETED (old) slot
 
@@ -657,7 +653,7 @@ xms_rx_deliver:
         mov     [si + EL3_DESC_STATUS], ax
         mov     [si + EL3_DESC_STATUS + 2], ax
 
-        ; --- 12. CONV_SINGLE: post-deliver re-arm desc0 + StartDmaUp ---
+        ; --- 12. CONV_SINGLE: post-deliver re-arm desc0 (UpListPtr write re-arms) ---
         ; (1 slot only; xms_slot_idx stays 0; gap is acceptable at 10 Mbps)
         cmp     byte [xms_rx_policy], XMS_POLICY_CONV_SINGLE
         jne     .toggle
@@ -671,14 +667,10 @@ xms_rx_deliver:
         adc     dx, 0
         push    dx
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_UP_LIST_PTR
+        add     dx, [g_uplist_off]      ; per-gen list-ptr; high-half write re-arms the engine
         out     dx, ax
         pop     ax
         add     dx, 2
-        out     dx, ax
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_UP
         out     dx, ax
         jmp     .done                   ; no slot toggle for CONV_SINGLE
 

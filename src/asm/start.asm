@@ -132,6 +132,8 @@ segment _TEXT public class=CODE use16
 
 g_nic_io:       resw 1              ; detected I/O base (command reg at +0x0E, windowed cfg at +0x00..)
 g_nic_irq:      resw 1              ; detected IRQ
+g_dnlist_off:   resw 1              ; DownListPtr reg offset (per gen: 0x404 ISA 515, 0x24 PCI 90x)
+g_uplist_off:   resw 1              ; UpListPtr reg offset   (per gen: 0x418 ISA 515, 0x38 PCI 90x)
 g_w1_base:      resw 1              ; Window-1 data-register base = io_base + gen delta (FIFO/status/free)
 g_tx_start:     resw 1              ; precomputed SET_TX_START command (early-start vs store-and-forward)
 g_use_dma:      resb 1             ; 1 = bus-master DMA TX active (3C515, >=286): single-transfer on 286/386, ring on 486+
@@ -140,6 +142,8 @@ g_rx_len_mask:  resw 1             ; RX length mask: 0x07FF std, 0x1FFF when lar
 g_tx_done:      resb 1             ; set by the ISR on TxComplete; awaited by dma_tx_single (286/386 path)
 g_tx_in_flight: resb 1             ; 1 while dma_tx_single holds the DMA channel (re-entrance guard)
 g_tx_ring:      resb 1             ; 1 = 486+ -> non-blocking TX ring (movsd copy); 0 = 286/386 -> blocking zero-copy single-transfer
+g_csum_ok:      resb 1             ; 1 = NIC supports HW checksum insertion (Cyclone) AND DMA active
+g_csum_mode:    resb 1             ; 1 = stack enabled checksum offload (CSUM_CTL) -> FSH bits per TX frame
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286/386 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
@@ -674,16 +678,40 @@ build_plan:
         mov     [g_tx_start], bx            ; precomputed SET_TX_START command
         mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
         mov     [g_plan_tx_imm], ax
-        ; --- resolve bus-master single-transfer TX DMA: /d AND 3C515 AND >=286 (else PIO floor) ---
+        ; --- per-generation bus-master list-pointer register offsets (hardware-true, D3.1):
+        ;     the ISA 3C515 aliases the master block at base+0x400; the PCI 90x parts put it
+        ;     at BAR0+0x20. Resident words so the datapath is generation-blind. ---
+        mov     word [g_dnlist_off], EL3_DN_LIST_ISA
+        mov     word [g_uplist_off], EL3_UP_LIST_ISA
+        cmp     byte [g_nic_gen], NIC_GEN_BOOMERANG
+        jb      .lp_done
+        mov     word [g_dnlist_off], EL3_DN_LIST_PCI
+        mov     word [g_uplist_off], EL3_UP_LIST_PCI
+.lp_done:
+        ; --- resolve bus-master TX DMA: /d AND (3C515 or Boomerang/Cyclone) AND >=286.
+        ;     3C509 has no engine; Vortex's is the Wn7 single-shot we don't drive (PIO). ---
         mov     byte [g_use_dma], 0
         cmp     byte [g_want_dma], 0
         je      .dma_resolved
-        cmp     byte [g_nic_gen], 1             ; Corkscrew (3C515) only -- has the bus-master engine
-        jne     .dma_resolved
+        cmp     byte [g_nic_gen], NIC_GEN_CORKSCREW
+        je      .dma_gen_ok
+        cmp     byte [g_nic_gen], NIC_GEN_BOOMERANG
+        jb      .dma_resolved                   ; Tomahawk / Vortex: PIO floor
+.dma_gen_ok:
         cmp     byte [g_cpu_class], CPU_80286   ; >=286: real mode, phys = seg*16+off, 24-bit ISA-safe
         jb      .dma_resolved
         mov     byte [g_use_dma], 1
 .dma_resolved:
+        ; --- HW checksum capability: Cyclone (3C905B/C) with DMA active. The MODE stays off
+        ;     until the stack opts in via XMS_DMA_CSUM_CTL (it must stop computing checksums). ---
+        mov     byte [g_csum_ok], 0
+        mov     byte [g_csum_mode], 0
+        cmp     byte [g_nic_gen], NIC_GEN_CYCLONE
+        jne     .csum_resolved
+        cmp     byte [g_use_dma], 0
+        je      .csum_resolved                  ; insertion rides the DPD path; PIO TX has no FSH
+        mov     byte [g_csum_ok], 1
+.csum_resolved:
         ; resident TX DMA path: 486+ uses the non-blocking ring (movsd slot copy, hidden by the
         ; faster core); 286 AND 386 use the blocking zero-copy single-transfer. (Phase 8b tier:
         ; ring threshold raised 386 -> 486. A 386's slower core can't usefully overlap the ring's

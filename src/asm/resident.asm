@@ -124,6 +124,8 @@ pkt_do_xms:
         je      .xtc
         cmp     al, XMS_DMA_TX_SUBMIT      ; 0x05 (8b.2a)
         je      .xts
+        cmp     al, XMS_DMA_CSUM_CTL       ; 0x07 (Cyclone HW checksum on/off)
+        je      .xcs
         ; 0x03 RX_CONFIGURE2 and 0x06 RX_REFILL are defined but not implemented in this build:
         ; return XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell "v2 known,
         ; unimplemented" from a genuinely bad command. al is in {0x03,0x06} here (0x00-0x02/0x04/0x05
@@ -146,6 +148,8 @@ pkt_do_xms:
 .xtc:   call    f_xms_tx_configure
         jmp     pkt_xms_ret
 .xts:   call    f_xms_tx_submit
+        jmp     pkt_xms_ret
+.xcs:   call    f_xms_csum_ctl
         jmp     pkt_xms_ret
 pkt_xms_ret:
         jc      pkt_error
@@ -461,7 +465,7 @@ dma_tx_enqueue:
         mov     cl, 4
         shl     bx, cl                          ; tail * 16
         add     bx, tx_descs
-        test    word [bx + EL3_DESC_STATUS], EL3_DESC_DN_COMPLETE
+        test    word [bx + EL3_DESC_STATUS_HI], EL3_DESC_DN_COMPLETE_HI
         jz      .eq_wtick                       ; tail genuinely in flight -> wait for the IRQ
         dec     word [tx_ring_count]            ; retire the completed tail (ring full -> count>0 after)
         mov     ax, [tx_ring_tail]
@@ -538,17 +542,20 @@ dma_tx_enqueue:
         and     cx, 3                           ; trailing bytes
         rep     movsb
         pop     ds                              ; DS = CS again
-        ; fill slot[head]'s descriptor: LEN = len, STATUS = 0 (ADDR/NEXT set at install)
+        ; fill slot[head]'s descriptor (ADDR/NEXT set at install): LEN = len | lastFrag,
+        ; FSH = TxIndicate (request TxComplete), FSH high word cleared (clears dnComplete)
         mov     bx, [tx_ring_head]
         mov     cl, 4
         shl     bx, cl                          ; head * 16
         add     bx, tx_descs
         mov     ax, [bp + F_CX]
         mov     [bx + EL3_DESC_LEN], ax
-        xor     ax, ax
-        mov     [bx + EL3_DESC_LEN + 2], ax
+        mov     ax, EL3_DESC_LAST_FRAG_HI
+        mov     [bx + EL3_DESC_LEN_HI], ax
+        mov     ax, EL3_FSH_TX_INDICATE
         mov     [bx + EL3_DESC_STATUS], ax
-        mov     [bx + EL3_DESC_STATUS + 2], ax
+        call    csum_fsh_hi                     ; 0 unless Cyclone csum mode (preserves BX)
+        mov     [bx + EL3_DESC_STATUS_HI], ax
         ; advance head (mod N), count++  (IF=0 here -> atomic wrt the ISR)
         mov     ax, [tx_ring_head]
         inc     ax
@@ -603,18 +610,18 @@ tx_kick:
         shr     dx, cl
         add     ax, bx
         adc     dx, 0                           ; dx:ax = phys(desc[tail])
+        ; HARDWARE-TRUE start: writing the list pointer starts the down engine (the
+        ; high-half write completes it) -- no StartDmaDown command (that is the Wn7
+        ; single-shot interface; issuing it here on real silicon would start the
+        ; MasterAddr engine with garbage). Busy flag set BEFORE the engine can run.
+        mov     byte [tx_dma_busy], 1
         push    dx
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_DOWN_LIST_PTR
+        add     dx, [g_dnlist_off]              ; per-gen: 0x404 ISA 515, 0x24 PCI 90x
         out     dx, ax                          ; DownListPtr low
         pop     ax
         add     dx, 2
-        out     dx, ax                          ; DownListPtr high
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_DOWN
-        out     dx, ax
-        mov     byte [tx_dma_busy], 1
+        out     dx, ax                          ; DownListPtr high -> engine starts
         ret
 
 ;------------------------------------------------------------------------------
@@ -644,13 +651,17 @@ dma_tx_single:
         adc     dx, 0                   ; dx:ax = phys(buffer)
         mov     [tx_descs + EL3_DESC_ADDR], ax
         mov     [tx_descs + EL3_DESC_ADDR + 2], dx
-        ; next = 0 (single transfer), status = 0, length high = 0
+        ; next = 0 (end of list), FSH = TxIndicate (request TxComplete; high word cleared
+        ; = dnComplete cleared), length = len | lastFrag (single fragment)
         xor     ax, ax
         mov     [tx_descs + EL3_DESC_NEXT], ax
         mov     [tx_descs + EL3_DESC_NEXT + 2], ax
+        call    csum_fsh_hi                     ; 0 unless Cyclone csum mode
+        mov     [tx_descs + EL3_DESC_STATUS_HI], ax
+        mov     ax, EL3_FSH_TX_INDICATE
         mov     [tx_descs + EL3_DESC_STATUS], ax
-        mov     [tx_descs + EL3_DESC_STATUS + 2], ax
-        mov     [tx_descs + EL3_DESC_LEN + 2], ax
+        mov     ax, EL3_DESC_LAST_FRAG_HI
+        mov     [tx_descs + EL3_DESC_LEN_HI], ax
         mov     ax, [bp + F_CX]         ; length (<= 1514 -> fits the 13-bit field)
         mov     [tx_descs + EL3_DESC_LEN], ax
         ; descriptor physical address (CS:tx_descs) -> dx:ax
@@ -663,21 +674,17 @@ dma_tx_single:
         shr     dx, cl
         add     ax, tx_descs
         adc     dx, 0                   ; dx:ax = phys(descriptor)
-        ; DownListPtr <- descriptor phys: two 16-bit OUTs (io+0x404 low, io+0x406 high)
+        ; arm completion BEFORE starting: the list-pointer high-half write starts the
+        ; engine (hardware-true; no StartDmaDown -- that is the Wn7 single-shot cmd).
+        mov     byte [g_tx_done], 0     ; cleared with IF=0, so the ISR can't race ahead
+        mov     byte [g_tx_in_flight], 1 ; mark channel busy before the engine can run
         push    dx                      ; save high word
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_DOWN_LIST_PTR
-        out     dx, ax                  ; low word
+        add     dx, [g_dnlist_off]      ; per-gen: 0x404 ISA 515, 0x24 PCI 90x
+        out     dx, ax                  ; DownListPtr low
         pop     ax                      ; high word -> ax
         add     dx, 2
-        out     dx, ax                  ; high word
-        ; arm completion, then kick StartDmaDown (cmd 0x14, param != 0)
-        mov     byte [g_tx_done], 0     ; cleared with IF=0, so the ISR can't race ahead
-        mov     byte [g_tx_in_flight], 1 ; mark channel busy before opening interrupts
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_DOWN
-        out     dx, ax
+        out     dx, ax                  ; DownListPtr high -> engine starts
         ; IRQ-driven wait: the TxComplete ISR sets g_tx_done. sti/hlt yields until an interrupt;
         ; spurious wakeups (RX during a TX flood) just re-loop -- the timeout is ELAPSED BIOS
         ; ticks, not a wakeup count, so only a wedged card escapes.
@@ -856,6 +863,18 @@ f_xms_query:
         je      .no_ring
         or      bx, XMS_CAP_XMS_RING | XMS_CAP_RING | XMS_CAP_CONV_RING
 .no_ring:
+        ; PCI generations (Boomerang/Cyclone): withhold the RX-DMA policy caps -- RX stays
+        ; PIO (the project's proven RX-always-PIO policy for TCP; the RX-DMA vertical on
+        ; PCI is deferred with #6: level-INTx re-entry double-delivers on the upcall path).
+        ; TX keeps the full DMA ring + XMS_TX; Cyclone csum rides the TX DPDs.
+        cmp     word [g_uplist_off], EL3_UP_LIST_PCI
+        jne     .rx_caps_ok
+        and     bx, ~(XMS_CAP_CONV_SINGLE | XMS_CAP_CONV_RING | XMS_CAP_XMS_RING | XMS_CAP_RING)
+.rx_caps_ok:
+        cmp     byte [g_csum_ok], 0        ; Cyclone: HW checksum insertion available
+        je      .no_csum_cap
+        or      bx, XMS_CAP_HWCSUM
+.no_csum_cap:
         mov     [bp + F_BX], bx
         mov     ax, EL3_MAX_FRAME
         cmp     byte [g_use_large], 0
@@ -1029,17 +1048,14 @@ f_xms_configure:
         adc     dx, 0
         push    dx
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_UP_LIST_PTR
+        add     dx, [g_uplist_off]      ; per-gen: 0x418 ISA 515, 0x38 PCI 90x
         out     dx, ax
         pop     ax
         add     dx, 2
-        out     dx, ax
-        ; issue StartDmaUp
+        out     dx, ax                  ; UpListPtr high -> up engine armed (hardware-true)
+        ; enable UP_COMPLETE interrupt (add to existing interrupt mask)
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_UP
-        out     dx, ax
-        ; enable UP_COMPLETE interrupt (add to existing interrupt mask)
         mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH | EL3_ST_UP_COMPLETE
         cmp     byte [g_use_dma], 0
         je      .intr_no_tx
@@ -1070,19 +1086,16 @@ f_xms_configure:
 f_xms_release:
         cmp     byte [xms_dma_armed], 0
         je      .enot
-        ; zero UP_LIST_PTR (two 16-bit OUTs)
+        ; zero UP_LIST_PTR (two 16-bit OUTs) -- a null list pointer halts the up engine
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_UP_LIST_PTR
+        add     dx, [g_uplist_off]
         xor     ax, ax
         out     dx, ax
         add     dx, 2
         out     dx, ax
-        ; StartDmaUp with null pointer halts the RX DMA engine
+        ; remove UP_COMPLETE from interrupt enable
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_UP
-        out     dx, ax
-        ; remove UP_COMPLETE from interrupt enable
         mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH
         cmp     byte [g_use_dma], 0
         je      .rel_intr
@@ -1223,15 +1236,18 @@ f_xms_tx_submit:
 dma_tx_caller:
         cmp     byte [g_tx_in_flight], 0
         jne     .tc_busy                ; another single-transfer in flight (transient)
-        ; build the dedicated TX descriptor: ADDR = dx:cx, LEN = bx, NEXT/STATUS = 0
+        ; build the dedicated TX descriptor: ADDR = dx:cx, LEN = bx | lastFrag, NEXT = 0,
+        ; FSH = TxIndicate (high word cleared = dnComplete cleared)
         mov     [xms_tx_desc + EL3_DESC_ADDR], cx
         mov     [xms_tx_desc + EL3_DESC_ADDR + 2], dx
         xor     ax, ax
         mov     [xms_tx_desc + EL3_DESC_NEXT], ax
         mov     [xms_tx_desc + EL3_DESC_NEXT + 2], ax
+        mov     [xms_tx_desc + EL3_DESC_STATUS_HI], ax
+        mov     ax, EL3_FSH_TX_INDICATE
         mov     [xms_tx_desc + EL3_DESC_STATUS], ax
-        mov     [xms_tx_desc + EL3_DESC_STATUS + 2], ax
-        mov     [xms_tx_desc + EL3_DESC_LEN + 2], ax
+        mov     ax, EL3_DESC_LAST_FRAG_HI
+        mov     [xms_tx_desc + EL3_DESC_LEN_HI], ax
         mov     [xms_tx_desc + EL3_DESC_LEN], bx
         ; descriptor phys (CS:xms_tx_desc) -> dx:ax
         mov     bx, cs
@@ -1243,22 +1259,18 @@ dma_tx_caller:
         shr     dx, cl
         add     ax, xms_tx_desc
         adc     dx, 0                   ; dx:ax = phys(xms_tx_desc)
-        ; DownListPtr <- descriptor phys (io+0x404 low, +0x406 high)
-        push    dx
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CS_DOWN_LIST_PTR
-        out     dx, ax
-        pop     ax
-        add     dx, 2
-        out     dx, ax
-        ; arm completion (IF=0 so the ISR can't race), then StartDmaDown
+        ; arm completion BEFORE starting (IF=0 so the ISR can't race); the list-pointer
+        ; high-half write starts the engine (hardware-true; no StartDmaDown command)
         mov     byte [g_tx_done], 0
         mov     byte [g_tx_in_flight], 1
         mov     byte [xms_tx_in_flight], 1   ; divert TxComplete -> g_tx_done (all tiers)
+        push    dx
         mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_START_DMA_DOWN
+        add     dx, [g_dnlist_off]      ; per-gen: 0x404 ISA 515, 0x24 PCI 90x
         out     dx, ax
+        pop     ax
+        add     dx, 2
+        out     dx, ax                  ; DownListPtr high -> engine starts
         ; IRQ-driven wait, bounded by elapsed BIOS ticks (same shape as dma_tx_single)
         xor     ax, ax
         mov     es, ax
@@ -1276,7 +1288,7 @@ dma_tx_caller:
 .tc_timeout:
         ; wedged card: abort the down channel so it stops reading the caller's slot, then report.
         mov     dx, [g_nic_io]
-        add     dx, EL3_CS_DOWN_LIST_PTR
+        add     dx, [g_dnlist_off]
         xor     ax, ax
         out     dx, ax
         add     dx, 2
@@ -1298,6 +1310,56 @@ dma_tx_caller:
 .tc_busy:
         mov     dh, XMS_ERR_TX_BUSY
         stc
+        ret
+
+;------------------------------------------------------------------------------
+; f_xms_csum_ctl -- XMS_DMA_CSUM_CTL (0x07): BX=1 enable / 0 disable the Cyclone
+; HW checksum insertion mode. While enabled, every IP TX frame on the DMA path
+; gets FSH AddIPChksum (+AddTCP/AddUDP by protocol) and the STACK must leave the
+; checksum fields zero. Rejected (XMS_ERR_NO_CSUM) unless the NIC is a Cyclone
+; with DMA active (insertion rides the DPD; PIO TX has no FSH).
+;------------------------------------------------------------------------------
+f_xms_csum_ctl:
+        cmp     byte [g_csum_ok], 0
+        jne     .cs_ok
+        mov     dh, XMS_ERR_NO_CSUM
+        stc
+        ret
+.cs_ok:
+        mov     ax, [bp + F_BX]
+        and     al, 1
+        mov     [g_csum_mode], al
+        clc
+        ret
+
+;------------------------------------------------------------------------------
+; csum_fsh_hi -- AX = FSH high word (Cyclone checksum-request bits) for the
+; caller frame at F_DS:F_SI, or 0 when the mode is off / the frame isn't IP.
+; IP -> AddIP; +AddTCP or +AddUDP by the protocol byte. Preserves DS/SI/BX/CX/DX.
+;------------------------------------------------------------------------------
+csum_fsh_hi:
+        xor     ax, ax
+        cmp     byte [g_csum_mode], 0
+        je      .cf_done
+        push    ds
+        push    si
+        mov     si, [bp + F_SI]
+        mov     ds, [bp + F_DS]
+        cmp     word [si + 12], 0x0008      ; EtherType 0x0800 (big-endian on the wire)
+        jne     .cf_pop
+        mov     ax, EL3_FSH_ADD_IP_HI
+        cmp     byte [si + 23], 6           ; IP protocol: TCP
+        jne     .cf_udp
+        or      ax, EL3_FSH_ADD_TCP_HI
+        jmp     .cf_pop
+.cf_udp:
+        cmp     byte [si + 23], 17          ; UDP
+        jne     .cf_pop
+        or      ax, EL3_FSH_ADD_UDP_HI
+.cf_pop:
+        pop     si
+        pop     ds
+.cf_done:
         ret
 
 f_bad:
