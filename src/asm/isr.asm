@@ -117,7 +117,10 @@ nic_isr:
         shl     bx, cl                  ; tail * 16 (EL3_DESC_SIZE)
         add     bx, tx_descs            ; bx = &desc[tail]
         test    word [bx + EL3_DESC_STATUS_HI], EL3_DESC_DN_COMPLETE_HI
-        jz      .tx_drained             ; tail still in flight -> no more completed; leave it
+        jnz     .tx_do_retire           ; write-back present -> retire (hot path)
+        call    dn_ptr_is_zero          ; R2 dual-evidence: no write-back -> DownListPtr consumed?
+        jnz     .tx_drained             ; still in flight by both evidences -> leave it
+.tx_do_retire:
 %ifdef CFG_DEBUG
         inc     word [txd_drained]      ; one descriptor actually retired this pass
         mov     al, 'T'
@@ -349,6 +352,8 @@ nic_isr:
         add     bx, tx_descs
         test    word [bx + EL3_DESC_STATUS_HI], EL3_DESC_DN_COMPLETE_HI
         jnz     .rc_drain
+        call    dn_ptr_is_zero          ; R2 dual-evidence: no write-back -> DownListPtr consumed?
+        jz      .rc_drain               ; DownListPtr == 0 -> retire
 %ifdef CFG_DEBUG
         mov     al, 'n'
         call    dbg_logb                ; recheck bail: tail still in flight (not DN_COMPLETE)
@@ -419,7 +424,17 @@ xms_rx_deliver:
         test    ax, EL3_DESC_UP_COMPLETE
         jz      .done
 
-        ; --- 3. Frame length from STATUS[12:0] ---
+        ; --- 3a. CLAIM the slot IMMEDIATELY (level-INTx re-entry discipline, docs/12 R1.a):
+        ; clearing STATUS before any upcall makes redelivery structurally impossible -- a
+        ; re-entered ISR (level line still high at IRET, or nested via an upcall that STIs)
+        ; finds no work at step 2 and exits. A claim is NOT a re-arm: the up engine is
+        ; stalled (end-of-list) until step 12 rewrites UpListPtr, so the slot data stays
+        ; stable through the upcall copy. Replaces the old post-upcall clear (was step 11).
+        xor     cx, cx
+        mov     [si + EL3_DESC_STATUS], cx
+        mov     [si + EL3_DESC_STATUS_HI], cx
+
+        ; --- 3b. Frame length from STATUS[12:0] (AX still holds the pre-claim status) ---
         and     ax, EL3_DESC_LEN_MASK
         mov     [rx_len], ax
         cmp     ax, 14
@@ -647,11 +662,7 @@ xms_rx_deliver:
         inc     word [stat_rx]
 
 .discard:
-        ; --- 11. Clear completed slot STATUS ---
-        mov     si, [bp-8]              ; completed descriptor ptr (saved at start)
-        xor     ax, ax
-        mov     [si + EL3_DESC_STATUS], ax
-        mov     [si + EL3_DESC_STATUS + 2], ax
+        ; --- 11. (slot was already claimed at step 3a; nothing to clear here) ---
 
         ; --- 12. CONV_SINGLE: post-deliver re-arm desc0 (UpListPtr write re-arms) ---
         ; (1 slot only; xms_slot_idx stays 0; gap is acceptable at 10 Mbps)

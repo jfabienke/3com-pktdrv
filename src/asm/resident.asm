@@ -466,7 +466,10 @@ dma_tx_enqueue:
         shl     bx, cl                          ; tail * 16
         add     bx, tx_descs
         test    word [bx + EL3_DESC_STATUS_HI], EL3_DESC_DN_COMPLETE_HI
-        jz      .eq_wtick                       ; tail genuinely in flight -> wait for the IRQ
+        jnz     .eq_do_heal                     ; write-back present -> retire (hot path)
+        call    dn_ptr_is_zero                  ; R2 dual-evidence: no write-back -> DownListPtr consumed?
+        jnz     .eq_wtick                       ; still in flight by both evidences -> wait for the IRQ
+.eq_do_heal:
         dec     word [tx_ring_count]            ; retire the completed tail (ring full -> count>0 after)
         mov     ax, [tx_ring_tail]
         inc     ax
@@ -821,6 +824,31 @@ f_uninstall:
         mov     bx, [psp_seg]
         mov     [bp + F_BX], bx               ; hand the PSP back to the caller
         clc
+        ret
+
+;------------------------------------------------------------------------------
+; dn_ptr_is_zero -- R2 dual-evidence TX retirement (docs/12 R2). The hot path retires a
+; descriptor on its fshDnComplete write-back (STATUS_HI bit0). That bit is proven on 90x
+; silicon but only *documented* for the Corkscrew -- Becker's 3c515.c never reads it; it
+; retires by DownListPtr register comparison. If real 515 silicon omits the write-back, the
+; bit test misses forever and the ring wedges. So on a bit MISS, fall back to this: read the
+; 32-bit DownListPtr (two word INs at g_nic_io+g_dnlist_off) and treat the tail as complete
+; iff it reads 0 -- the engine consumed the (always NEXT=0) single-descriptor list, so the
+; descriptor AND its buffer have been fetched (Linux ships on exactly this evidence). Cost is
+; two INs on the miss path only; the write-back-present hot path never calls here.
+; Enter: DS = CS. Exit: ZF=1 iff DownListPtr == 0 (retire). Clobbers AX + flags; preserves
+; BX/CX/DX/SI/DI (the drain sites keep BX = &desc[tail] across the call).
+dn_ptr_is_zero:
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, [g_dnlist_off]      ; per-gen: 0x404 ISA 515, 0x24 PCI 90x
+        in      ax, dx                  ; DownListPtr low 16
+        add     dx, 2
+        push    ax
+        in      ax, dx                  ; DownListPtr high 16
+        pop     dx                      ; dx = low half (scratch)
+        or      ax, dx                  ; ZF=1 iff both halves zero
+        pop     dx
         ret
 
 %ifdef CFG_DEBUG

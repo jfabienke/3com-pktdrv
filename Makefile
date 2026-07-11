@@ -40,7 +40,7 @@ $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
 
 $(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.asm &
                      src/asm/resident.asm src/asm/isr.asm src/asm/install.asm &
-                     src/asm/isapnp.asm &
+                     src/asm/isapnp.asm src/asm/pci_io.asm src/asm/pcibus.asm &
                      include/codegen.inc include/el3_tomahawk.inc include/el3_core.inc &
                      include/el3_corkscrew.inc &
                      $(BUILD)/frags_asm.inc
@@ -80,6 +80,17 @@ pnp: .SYMBOLIC
 debugpnp: .SYMBOLIC
     @rm -f $(BUILD)/start.obj
     $(MAKE) DEFS="-dCFG_DEBUG -dCFG_PNP" all
+
+# pci: full profile + PCI -- adds the mechanism-#1 bus prober (Vortex/Boomerang/Cyclone,
+# >=386, tried before ISA PnP/ID-port). Includes the PnP probe (a full-profile machine
+# may still carry the ISA cards). debugpci adds the instrumentation on top.
+pci: .SYMBOLIC
+    @rm -f $(BUILD)/start.obj
+    $(MAKE) DEFS="-dCFG_PCI -dCFG_PNP" all
+
+debugpci: .SYMBOLIC
+    @rm -f $(BUILD)/start.obj
+    $(MAKE) DEFS="-dCFG_DEBUG -dCFG_PCI -dCFG_PNP" all
 
 clean: .SYMBOLIC
     @rm -f $(BUILD)/start.obj $(BUILD)/*.bin $(BUILD)/frags_asm.inc $(TARGET) $(BUILD)/blast.com $(BUILD)/3cpd.map
