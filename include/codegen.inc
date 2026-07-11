@@ -23,6 +23,15 @@ CPU_CPUID           equ 4       ; CPUID present (family/model via CPUID -- futur
 CPU_PENTIUM         equ 5       ; reserved: set by the CPUID-parsing lift
 CPU_P6              equ 6
 
+; ---- NIC generation (g_nic_gen; mirrors hardware.h nic_type_t ladder) ----
+; 0/1 are the original ISA pair -- existing `cmp 0`/`cmp 1` gating is unchanged.
+; The Window-1 +0x10 relocation applies to every generation >= 1 (Corkscrew on).
+NIC_GEN_TOMAHAWK    equ 0       ; 3C509/B  ISA PIO (the floor)
+NIC_GEN_CORKSCREW   equ 1       ; 3C515    ISA + bus-master
+NIC_GEN_VORTEX      equ 2       ; 3C59x    PCI, PIO datapath
+NIC_GEN_BOOMERANG   equ 3       ; 3C90x    PCI, descriptor-list DMA
+NIC_GEN_CYCLONE     equ 4       ; 3C905B/C PCI, + HW checksum
+
 ; ---- immediate patch kinds ----
 PATCH_IMM8          equ 0
 PATCH_IMM16         equ 1

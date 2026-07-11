@@ -102,12 +102,22 @@ el3_load_mac_io:
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W0_SETUP
         out     dx, ax
-        mov     bp, EL3_W0_EE_CMD          ; 3C509: EEPROM cmd at io+0x0A
-        cmp     byte [g_nic_gen], 0
-        je      .eeoff
-        mov     bp, EL3_CS_W0_EE_CMD       ; 3C515: io+0x200A (the +0x2000 ISA alias)
+        mov     bp, EL3_W0_EE_CMD          ; 3C509 AND PCI Vortex+: EEPROM cmd at io+0x0A
+        cmp     byte [g_nic_gen], NIC_GEN_CORKSCREW
+        jne     .eeoff
+        mov     bp, EL3_CS_W0_EE_CMD       ; 3C515 ONLY: io+0x200A (the +0x2000 ISA alias --
+                                           ; a PCI BAR decodes 0x80 bytes, no alias there)
 .eeoff:
-        xor     di, di                     ; EEPROM word index 0..2
+        xor     di, di                     ; EEPROM word index (node address)
+%ifdef CFG_PCI
+        ; Vortex+ keeps the station address at EEPROM words 10-12 (the OEM node
+        ; address -- what Linux 3c59x/iPXE 3c90x read); words 0-2 hold other IDs
+        ; on the PCI parts. The ISA 3C509/3C515 node address stays at words 0-2.
+        cmp     byte [g_nic_gen], NIC_GEN_VORTEX
+        jb      .eebase0
+        mov     di, 10
+.eebase0:
+%endif
         xor     si, si                     ; byte offset into g_mac
 .macw:
         mov     dx, bx
@@ -128,6 +138,6 @@ el3_load_mac_io:
         mov     [g_mac + si + 1], al
         add     si, 2
         inc     di
-        cmp     di, 3
+        cmp     si, 6                      ; three words -> six MAC bytes (start-index agnostic)
         jb      .macw
         ret

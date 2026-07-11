@@ -75,7 +75,7 @@ msg_inst    db 13, 10, 'INSTALLED: INT 60h, IRQ vec=0x', '$'
 segment _BSS public class=BSS use16
 
 g_cpu_class:    resb 1          ; CPU_8088 .. CPU_CPUID (set by detect_cpu)
-g_nic_gen:      resb 1          ; detected generation: 0 = Tomahawk (3C509/B), 1 = Corkscrew (3C515)
+g_nic_gen:      resb 1          ; detected generation (NIC_GEN_*): 0=3C509/B 1=3C515 2=Vortex 3=Boomerang 4=Cyclone
 g_manual:       resb 1          ; 1 = manual /b= I/O base given -> skip the ID-port probe
 g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit byte-loop) datapath
 g_force286:     resb 1          ; 1 = /2 given -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
@@ -445,6 +445,16 @@ global resident_end
         clc
         jmp     .nic_found
 .auto_detect:
+%ifdef CFG_PCI
+        ; PCI first on >=386: mechanism-#1 config access needs 32-bit port I/O,
+        ; and a machine carrying an EtherLink III PCI card should bind it in
+        ; preference to any ISA leftovers. Miss -> fall through to PnP/ID-port.
+        cmp     byte [g_cpu_class], CPU_80386
+        jb      .pci_skip
+        call    detect_nic_pci      ; -> g_nic_io/irq/gen/mac, I/O + bus-master enabled
+        jnc     .nic_found
+.pci_skip:
+%endif
 %ifdef CFG_PNP
         ; >=286 (16-bit ISA): try ISA PnP first -- it finds a 3C515 AND a PnP-mode 3C509B --
         ; then fall back to the legacy ID-port. On an 8088 a 3C515 can't exist (16-bit card)
@@ -631,6 +641,11 @@ phase_validate_dma:
 %ifdef CFG_PNP
 ; detect_nic_pnp -- direct ISA PnP isolation (3C515 / PnP-mode 3C509B). >=286-gated by caller.
 %include "isapnp.asm"
+%endif
+
+%ifdef CFG_PCI
+%include "pci_io.asm"
+%include "pcibus.asm"
 %endif
 
 ; install -- hook INT 60h + NIC IRQ, enable card int, free environment, DOS TSR-keep.
