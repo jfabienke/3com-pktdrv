@@ -262,7 +262,24 @@ xms_ring_tail:  resw 1             ; ISR consume cursor (next slot to claim), 0.
                 alignb 16
 xms_rx_ring:    resb EL3_RX_RING_N * EL3_DESC_SIZE      ; N UPDs (16 B each), NEXT-chained circular
                 alignb 16
-xms_rx_slotbuf: resb EL3_RX_RING_N * EL3_RX_SLOT_STRIDE ; N paragraph-aligned landing buffers
+xms_rx_slotbuf: resb EL3_RX_RING_N * EL3_RX_SLOT_STRIDE ; N paragraph-aligned landing buffers (Stage 1 only)
+
+; R1.c Stage 2 (docs/13): completion/free-ring zero-copy RX. When the stack supplies app-owned
+; slots + a completion ring + a free ring (cfg2.slots_lin/compl_ring_lin/free_ring_lin all set),
+; xms_rx_mode=1: the UPD ADDRs point at the APP buffers (not xms_rx_slotbuf), and on RX the ISR
+; POSTS {slot_id,len,status,seq} to the completion ring instead of the upcall copy. The stack
+; processes the frame in place and returns the slot via the free ring; RX_REFILL (0x06) -- and the
+; ISR opportunistically -- drains the free ring, clearing UPD STATUS + xms_rx_posted[] to re-arm.
+xms_rx_mode:    resb 1             ; 0 = Stage 1 upcall (driver slotbuf); 1 = Stage 2 completion ring
+                resb 1             ; pad
+xms_compl_off:  resw 1             ; completion ring far ptr (offset) -> xms_ring_hdr_t + entries
+xms_compl_seg:  resw 1             ; completion ring segment
+xms_free_off:   resw 1             ; free ring far ptr (offset) -> xms_ring_hdr_t + entries
+xms_free_seg:   resw 1             ; free ring segment
+xms_compl_seq:  resw 1             ; monotonic sequence stamped into each completion entry
+xms_rx_posted:  resb EL3_RX_RING_N ; per-slot: 1 = completion posted, awaiting app free (STATUS stays
+                                   ; UP_COMPLETE so the engine can't refill). Cleared on free -> re-arm.
+                alignb 2
 
 ; 8b.2a: caller-phys TX pool (registered via TX_CONFIGURE) + a dedicated TX down-descriptor.
 ; Blocking single-transfer (caller-phys variant of dma_tx_single), used on ALL DMA tiers

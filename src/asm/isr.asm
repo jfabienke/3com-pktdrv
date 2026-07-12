@@ -452,6 +452,8 @@ xms_rx_deliver:
         jne     .nring_enter            ; yes -> drain the ring (claim + upcall each completed head)
         jmp     .legacy_desc
 .nring_enter:
+        cmp     byte [xms_rx_mode], 0   ; R1.c Stage 2: completion/free-ring zero-copy?
+        jne     .nring2_start           ; yes -> post completions (no upcall copy)
 %ifdef CFG_DEBUG
         mov     al, 'N'
         call    dbg_logb
@@ -899,6 +901,90 @@ xms_rx_deliver:
 %endif
         ; the up engine stalls if it laps the driver (all N slots complete); UpUnstall resumes it.
         ; Harmless when not stalled -- issued once per IRQ after the drain.
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_UP_UNSTALL
+        out     dx, ax
+        jmp     .done
+
+; ---- R1.c Stage 2: completion/free-ring zero-copy drain (docs/13) ------------------------------
+; Post every newly-filled slot to the completion ring (no upcall copy); the stack reads the frame
+; in place from its own slot buffer and returns the slot via the free ring. STATUS is NOT cleared
+; on post -- the buffer is the app's until it frees, and the engine stalling on the still-complete
+; head is the interlock. xms_rx_posted[] makes re-post idempotent (level-INTx / lap safe).
+; BP frame locals: [bp-2]=cursor slot index, [bp-4]=descriptor status word.
+.nring2_start:
+        mov     al, [xms_ring_tail]
+        xor     ah, ah
+        mov     [bp-2], ax              ; cursor = current post slot
+        mov     cl, 4
+        shl     ax, cl
+        add     ax, xms_rx_ring
+        mov     si, ax                  ; si = &ring[cursor]
+        mov     ax, [si + EL3_DESC_STATUS]
+        test    ax, EL3_DESC_UP_COMPLETE
+        jz      .nring2_done            ; armed (engine hasn't filled it) -> drained this pass
+        mov     bx, [bp-2]
+        cmp     byte [bx + xms_rx_posted], 0
+        jne     .nring2_done            ; posted-awaiting-free -> engine stalled here; stop
+        mov     [bp-4], ax              ; save status for the completion entry
+        ; --- post {slot_id,len,status,seq} to the completion ring (ES:DI = hdr) ---
+        mov     ax, [xms_compl_seg]
+        or      ax, ax
+        jz      .nring2_done            ; Stage 2 with no completion ring (defensive)
+        mov     es, ax
+        mov     di, [xms_compl_off]
+        mov     cx, [es:di + XMS_RING_head]
+        mov     ax, cx
+        sub     ax, [es:di + XMS_RING_tail]  ; occupancy = head - tail (free-running u16)
+        mov     bx, [es:di + XMS_RING_mask]
+        cmp     ax, bx
+        ja      .nring2_full            ; occupancy > mask -> ring full: backpressure, retry next IRQ
+        mov     ax, cx
+        and     ax, bx                  ; head & mask = entry index
+        mov     cl, 3
+        shl     ax, cl                  ; * XMS_COMPL_SIZE (8)
+        add     ax, XMS_RING_SIZE       ; skip the 8-byte ring header
+        add     ax, di                  ; + hdr base -> absolute entry offset (di stays = hdr base)
+        mov     si, ax                  ; si = &entry (single-reg addressing; di+si is illegal in 16-bit)
+        mov     ax, [bp-2]
+        mov     [es:si + XMS_COMPL_slot_id], ax
+        mov     ax, [bp-4]
+        and     ax, EL3_DESC_LEN_MASK
+        mov     [es:si + XMS_COMPL_len], ax
+        mov     ax, [bp-4]
+        mov     [es:si + XMS_COMPL_status], ax
+        mov     ax, [xms_compl_seq]
+        mov     [es:si + XMS_COMPL_seq], ax
+        inc     word [xms_compl_seq]
+        inc     word [es:di + XMS_RING_head]  ; publish the entry
+        push    cs
+        pop     es
+        mov     bx, [bp-2]              ; mark posted; STATUS stays UP_COMPLETE (app owns the buffer)
+        mov     byte [bx + xms_rx_posted], 1
+        inc     word [stat_rx]
+%ifdef CFG_DEBUG
+        mov     al, 'P'                 ; posted a completion (Stage 2 zero-copy)
+        call    dbg_logb
+%endif
+        mov     al, [xms_ring_tail]     ; advance cursor (mod N)
+        inc     al
+        cmp     al, [xms_rx_n]
+        jb      .nring2_tstore
+        xor     al, al
+.nring2_tstore:
+        mov     [xms_ring_tail], al
+        jmp     .nring2_start
+.nring2_full:
+        push    cs
+        pop     es
+%ifdef CFG_DEBUG
+        mov     al, 'F'                 ; completion ring full -> stop (no loss; engine stalls)
+        call    dbg_logb
+%endif
+.nring2_done:
+        ; re-arm any slots the stack freed since the last IRQ, then UpUnstall so the engine resumes
+        call    xms_free_drain
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_UP_UNSTALL

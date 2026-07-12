@@ -114,3 +114,48 @@ in the prof `POLL`/`COPY` decomposition (R3.a shows the drop); no-regress on 509
 3. Stage 1 gate: 905 RX-DMA oracle (dup-free) + #6 burst + 515 no-regress + drop withhold.
 4. Stage 2 driver+stack: completion/free rings + RX_REFILL (the copybreak vertical).
 5. Stage 2 gate: matrix goodput + prof copy-drop; fold #25/#26 closed.
+
+---
+
+## Stage 2 protocol (implementation — the exact invariant)
+
+**Mode select.** `RX_CONFIGURE2` reads `cfg2.slots_lin`, `compl_ring_lin`, `free_ring_lin`. All
+three non-zero ⇒ **Stage 2** (`xms_rx_mode=1`): the UPD `ADDR`s point at the app buffers
+(`slots[i].phys`, read from the array at `slots_lin`), and slot_size may be FDDI-large (the app
+owns the buffers, so no driver-resident cost). Any zero ⇒ **Stage 1** (driver `xms_rx_slotbuf` +
+Crynwr upcall), preserved as the ISA / back-compat fallback.
+
+**Per-slot state.** Each UPD `i` has descriptor `STATUS` (owned by the engine) plus a driver-side
+`xms_rx_posted[i]` byte. Life-cycle of slot `i`:
+
+| state | STATUS | posted[i] | who owns the buffer |
+|---|---|---|---|
+| armed | 0 | 0 | engine (may DMA a frame in) |
+| filled | UP_COMPLETE | 0 | driver (owes a completion post) |
+| posted | UP_COMPLETE | 1 | app (reading in place; engine is stalled here) |
+
+**Producer = the up engine** (fills `armed`→`filled`, walks circular NEXT, **stalls** at the first
+non-armed head). **Consumer 1 = the ISR** posts `filled`→`posted`. **Consumer 2 = the app** frees
+`posted`→`armed`.
+
+**ISR drain (`xms_ring_tail` = post cursor).** From `tail`, while `STATUS[cursor]&UP_COMPLETE` **and**
+`posted[cursor]==0`: push `{slot_id=cursor, len=STATUS&LEN_MASK, status, seq=xms_compl_seq++}` to the
+completion ring (at `compl.head & mask`, bump `compl.head`), set `posted[cursor]=1`, **do not clear
+STATUS**, advance cursor (mod N). Stop at the first slot that is not `filled` — which is either
+`armed` (STATUS=0, engine hasn't reached it) or `posted` (posted=1, the engine is stalled there
+awaiting the app). Correct for **out-of-order** free: the engine only advances in ring order, so the
+cursor parks on the oldest un-freed slot until it is freed+refilled. Stop early (leave `filled`) if
+the completion ring is full — natural backpressure; the engine stalls, no frame lost.
+
+**Free drain (RX_REFILL 0x06, and opportunistically at the end of every ISR).** While
+`free.tail != free.head`: `slot_id = free.entry[tail & mask]`; clear `UPD[slot_id].STATUS` (lo+hi) and
+`posted[slot_id]=0`; bump `free.tail`. Then one `UpUnstall` so the engine resumes over the just-armed
+slot(s). Clearing a specific `slot_id` (not "the oldest") is what makes out-of-order free safe.
+
+**Why STATUS is never cleared at post time** (unlike Stage 1): the buffer is the app's until it frees;
+clearing STATUS would let the engine DMA a new frame over a buffer the app is still reading. The engine
+stalling on the still-complete head is the interlock. Mirrors the Stage-1 "claim after copy" rule, but
+the claim moves all the way out to the app's free-ring return.
+
+**Level-INTx (R1.a):** the ISR is single-entry (`g_isr_busy`); posting is idempotent per slot via
+`posted[]`, so a re-entered/again-raised IRQ finds `posted==1` at the cursor and does no work.

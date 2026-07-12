@@ -128,21 +128,16 @@ pkt_do_xms:
         je      .xcs
         cmp     al, XMS_DMA_TX_SUBMIT_SG   ; 0x08 (SG-TX Phase A: 2-fragment gather)
         je      .xtsg
-        cmp     al, XMS_DMA_RX_CONFIGURE2  ; 0x03 (R1.c Stage 1: N-slot RX-DMA ring)
+        cmp     al, XMS_DMA_RX_CONFIGURE2  ; 0x03 (R1.c Stage 1/2: N-slot RX-DMA ring)
         je      .x2
-        ; 0x06 RX_REFILL is defined but not implemented in this build (Stage 2): return
-        ; XMS_ERR_NOT_V2 (distinct from PD_ERR_BADCMD) so the client can tell "v2 known,
-        ; unimplemented" from a genuinely bad command. al is 0x06 here (0x00-0x05/0x07 already
-        ; dispatched above); a higher AL falls through to PD_ERR_BADCMD.
-        cmp     al, XMS_DMA_RX_REFILL   ; 0x06 = top of the reserved v2 range
-        jbe     .xstub
+        cmp     al, XMS_DMA_RX_REFILL   ; 0x06 (R1.c Stage 2: free-ring doorbell)
+        je      .xrf
+        ; 0x00-0x08 are all dispatched above; anything else is a genuinely bad sub-function.
         mov     dh, PD_ERR_BADCMD
         stc
         jmp     pkt_error
-.xstub:
-        mov     dh, XMS_ERR_NOT_V2
-        stc
-        jmp     pkt_error
+.xrf:   call    f_xms_refill
+        jmp     pkt_xms_ret
 .xq:    call    f_xms_query
         jmp     pkt_xms_ret
 .xc:    call    f_xms_configure
@@ -1149,24 +1144,87 @@ f_xms_configure2:
         jb      .ec2_nslots
         cmp     ax, EL3_RX_RING_N
         ja      .ec2_nslots
-        mov     [xms_rx_n], al             ; active depth (<= 4)
-        ; slot_size: Stage 1 is std-MTU only -> must equal the QUERY-advertised max frame
+        mov     [xms_rx_n], al             ; active depth (<= N)
+        ; --- Stage select: all of slots_lin / compl_ring_lin / free_ring_lin set => Stage 2
+        ; (app-owned slots + completion/free rings, zero-copy). Any zero => Stage 1 (driver
+        ; slotbuf + Crynwr upcall). Detect on compl_ring_lin (both words) and require the others.
+        mov     byte [xms_rx_mode], 0
+        mov     ax, [es:bx + XMS_CFG2_compl_lin]
+        or      ax, [es:bx + XMS_CFG2_compl_lin + 2]
+        jz      .ec2_stage1                ; no completion ring -> Stage 1
+        ; Stage 2: capture the completion + free ring far pointers (hi16=seg, lo16=off)
+        mov     ax, [es:bx + XMS_CFG2_compl_lin]
+        mov     [xms_compl_off], ax
+        mov     ax, [es:bx + XMS_CFG2_compl_lin + 2]
+        mov     [xms_compl_seg], ax
+        mov     ax, [es:bx + XMS_CFG2_free_lin]
+        mov     cx, [es:bx + XMS_CFG2_free_lin + 2]
+        mov     dx, ax
+        or      dx, cx
+        jz      .ec2_pol                   ; compl set but free not -> malformed
+        mov     [xms_free_off], ax
+        mov     [xms_free_seg], cx
+        mov     ax, [es:bx + XMS_CFG2_slots_lin]
+        mov     cx, [es:bx + XMS_CFG2_slots_lin + 2]
+        mov     dx, ax
+        or      dx, cx
+        jz      .ec2_pol                   ; compl set but slots not -> malformed
+        ; Stage 2 slot_size: app owns the buffers, so FDDI-large is allowed up to TX_SLOT_SZ
+        mov     ax, [es:bx + XMS_CFG2_slot_size]
+        cmp     ax, EL3_MAX_FRAME
+        jb      .ec2_size
+        cmp     ax, TX_SLOT_SZ
+        ja      .ec2_size
+        mov     [xms_slot_sz], ax
+        mov     byte [xms_rx_mode], 1
+        ; clear per-slot posted[] + seq; the loop below fills ADDR from slots[i].phys
+        xor     ax, ax
+        mov     [xms_compl_seq], ax
+        mov     cx, EL3_RX_RING_N
+        mov     di, xms_rx_posted
+        push    es
+        push    cs
+        pop     es
+        rep     stosb                      ; posted[0..N-1] = 0
+        pop     es
+        jmp     .ec2_common
+.ec2_stage1:
+        ; Stage 1: std-MTU only -> slot_size must equal the QUERY-advertised max frame
         mov     ax, [es:bx + XMS_CFG2_slot_size]
         cmp     ax, EL3_MAX_FRAME
         jne     .ec2_size
         mov     [xms_slot_sz], ax
-        ; policy drives the CONV (hint + no-copy) delivery branch in xms_rx_deliver; the N-slot
-        ; walk is selected by xms_rx_n != 0, so this stays a conventional-memory policy.
+.ec2_common:
+        ; policy drives the CONV (hint + no-copy) delivery branch; the N-slot walk is selected
+        ; by xms_rx_n != 0, so this stays a conventional-memory policy.
         mov     byte [xms_rx_policy], XMS_POLICY_CONV_RING
         mov     word [xms_ring_tail], 0
-        ; --- build N UPDs: ring[i].ADDR=phys(slotbuf+i*stride), LEN=slot_sz, STATUS=0,
-        ;     NEXT=phys(ring[(i+1) mod N]) --- (BX now free: reuse bh=N loop bound, bl=i)
+        ; --- build N UPDs: ring[i].ADDR = Stage1 phys(slotbuf+i*stride) / Stage2 slots[i].phys,
+        ;     LEN=slot_sz, STATUS=0, NEXT=phys(ring[(i+1) mod N]) --- (BX free: bh=N, bl=i).
+        ; For Stage 2 the slots[] array (xms_slot_desc_t, 8 B) is walked via ES:DI (ES=slots seg,
+        ; DI=entry off, +8/iter); for Stage 1 DI=slotbuf off (+stride/iter, ES unused).
         mov     bh, [xms_rx_n]             ; bh = N (loop bound)
         mov     si, xms_rx_ring            ; &ring[0]
+        cmp     byte [xms_rx_mode], 0
+        je      .ec2_di_stage1
+        mov     di, [es:bx + XMS_CFG2_slots_lin]      ; ES:BX still = cfg2 here
+        mov     ax, [es:bx + XMS_CFG2_slots_lin + 2]
+        mov     es, ax                     ; ES = slots array segment (BX now stale, reload below)
+        jmp     .ec2_di_done
+.ec2_di_stage1:
         mov     di, xms_rx_slotbuf         ; slot buffer offset for i=0
+.ec2_di_done:
         xor     bl, bl                     ; bl = i
 .ec2_build:
-        ; ADDR = phys(CS:di)
+        ; ADDR: Stage1 = phys(CS:di) (driver slotbuf) ; Stage2 = slots[i].phys at ES:[di]
+        cmp     byte [xms_rx_mode], 0
+        je      .ec2_addr_s1
+        mov     ax, [es:di + XMS_SLOT_phys]
+        mov     dx, [es:di + XMS_SLOT_phys + 2]
+        cmp     dx, DMA_ISA_16M_LIMIT      ; app slot phys must be < 16 MB (ISA DMA reach)
+        jae     .ec2_range
+        jmp     .ec2_addr_done
+.ec2_addr_s1:
         mov     ax, cs
         mov     cl, 4
         shl     ax, cl
@@ -1175,6 +1233,7 @@ f_xms_configure2:
         shr     dx, cl
         add     ax, di
         adc     dx, 0
+.ec2_addr_done:
         mov     [si + EL3_DESC_ADDR], ax
         mov     [si + EL3_DESC_ADDR + 2], dx
         ; LEN = slot_sz, LEN_HI = 0
@@ -1209,7 +1268,13 @@ f_xms_configure2:
         mov     [si + EL3_DESC_NEXT], ax
         mov     [si + EL3_DESC_NEXT + 2], dx
         add     si, EL3_DESC_SIZE          ; next descriptor
-        add     di, EL3_RX_SLOT_STRIDE     ; next slot buffer
+        cmp     byte [xms_rx_mode], 0      ; advance the ADDR source: Stage2 slots[] +8, Stage1 slotbuf +stride
+        je      .ec2_adv_s1
+        add     di, XMS_SLOT_SIZE
+        jmp     .ec2_adv_done
+.ec2_adv_s1:
+        add     di, EL3_RX_SLOT_STRIDE
+.ec2_adv_done:
         inc     bl
         cmp     bl, bh
         jb      .ec2_build
@@ -1247,6 +1312,8 @@ f_xms_configure2:
         jmp     .ec2_err
 .ec2_nslots: mov dh, XMS_ERR_BAD_NSLOTS
         jmp     .ec2_err
+.ec2_range: mov dh, XMS_ERR_PHYS_RANGE
+        jmp     .ec2_err
 .ec2_size:  mov dh, XMS_ERR_SLOT_SIZE
 .ec2_err:   mov ax, cs
         mov     es, ax
@@ -1276,13 +1343,90 @@ f_xms_release:
         ; clear state
         mov     byte [xms_dma_armed], 0
         mov     byte [xms_rx_n], 0             ; R1.c: tear down the N-slot ring (0 = inactive)
+        mov     byte [xms_rx_mode], 0          ; R1.c Stage 2: back to upcall mode
         xor     ax, ax
         mov     [xms_cfg_off], ax
         mov     [xms_cfg_seg], ax
+        mov     [xms_compl_seg], ax            ; drop the completion/free ring pointers
+        mov     [xms_free_seg], ax
         clc
         ret
 .enot:  mov     dh, XMS_ERR_NOT_CFG
         stc
+        ret
+
+;------------------------------------------------------------------------------
+; f_xms_refill -- XMS_DMA_RX_REFILL (AL=0x06): Stage 2 free-ring doorbell. The stack has
+; returned one or more processed slots via the free ring; drain it (clear each freed slot's
+; UPD STATUS + xms_rx_posted[] to re-arm) and UpUnstall so the engine resumes over them.
+; No-op (success) when not in Stage 2. Returns CF=0, or CF=1 + DH on a bad state.
+;------------------------------------------------------------------------------
+f_xms_refill:
+        cmp     byte [xms_rx_mode], 0
+        je      .rf_nop                    ; not Stage 2: nothing to refill (benign success)
+        cmp     byte [xms_dma_armed], 0
+        je      .rf_enot
+        call    xms_free_drain             ; clear STATUS + posted[] for every freed slot
+        ; UpUnstall so the engine resumes over the just-re-armed slot(s)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_UP_UNSTALL
+        out     dx, ax
+.rf_nop:
+        clc
+        ret
+.rf_enot: mov   dh, XMS_ERR_NOT_CFG
+        stc
+        ret
+
+;------------------------------------------------------------------------------
+; xms_free_drain -- consume the Stage 2 free ring (stack->driver). For each entry [tail..head):
+; slot_id = free.entry[tail & mask]; clear UPD[slot_id].STATUS (lo+hi) + xms_rx_posted[slot_id]=0
+; (re-arm), bump free.tail. Ring layout: xms_ring_hdr_t {head,tail,mask,rsv} then u16 entries.
+; Called from f_xms_refill AND the ISR (opportunistic re-arm). DS=CS on entry/exit.
+; Clobbers AX,BX,CX,DX,SI,DI,ES. Bounded by the ring size (mask+1) so a bad head can't spin.
+;------------------------------------------------------------------------------
+xms_free_drain:
+        mov     ax, [xms_free_seg]
+        or      ax, ax
+        jz      .fd_ret                    ; no free ring configured
+        mov     es, ax
+        mov     bx, [xms_free_off]         ; ES:BX -> free ring hdr
+        mov     dx, [es:bx + XMS_RING_mask]
+        mov     cx, dx
+        inc     cx                         ; cx = ring capacity (mask+1) = spin bound
+.fd_loop:
+        mov     ax, [es:bx + XMS_RING_tail]
+        cmp     ax, [es:bx + XMS_RING_head]
+        je      .fd_ret                    ; tail == head -> ring empty
+        mov     si, ax
+        and     si, dx                     ; si = tail & mask (entry index)
+        shl     si, 1                      ; u16 entries
+        add     si, XMS_RING_SIZE          ; skip the 8-byte header
+        mov     di, [es:bx + si]           ; di = slot_id
+        cmp     di, EL3_RX_RING_N          ; guard: ignore an out-of-range slot_id
+        jae     .fd_adv
+        ; clear UPD[slot_id].STATUS (lo+hi) and posted[slot_id] -> slot re-armed
+        push    bx
+        mov     ax, di
+        mov     bx, ax
+        shl     bx, 1
+        shl     bx, 1
+        shl     bx, 1
+        shl     bx, 1                      ; bx = slot_id * 16 (EL3_DESC_SIZE)
+        add     bx, xms_rx_ring
+        xor     ax, ax
+        mov     [cs:bx + EL3_DESC_STATUS], ax
+        mov     [cs:bx + EL3_DESC_STATUS + 2], ax
+        mov     bx, di
+        mov     byte [cs:bx + xms_rx_posted], 0
+        pop     bx
+.fd_adv:
+        inc     word [es:bx + XMS_RING_tail]   ; consume the entry (free-running index)
+        loop    .fd_loop
+.fd_ret:
+        push    cs
+        pop     es
         ret
 
 ;--- XMS DMA TX_CONFIGURE (AL=0x04): ES:DI -> xms_tx_cfg_t; register the caller TX pool (8b.2a) ---
