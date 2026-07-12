@@ -349,6 +349,19 @@ nic_isr:
         mov     bx, ax
         test    word [bx + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
         jz      .rx_recheck_done
+        ; Stage 2 (completion/free ring): a still-complete tail may be a posted-but-unfreed slot --
+        ; the app owns that buffer and STATUS stays UP_COMPLETE by design. That is NOT a stranded
+        ; ack-window frame; re-delivering it is a no-op (xms_rx_deliver stops on posted[cursor]) that
+        ; never advances the cursor -> this loop spins forever. Only an UNposted completion at the
+        ; tail is genuinely new work worth draining here. (Stage 1 clears STATUS on deliver, so its
+        ; tail can only be complete when a real new frame landed -- skip the check.)
+        cmp     byte [xms_rx_mode], 0
+        je      .rx_recheck_go
+        mov     bl, [xms_ring_tail]
+        xor     bh, bh
+        cmp     byte [bx + xms_rx_posted], 0
+        jne     .rx_recheck_done        ; posted-awaiting-free -> engine already stalled here; not new work
+.rx_recheck_go:
 %ifdef CFG_DEBUG
         mov     al, 'x'
         call    dbg_logb                ; RX ack-race recovery (stranded UP_COMPLETE drained)

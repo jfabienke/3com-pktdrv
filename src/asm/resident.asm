@@ -1203,17 +1203,19 @@ f_xms_configure2:
         ;     LEN=slot_sz, STATUS=0, NEXT=phys(ring[(i+1) mod N]) --- (BX free: bh=N, bl=i).
         ; For Stage 2 the slots[] array (xms_slot_desc_t, 8 B) is walked via ES:DI (ES=slots seg,
         ; DI=entry off, +8/iter); for Stage 1 DI=slotbuf off (+stride/iter, ES unused).
-        mov     bh, [xms_rx_n]             ; bh = N (loop bound)
-        mov     si, xms_rx_ring            ; &ring[0]
+        ; Capture the ADDR source WHILE ES:BX still = cfg2 -- the `mov bh,[xms_rx_n]` below
+        ; repurposes BX as the loop counter and would corrupt the cfg2 offset (bh overwrite).
         cmp     byte [xms_rx_mode], 0
         je      .ec2_di_stage1
-        mov     di, [es:bx + XMS_CFG2_slots_lin]      ; ES:BX still = cfg2 here
+        mov     di, [es:bx + XMS_CFG2_slots_lin]      ; Stage 2: DI = slots array offset
         mov     ax, [es:bx + XMS_CFG2_slots_lin + 2]
-        mov     es, ax                     ; ES = slots array segment (BX now stale, reload below)
+        mov     es, ax                     ; ES = slots array segment (cfg2 no longer needed)
         jmp     .ec2_di_done
 .ec2_di_stage1:
-        mov     di, xms_rx_slotbuf         ; slot buffer offset for i=0
+        mov     di, xms_rx_slotbuf         ; Stage 1: DI = slot buffer offset (ES unused in loop)
 .ec2_di_done:
+        mov     bh, [xms_rx_n]             ; NOW repurpose BX: bh = N (loop bound)
+        mov     si, xms_rx_ring            ; &ring[0]
         xor     bl, bl                     ; bl = i
 .ec2_build:
         ; ADDR: Stage1 = phys(CS:di) (driver slotbuf) ; Stage2 = slots[i].phys at ES:[di]
@@ -1366,12 +1368,18 @@ f_xms_refill:
         je      .rf_nop                    ; not Stage 2: nothing to refill (benign success)
         cmp     byte [xms_dma_armed], 0
         je      .rf_enot
+        ; cli around the drain: the NIC ISR also drains the free ring (opportunistically each IRQ),
+        ; so the two free-ring CONSUMERS must not interleave. The ISR runs with IF=0; we match it
+        ; here. pushf/popf preserves the caller's IF (the Crynwr handler may run with IF=1).
+        pushf
+        cli
         call    xms_free_drain             ; clear STATUS + posted[] for every freed slot
         ; UpUnstall so the engine resumes over the just-re-armed slot(s)
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_UP_UNSTALL
         out     dx, ax
+        popf
 .rf_nop:
         clc
         ret
