@@ -330,6 +330,36 @@ nic_isr:
         ; until RX-DMA went live on level-INTx. R1.c.)
         mov     ax, EL3_CMD_ACK_INTR | 0x07FF   ; acknowledge all latched sources (incl. Up/DownComplete)
         out     dx, ax
+        ; --- RX closed-window re-check (N-slot RX-DMA ring). Same edge-loss hazard as the TX block
+        ; below: an UP_COMPLETE the up engine posts after the drain's last look but before/at this
+        ; ack is stranded -- the ack drops int_status UP_COMPLETE (INTx low) with no new rising edge,
+        ; and once the ring fills behind that frame the engine stalls and raises no further IRQ ->
+        ; the ring deadlocks (the ~62 KB sustained-read wedge: snapshot showed all 4 UPDs complete,
+        ; tail parked, no IRQ). Descriptor memory is truth: while ring[tail] is complete, drain it
+        ; and re-ack. xms_rx_deliver advances tail to the first non-complete slot, so this loops only
+        ; for frames that actually landed in the ack window and terminates when the engine quiesces.
+        cmp     byte [xms_rx_n], 0
+        je      .rx_recheck_done
+.rx_recheck:
+        mov     al, [xms_ring_tail]
+        xor     ah, ah
+        mov     cl, 4
+        shl     ax, cl                  ; tail * EL3_DESC_SIZE
+        add     ax, xms_rx_ring
+        mov     bx, ax
+        test    word [bx + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
+        jz      .rx_recheck_done
+%ifdef CFG_DEBUG
+        mov     al, 'x'
+        call    dbg_logb                ; RX ack-race recovery (stranded UP_COMPLETE drained)
+%endif
+        call    xms_rx_deliver          ; drain the stranded frame(s); re-arms via UpUnstall
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_ACK_INTR | 0x07FF
+        out     dx, ax
+        jmp     .rx_recheck
+.rx_recheck_done:
         ; --- closed-window re-check (edge-triggered IRQ). A TxComplete that latches while the
         ; line is already high (mid-ISR) raises no new edge; if it lands after the final status
         ; read, the ack above just cleared it UNPROCESSED and no IRQ will ever re-fire for it --
