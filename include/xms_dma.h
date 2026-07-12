@@ -40,6 +40,7 @@
 #define XMS_DMA_TX_SUBMIT     0x05u /* AL: submit one TX frame from caller phys (DX:CX=phys, BX=len)       */
 #define XMS_DMA_RX_REFILL     0x06u /* AL: reserved RX free-ring doorbell                                  */
 #define XMS_DMA_CSUM_CTL      0x07u /* AL: BX=1 enable / 0 disable Cyclone HW checksum insertion           */
+#define XMS_DMA_TX_SUBMIT_SG  0x08u /* AL: submit one 2-fragment TX frame (ES:DI → xms_tx_sg_t)            */
 
 /* ---- capability flags (BX on successful QUERY) ------------------------- */
 /*
@@ -57,6 +58,8 @@
 #define XMS_CAP_RX_DESC_V2  0x0040u /* N-slot RX ring + completion/free rings (RX vertical) */
 #define XMS_CAP_XMS_TX      0x0080u /* caller-phys TX submit path             (TX vertical) */
 #define XMS_CAP_HWCSUM      0x0100u /* Cyclone: HW IP/TCP/UDP checksum insertion on DMA TX  */
+#define XMS_CAP_SG_TX       0x0200u /* 2-fragment scatter-gather TX submit (TX_SUBMIT_SG); NIC gathers
+                                    * header template + payload-in-place, no CPU payload copy (486+ DMA) */
 
 /* ---- memory policy ----------------------------------------------------- */
 /*
@@ -169,6 +172,17 @@ typedef struct {                /* ES:DI -> TX_CONFIGURE; 12 bytes */
     uint32_t pool_phys;        /* base phys (< DMA_ISA_16M_LIMIT)             */
     uint32_t pool_len;         /* pool size in bytes                          */
 } xms_tx_cfg_t;
+
+#define XMS_TXSG_FLAG_CSUM  0x0001u /* frag flags bit0: request HW checksum (honored only on Cyclone) */
+
+typedef struct {                /* ES:DI -> TX_SUBMIT_SG; 16 bytes */
+    uint32_t hdr_phys;         /* frag0 phys — header template (Ethernet+IP+TCP)  */
+    uint16_t hdr_len;          /* frag0 length                                    */
+    uint16_t flags;            /* bit0 = request Cyclone IP+TCP/UDP csum           */
+    uint32_t pay_phys;         /* frag1 phys — payload in place                    */
+    uint16_t pay_len;          /* frag1 length                                    */
+    uint16_t reserved;         /* 0                                               */
+} xms_tx_sg_t;                 /* 16 bytes                                        */
 
 #pragma pack(pop)
 

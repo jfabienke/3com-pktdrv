@@ -27,6 +27,9 @@ XMS_DMA_RX_REFILL     equ 0x06  ; AL: reserved RX free-ring doorbell
 XMS_DMA_CSUM_CTL      equ 0x07  ; AL: BX=1 enable / 0 disable Cyclone HW checksum insertion
                                 ;     (driver then requests IP+TCP/UDP checksums per DMA TX frame;
                                 ;      the stack must leave the checksum fields zero while enabled)
+XMS_DMA_TX_SUBMIT_SG  equ 0x08  ; AL: submit one 2-fragment TX frame (ES:DI -> xms_tx_sg_t)
+                                ;     frag0=header template, frag1=payload-in-place; the NIC
+                                ;     download engine gathers both -- no CPU payload copy.
 
 ; ---- capability flags (BX on successful QUERY) --------------------------
 ; Caps are fixed at install time by JIT fragment selection (the ring tier is gated
@@ -43,6 +46,8 @@ XMS_CAP_XMS_RING    equ 0x0020  ; XMS + INT 15h ring mode               (486+)
 XMS_CAP_RX_DESC_V2  equ 0x0040  ; N-slot RX ring + completion/free rings (advertised by the RX vertical)
 XMS_CAP_XMS_TX      equ 0x0080  ; caller-phys TX submit path             (advertised by the TX vertical)
 XMS_CAP_HWCSUM      equ 0x0100  ; Cyclone (3C905B+): HW IP/TCP/UDP checksum insertion on DMA TX
+XMS_CAP_SG_TX       equ 0x0200  ; 2-fragment scatter-gather TX submit (TX_SUBMIT_SG); NIC gathers
+                                ;  header template + payload-in-place, no CPU payload copy (486+ DMA)
 
 ; ---- memory policy (xms_rx_cfg_t.policy field) --------------------------
 ; CONV_SINGLE(0) is the only single-transfer policy; CONFIGURE uses a single CMP.
@@ -135,6 +140,20 @@ XMS_TXCFG_reserved  equ 2       ; uint16_t reserved
 XMS_TXCFG_pool_phys equ 4       ; uint32_t pool_phys (<16MB)
 XMS_TXCFG_pool_len  equ 8       ; uint32_t pool_len
 XMS_TXCFG_SIZE      equ 12
+
+; xms_tx_sg_t (ES:DI -> TX_SUBMIT_SG), 16 bytes.
+; A 2-fragment scatter-gather TX submit: fragment 0 is the header template
+; (Ethernet+IP+TCP built by the stack), fragment 1 is the payload in place.
+; Both phys addresses must be < DMA_ISA_16M_LIMIT and inside the TX_CONFIGURE pool.
+XMS_TXSG_hdr_phys   equ 0       ; uint32_t frag0 phys (header template)
+XMS_TXSG_hdr_len    equ 4       ; uint16_t frag0 length
+XMS_TXSG_flags      equ 6       ; uint16_t flags (bit0 = request Cyclone IP+TCP/UDP csum)
+XMS_TXSG_pay_phys   equ 8       ; uint32_t frag1 phys (payload in place)
+XMS_TXSG_pay_len    equ 12      ; uint16_t frag1 length
+XMS_TXSG_reserved   equ 14      ; uint16_t reserved (0)
+XMS_TXSG_SIZE       equ 16
+
+XMS_TXSG_FLAG_CSUM  equ 0x0001  ; frag flags bit0: request HW checksum (honored only on Cyclone)
 
 ; ---- ISA 24-bit DMA physical address limit ------------------------------
 

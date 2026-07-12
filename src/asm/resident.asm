@@ -126,6 +126,8 @@ pkt_do_xms:
         je      .xts
         cmp     al, XMS_DMA_CSUM_CTL       ; 0x07 (Cyclone HW checksum on/off)
         je      .xcs
+        cmp     al, XMS_DMA_TX_SUBMIT_SG   ; 0x08 (SG-TX Phase A: 2-fragment gather)
+        je      .xtsg
         cmp     al, XMS_DMA_RX_CONFIGURE2  ; 0x03 (R1.c Stage 1: N-slot RX-DMA ring)
         je      .x2
         ; 0x06 RX_REFILL is defined but not implemented in this build (Stage 2): return
@@ -153,6 +155,8 @@ pkt_do_xms:
         jmp     pkt_xms_ret
 .xcs:   call    f_xms_csum_ctl
         jmp     pkt_xms_ret
+.xtsg:  call    f_xms_tx_submit_sg
+        jmp     pkt_xms_ret
 .x2:    call    f_xms_configure2
         jmp     pkt_xms_ret
 pkt_xms_ret:
@@ -162,7 +166,7 @@ pkt_error:
         mov     bp, sp
         mov     [bp + F_DH], dh         ; return error code in DH
         or      word [bp + F_FLAGS], CY ; set caller CY
-        jmp     short pkt_return
+        jmp     pkt_return              ; near: the CFG_DEBUG dispatch can exceed short range
 pkt_bad:
         mov     dh, PD_ERR_BADCMD
         jmp     short pkt_error
@@ -910,6 +914,12 @@ f_xms_query:
         je      .no_csum_cap
         or      bx, XMS_CAP_HWCSUM
 .no_csum_cap:
+        ; SG-TX (2-fragment gather) rides the PCI download engine's fragment walk; the ISA 515
+        ; single-transfer path would send only frag0. Advertise on PCI 90x (Boomerang/Cyclone) only.
+        cmp     word [g_uplist_off], EL3_UP_LIST_PCI
+        jne     .no_sg_cap
+        or      bx, XMS_CAP_SG_TX
+.no_sg_cap:
         mov     [bp + F_BX], bx
         mov     ax, EL3_MAX_FRAME
         cmp     byte [g_use_large], 0
@@ -1411,6 +1421,10 @@ dma_tx_caller:
         mov     ax, EL3_DESC_LAST_FRAG_HI
         mov     [xms_tx_desc + EL3_DESC_LEN_HI], ax
         mov     [xms_tx_desc + EL3_DESC_LEN], bx
+.desc_go:
+        ; shared arm/start/wait tail (referenced as dma_tx_caller.desc_go by the SG path).
+        ; A local label so it does NOT reparent the .tc_* locals below. Enter: xms_tx_desc
+        ; fully built, g_tx_in_flight==0.
         ; descriptor phys (CS:xms_tx_desc) -> dx:ax
         mov     bx, cs
         mov     ax, bx
@@ -1473,6 +1487,144 @@ dma_tx_caller:
         mov     dh, XMS_ERR_TX_BUSY
         stc
         ret
+
+;------------------------------------------------------------------------------
+; tx_pool_check -- is [phys .. phys+len) wholly inside the registered TX pool?
+; Enter: DX:CX = fragment phys (hi:lo), BX = length. Exit: CF=0 in range, CF=1 out of
+; range. Clobbers AX,SI,DI (the dispatch frame restores caller SI/DI on iret). Mirrors
+; the inline range check in f_xms_tx_submit so both fragments get identical validation.
+;------------------------------------------------------------------------------
+tx_pool_check:
+        cmp     dx, [xms_tx_pool_phys + 2]  ; phys >= pool_phys ?
+        jb      .pc_oor
+        ja      .pc_ge_ok
+        cmp     cx, [xms_tx_pool_phys]
+        jb      .pc_oor
+.pc_ge_ok:
+        mov     di, cx
+        add     di, bx
+        mov     si, dx
+        adc     si, 0                       ; si:di = frame_end = phys + len
+        mov     ax, [xms_tx_pool_phys]
+        add     ax, [xms_tx_pool_len]       ; CF = carry out of the low add
+        mov     ax, [xms_tx_pool_phys + 2]
+        adc     ax, [xms_tx_pool_len + 2]   ; ax = pool_end.high
+        cmp     si, ax
+        ja      .pc_oor                     ; frame_end.high > pool_end.high
+        jb      .pc_in                      ; frame_end.high < pool_end.high -> in range
+        mov     ax, [xms_tx_pool_phys]
+        add     ax, [xms_tx_pool_len]       ; ax = pool_end.low (only ax free here)
+        cmp     di, ax
+        ja      .pc_oor                     ; equal high, frame_end.low > pool_end.low
+.pc_in:
+        clc
+        ret
+.pc_oor:
+        stc
+        ret
+
+;------------------------------------------------------------------------------
+; f_xms_tx_submit_sg -- XMS_DMA_TX_SUBMIT_SG (AL=0x08): submit one 2-fragment TX frame
+; from ES:DI -> xms_tx_sg_t. Fragment 0 is the header template, fragment 1 is the payload
+; in place; the NIC download engine gathers both, so the CPU never copies the payload.
+; Builds the dedicated 24-byte 2-fragment DPD and hands off to the shared dma_tx_desc_go
+; arm/start/wait tail (blocking, TxComplete-driven, identical completion to TX_SUBMIT).
+; ES:DI is the caller's live struct pointer (the dispatch preserves it). Returns CF=0, or
+; CF=1 + DH=XMS_ERR_*. Only advertised on PCI 90x (the ISA path can't fragment-walk).
+;------------------------------------------------------------------------------
+f_xms_tx_submit_sg:
+        cmp     byte [g_use_dma], 0     ; PIO floor: xms_tx_* is not resident -- never touch it
+        je      .sg_ehw
+        ; SG gather rides the PCI download engine's fragment walk; the ISA 515 single-transfer
+        ; path would send only frag0 (silent payload loss). QUERY withholds the cap off-PCI, but
+        ; reject here too so a cap-ignoring caller can't corrupt a frame. (matches f_xms_query)
+        cmp     word [g_uplist_off], EL3_UP_LIST_PCI
+        jne     .sg_ehw
+        cmp     byte [xms_tx_armed], 0
+        je      .sg_enotcfg
+        ; both fragment lengths nonzero; total <= max frame (std, or FDDI-large when /j)
+        mov     bx, [es:di + XMS_TXSG_hdr_len]
+        or      bx, bx
+        jz      .sg_esize
+        mov     ax, [es:di + XMS_TXSG_pay_len]
+        or      ax, ax
+        jz      .sg_esize
+        add     ax, bx                  ; ax = total frame length
+        jc      .sg_esize               ; 16-bit wrap -> absurdly large
+        mov     bx, EL3_MAX_FRAME
+        cmp     byte [g_use_large], 0
+        je      .sg_lcap
+        mov     bx, EL3_MAX_FRAME_LARGE
+.sg_lcap:
+        cmp     ax, bx
+        ja      .sg_esize
+        ; must not clobber a descriptor the card is still reading
+        cmp     byte [g_tx_in_flight], 0
+        jne     .sg_busy
+        jmp     .sg_build               ; over the error stubs (keeps every jcc short + stable)
+        ; error returns, placed here so the validation jcc above stay short-range and the
+        ; post-build jc .sg_erange is a stable backward jump (avoids two-pass jump-size flip).
+.sg_ehw:    mov dh, PD_ERR_BADCMD
+        stc
+        ret
+.sg_enotcfg: mov dh, XMS_ERR_TX_NOT_CFG
+        stc
+        ret
+.sg_esize:  mov dh, XMS_ERR_SLOT_SIZE
+        stc
+        ret
+.sg_erange: mov dh, XMS_ERR_TX_RANGE
+        stc
+        ret
+.sg_busy:   mov dh, XMS_ERR_TX_BUSY
+        stc
+        ret
+.sg_build:
+        ; --- build the 2-fragment DPD from the struct (ES:DI live) ---
+        xor     ax, ax
+        mov     [xms_tx_desc + EL3_DESC_NEXT], ax       ; NEXT = 0 (single DPD)
+        mov     [xms_tx_desc + EL3_DESC_NEXT + 2], ax
+        ; frag0 = header template (NOT last)
+        mov     ax, [es:di + XMS_TXSG_hdr_phys]
+        mov     [xms_tx_desc + EL3_DESC_ADDR], ax
+        mov     ax, [es:di + XMS_TXSG_hdr_phys + 2]
+        mov     [xms_tx_desc + EL3_DESC_ADDR + 2], ax
+        mov     ax, [es:di + XMS_TXSG_hdr_len]
+        mov     [xms_tx_desc + EL3_DESC_LEN], ax
+        xor     ax, ax
+        mov     [xms_tx_desc + EL3_DESC_LEN_HI], ax     ; frag0: last-frag bit clear
+        ; frag1 = payload in place (LAST) -- second 8-byte pair at +8 from frag0
+        mov     ax, [es:di + XMS_TXSG_pay_phys]
+        mov     [xms_tx_desc + EL3_DESC_ADDR + 8], ax
+        mov     ax, [es:di + XMS_TXSG_pay_phys + 2]
+        mov     [xms_tx_desc + EL3_DESC_ADDR + 8 + 2], ax
+        mov     ax, [es:di + XMS_TXSG_pay_len]
+        mov     [xms_tx_desc + EL3_DESC_LEN + 8], ax
+        mov     ax, EL3_DESC_LAST_FRAG_HI
+        mov     [xms_tx_desc + EL3_DESC_LEN_HI + 8], ax
+        ; FSH: TxIndicate low; csum bits (high) iff the frame requests it AND this is a Cyclone
+        mov     ax, EL3_FSH_TX_INDICATE
+        mov     [xms_tx_desc + EL3_DESC_STATUS], ax
+        xor     ax, ax
+        test    word [es:di + XMS_TXSG_flags], XMS_TXSG_FLAG_CSUM
+        jz      .sg_nocsum
+        cmp     byte [g_csum_ok], 0
+        je      .sg_nocsum
+        mov     ax, EL3_FSH_ADD_IP_HI | EL3_FSH_ADD_TCP_HI
+.sg_nocsum:
+        mov     [xms_tx_desc + EL3_DESC_STATUS_HI], ax
+        ; --- range-check both fragments live wholly inside the registered pool ---
+        mov     cx, [xms_tx_desc + EL3_DESC_ADDR]
+        mov     dx, [xms_tx_desc + EL3_DESC_ADDR + 2]
+        mov     bx, [xms_tx_desc + EL3_DESC_LEN]
+        call    tx_pool_check
+        jc      .sg_erange
+        mov     cx, [xms_tx_desc + EL3_DESC_ADDR + 8]
+        mov     dx, [xms_tx_desc + EL3_DESC_ADDR + 8 + 2]
+        mov     bx, [xms_tx_desc + EL3_DESC_LEN + 8]
+        call    tx_pool_check
+        jc      .sg_erange
+        jmp     dma_tx_caller.desc_go   ; descriptor built + not busy: arm/start/wait
 
 ;------------------------------------------------------------------------------
 ; f_xms_csum_ctl -- XMS_DMA_CSUM_CTL (0x07): BX=1 enable / 0 disable the Cyclone

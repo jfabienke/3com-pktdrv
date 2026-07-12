@@ -277,7 +277,10 @@ xms_tx_in_flight: resb 1           ; 1 = a TX_SUBMIT single-transfer is DMAing n
 xms_tx_pool_phys: resd 1           ; caller TX pool base phys (< DMA_ISA_16M_LIMIT)
 xms_tx_pool_len:  resd 1           ; caller TX pool length (bytes)
                   alignb 4
-xms_tx_desc:      resb EL3_DESC_SIZE ; dedicated TX down-descriptor (NOT the ring's tx_descs[])
+xms_tx_desc:      resb EL3_DESC_SIZE + 8 ; dedicated TX down-descriptor (NOT the ring's tx_descs[]).
+                                   ; 24 bytes: 8-byte header (NEXT+FSH) + up to TWO 8-byte fragment
+                                   ; pairs -- single-fragment TX_SUBMIT uses frag0 only; TX_SUBMIT_SG
+                                   ; uses frag0 (header template) + frag1 (payload in place).
 
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
