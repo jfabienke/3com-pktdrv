@@ -1,6 +1,7 @@
 # 14 — Scatter/Gather DMA: zero-copy TX gather + RX copybreak
 
-**Status:** Phase A **IMPLEMENTED + validated** (2026-07-12); Phases B/C/D design. **Goal:**
+**Status:** Phases A + B **IMPLEMENTED + validated**, Phase C (RX copybreak) **DONE == #81**
+(2026-07-12); Phase D deferred. **Goal:**
 remove the per-byte payload copies from the DMA datapath — gather TX frames from a header
 fragment + an in-place payload fragment, and deliver large RX frames in place (copybreak) — so
 the CPU stops touching payload bytes on the fast tiers. Builds on the caller-phys TX vertical
@@ -17,6 +18,25 @@ the CPU stops touching payload bytes on the fast tiers. Builds on the caller-phy
 > IP+UDP checksums on the csum frames; on **3c905** gather-only, 4/4. NVMe VERIFY 128 KB still OK
 > (no datapath regression). **Not yet wired into the stack's TCP xmit hot path** — that (the actual
 > throughput win) is the next sub-step (Phase A.2 / folds with #31 H2C).
+
+> **Phase B status (non-Cyclone software checksum, #83).** On a NIC that gathers but can't
+> checksum (**3c905 Boomerang**: advertises `SG_TX` cap, *not* `HWCSUM`), the stack must checksum
+> the frame itself before an SG submit — but **without** copying the payload: it reads the payload
+> *in place* (`cksum_partial`, one read pass, no write) and inserts IP+UDP checksums into the header
+> fragment, then submits with `flags=0` (no csum bits in the FSH). The driver side needed **no
+> change** — `f_xms_tx_submit_sg` already emits a csum-less DPD when the flag is clear. Proven by
+> the extended `src/sgtxtest.c` (adds `sw_checksum_inplace()`, mirroring `ip_send()`/`tcp_cksum()`
+> folding) + strengthened `tools/sgtx_verify.py` (now requires valid IP+UDP checksums on **every**
+> gathered frame, not just offloaded ones): **3c905** 4/4 software-checksummed frames gather with
+> valid on-wire IP+UDP csums (model FSH `0x8000`, no csum bits); **3c905b** the HW/software split
+> (2 offloaded FSH `0x6008000`, 2 software FSH `0x8000`) all 4 verify — both paths coexist on one
+> Cyclone. **Memory win: one fewer payload pass** — `cksum_partial` (read-only) replaces the legacy
+> `cksum_copy` (read+write); the per-pass cost is already quantified by `cksumtest`'s micro-bench
+> (T1/T2.1). The changes are **test-only** (no runtime stack file touched), so 509/515/590/905/905B
+> runtime is byte-identical (515 SG_TX unadvertised → the runtime keeps its contiguous send, no
+> regression; 515 driver install re-confirmed on the pci build). The **end-to-end throughput lift**
+> and the `CFG_PROF` pass-count delta on the live TCP path ride the hot-path wiring (#31) + real-HW
+> ladder (#79), where the copy is measurable — TX copybreak is round-trip-bound on the slirp rig.
 
 Companion docs: [11 PCI plan](11-pci-plan.md), [13 R1.c RX ring](13-r1c-rx-ring.md),
 [04 DMA model](04-dma-model.md).
@@ -210,7 +230,7 @@ one app buffer, no oversized resident slot.
 |-------|---------|-------|------|
 | **Pre** | Land #80 (RX read residual) | driver+qemu | 128 KB VERIFY read passes on 905 |
 | **A** | SG-TX 2-fragment DPD + model fragment walk + `TX_SUBMIT_SG` ABI + Cyclone-first csum | all 3 | pcap shows 2-fragment DMA; VERIFY write passes on 905B; icount confirms **zero payload touch** vs. Phase-8b baseline |
-| **B** | Non-Cyclone SG-TX (read-only checksum into header frag) | stack | 515 + 905 write no-regress; one fewer payload pass (CFG_PROF) |
+| **B** ✅ | Non-Cyclone SG-TX (read-only checksum into header frag) | stack (test) | **DONE**: 905 4/4 sw-checksummed frames gather + valid IP+UDP csum (pcap); 905b HW/sw split both valid; 515 unaffected (test-only). Throughput/CFG_PROF pass-delta ride #31/#79 |
 | **C** | RX copybreak — free/completion ring + `RX_REFILL` + receiver ready-queue (== #81) | all 3 | large-frame read zero-copy; matrix no-regress; folds #25/#26 |
 | **D** | Retain-until-ACK for pipelined TCP SG-TX (== #31) | stack | pipelined TCP write no-regress; **optional/deferred** |
 
