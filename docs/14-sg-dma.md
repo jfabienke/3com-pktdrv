@@ -184,6 +184,39 @@ The payload phys for NVMe writes is the caller's INT 13h buffer (already resolve
 Stage D** — until then, TCP SG-TX stays send-and-block per segment (correct, just not pipelined),
 and only the NVMe write path (blocking by construction) gets the full benefit first.
 
+### 5.1 Pool resolution + wiring plan (#31 design, settled 2026-07-12)
+
+The blocker was that `tx_pool_check` validates ONE registered pool while the TX fragments live in
+two regions (txbuf in DGROUP; per-conn sndrings in mempol). **Resolved by #27 + a combined arena
+(option A):** txbuf already comes from mempol now, so the TSR allocates ONE contiguous
+`MEMCLASS_PIO_SMALL` block and carves it —
+
+```
+[ txbuf 4608 ][ snd0 16384 ][ snd1 16384 ]   ≈ 37 KB, one mempol block, phys < 1 MB
+```
+
+— hands the carved pointers to netif (txbuf) and `tcp_set_bufs` (sndrings), and registers the
+whole span once via `TX_CONFIGURE`. Every SG fragment (header in txbuf, payload in a sndring)
+then passes the single-pool range check by construction. UMB tier included (still < 1 MB, real-
+mode addressable, ISA-DMA-safe); the XMS tier stays excluded from this arena (DMA class rules).
+
+**Wiring shape (correctness-gated, from #83's proven mechanism):** in `tcp_xmit_data`, when the
+driver advertised `SG_TX` and the segment's ring span does NOT wrap:
+- Cyclone (`HWCSUM`): build/refresh the header template, leave csums zero, submit
+  `{hdr_phys, 54, CSUM, ring_phys(seq), seglen}` — zero payload touch.
+- Boomerang (no HWCSUM): `cksum_partial` the ring span IN PLACE (read-only, #83), stamp the
+  header csums, submit with `flags=0` — one payload pass instead of read+write.
+- Wrapped span (2 ring pieces) or no SG cap: keep today's fused `cksum_copy` → `pkt_send` path
+  (the 2-fragment DPD has exactly one payload fragment; a 3-fragment variant is not worth it —
+  wraps are ≤1 segment per ring lap).
+Lifetime is already safe send-and-block: `TX_SUBMIT_SG` blocks until dnComplete, and Go-Back-N
+retransmits re-submit from the ring (which retains unacked bytes). Retain-until-ACK pipelining
+of the DPD itself stays Stage D / deferred.
+
+**Gate:** correctness only on this rig (pcap csum-valid on 905/905b + VERIFY + matrix no-regress);
+the throughput claim rides #79 real HW — measured 2026-07-12: TX copybreak is round-trip-bound
+here (#32/#83), and the #59/#51 work moved the write bottleneck to protocol RTTs, not copies.
+
 ---
 
 ## 6. RX zero-copy — completion/free ring + copybreak (== #81)
