@@ -752,15 +752,22 @@ build_plan:
         jb      .ring_resolved
         mov     byte [g_tx_ring], 1
 .ring_resolved:
-        ; --- resolve FDDI-sized large frames: /j AND 3C515 (else standard Ethernet). Sets the RX
-        ;     length mask to the 13-bit Corkscrew field so a >2047 B frame's length isn't truncated.
-        ;     el3_init sets allowLargePackets in MacControl when g_use_large. ---
+        ; --- resolve FDDI-sized large frames: /j AND a bus-master datapath (else standard
+        ;     Ethernet). Large frames require descriptor DMA: Corkscrew (515) and Boomerang/
+        ;     Cyclone (90x). Tomahawk (509) and Vortex (590) are PIO datapaths -- the TX FIFO
+        ;     path can't carry >1518, so /j is silently ignored on them. Sets the 13-bit RX
+        ;     length mask so a >2047 B frame's length isn't truncated; el3_init sets
+        ;     allowLargePackets in MacControl (Window 3, same register across the family)
+        ;     when g_use_large. (#26 PCI extension) ---
         mov     byte [g_use_large], 0
         mov     word [g_rx_len_mask], 0x07FF     ; default: standard Ethernet (11-bit-safe)
         cmp     byte [g_want_large], 0
         je      .large_resolved
-        cmp     byte [g_nic_gen], 1              ; Corkscrew (3C515) only
-        jne     .large_resolved
+        cmp     byte [g_nic_gen], NIC_GEN_CORKSCREW
+        je      .large_ok
+        cmp     byte [g_nic_gen], NIC_GEN_BOOMERANG ; Boomerang(3)/Cyclone(4) qualify
+        jb      .large_resolved                     ; Tomahawk(0)/Vortex(2): PIO -> no /j
+.large_ok:
         mov     byte [g_use_large], 1
         mov     word [g_rx_len_mask], 0x1FFF     ; 13-bit length field (FDDI-sized RX)
 .large_resolved:
