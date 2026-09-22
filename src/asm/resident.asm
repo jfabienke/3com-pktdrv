@@ -489,7 +489,10 @@ dma_tx_async:
         mov     cl, 4
         shl     bx, cl                          ; head * 16
         add     bx, tx_descs                    ; bx = &desc[head]
-        ; ADDR = phys(F_DS:F_SI): the card DMAs straight from the caller's pooled buffer (<1 MB, 24-bit)
+        ; ADDR = phys(F_DS:F_SI): the card DMAs straight from the caller's pooled buffer (<1 MB, 24-bit).
+        ; Under V86 seg<<4 is not the bus address -> VDS-lock the frame (tx_v86_phys, DMA region).
+        cmp     byte [g_v86], 0
+        jne     .v86_addr
         mov     ax, [bp + F_DS]
         mov     dx, ax
         mov     cl, 4
@@ -498,6 +501,7 @@ dma_tx_async:
         shr     dx, cl                          ; dx = seg >> 12 (high 4 bits of seg*16)
         add     ax, [bp + F_SI]
         adc     dx, 0                           ; dx:ax = phys(buffer)
+.addr_set:
         mov     [bx + EL3_DESC_ADDR], ax
         mov     [bx + EL3_DESC_ADDR + 2], dx
         ; LEN = F_CX, STATUS = 0
@@ -523,6 +527,9 @@ dma_tx_async:
 .ok:
         clc
         ret
+.v86_addr:
+        call    tx_v86_phys                     ; dx:ax = VDS-locked phys (or the slot copy's); keeps bx
+        jmp     .addr_set
 
 ;------------------------------------------------------------------------------
 ; dma_tx_single -- blocking zero-copy bus-master TX (3C515 Corkscrew, 286 real mode). The ring's
@@ -678,6 +685,11 @@ f_uninstall:
         or      al, ah
         out     0xA1, al
 .un_card:
+        ; bus-master path live -> release the DMA-side state (VDS locks) before the card is idled
+        cmp     byte [g_use_dma], 0
+        je      .un_nodma
+        call    dma_teardown
+.un_nodma:
         ; disable all NIC interrupt sources (leave the card otherwise idle)
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD

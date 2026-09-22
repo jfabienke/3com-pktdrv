@@ -98,6 +98,9 @@ g_want_large:   resb 1          ; 1 = /j given -> request FDDI-sized large frame
 g_want_v86trust: resb 1         ; 1 = /v given -> trust the V86 host (EMM386/JEMM386) to emulate WBINVD
 g_wbinvd_ok:    resb 1          ; 1 = WBINVD may run: 486+ AND (real mode OR /v). Set in dma_v86_forbid_check
 g_coh_nosafe:   resb 1          ; 1 = the coherency probe found a non-coherent cache with no safe flush -> PIO
+g_vds_cold_held: resb 1         ; 1 = cold_dds holds the VDS lock on the cold probe span (V86)
+                alignb 2
+cold_dds:       resb 16         ; VDS DDS for the cold probe span [bm_test_buf, coh_probe_end)
 tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
@@ -226,6 +229,8 @@ dbg_log:        times DBG_LOG_SIZE db 0
 resident_end_pio:
 global resident_end_pio
 
+%include "resident_dma.asm"         ; DMA-only resident code (VDS locks, teardown) -- dropped on the PIO floor
+
 ; bus-master TX-DMA structures -- kept ONLY when the DMA path is active (gated on g_use_dma), so
 ; they sit past resident_end_pio and the PIO floor drops them. RX is always PIO (no RX-DMA buffer/
 ; descriptor), so only the TX descriptors + ring slots live here. Descriptor layout matches the
@@ -297,6 +302,11 @@ g_desc_phys:    resd 1             ; descriptor block physical base -- card UP_L
 g_rx_flush_fn:  resw 1             ; RX-drain cache helper (= g_cache_flush_fn, or cache_flush_none when NC-relocated)
 g_v86:          resb 1             ; 1 = running under a paging V86 host (SMSW PE=1) -> seg<<4 is not the bus
                                    ; address; set by dma_v86_forbid_check (DMA region: DMA paths read it)
+g_vds_span_held: resb 1            ; 1 = tx_span_dds holds the VDS lock on [tx_descs, resident_end) (V86)
+tx_vds_held:    resb TX_RING_N     ; per TX slot: 1 = tx_vds_dds[i] still holds an AH=F1 frame's VDS lock
+                alignb 2
+tx_span_dds:    resb DDS_LEN       ; VDS DDS: the driver's own DMA span, locked for the driver's lifetime
+tx_vds_dds:     resb TX_RING_N * DDS_LEN   ; VDS DDS per TX slot (AH=F1 per-send locks under V86)
 
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
@@ -515,6 +525,7 @@ global resident_end
         ; Phase 2: RX cache-coherency self-test (MAC internal loopback) -> g_flush_tier. On QEMU (no
         ; cache modelled) this concludes coherent -> NONE; on a non-coherent 486+ it picks WBINVD.
         call    phase_validate_coherency
+        call    vds_cold_release    ; V86: drop the cold probe span's VDS lock (+ the span lock if now PIO)
         mov     dx, msg_coh
         call    print_str
         mov     dx, msg_coh_nosafe
@@ -1077,6 +1088,7 @@ coh_nc_buf:      times COH_BUF_LEN db 0          ; VIRGIN buffer for the NC re-t
 coh_wb_src:      times COH_FRAME_LEN db 0
         alignb 32
 coh_wb_dst:      times COH_BUF_LEN db 0
+coh_probe_end:                                  ; end of the cold bus-master probe span (V86 VDS proof)
 
 ; detect_nic / id_read_eeprom / io_delay -- the real 3C509B ISA probe + activation.
 %include "el3_probe.asm"
@@ -1159,12 +1171,25 @@ build_plan:
 ; dma_v86_forbid_check -- under a paging memory manager (V86) WITHOUT VDS we cannot get a safe bus-master
 ; physical (seg<<4 is a lie when low memory is remapped, and there's no VDS to translate/lock), so fall
 ; back to the PIO floor -- dma.h's DMA_POLICY_FORBID. Real mode keeps DMA (seg<<4 valid). V86 *with* VDS
-; keeps DMA too: TX seg<<4 correctness is then proven empirically by phase_validate_dma (its descriptor
-; poll mismatches under a remapping map -> timeout -> PIO) and the RX conv ring gets the true physical from
-; the VDS-locking stack (XMS_POLICY_COMMONBUF). Cold; clobbers AX, ES. Only reached on >=286 (SMSW).
+; keeps DMA only once it is PROVEN: the 386+ ring, and a VDS lock of the driver's DMA span (and the cold
+; probe span) that reports phys == seg<<4. AH=F1 stack buffers are VDS-locked per send (tx_v86_phys);
+; the RX conv ring gets the true physical from the VDS-locking stack (XMS_POLICY_COMMONBUF). Also records
+; g_v86 and g_wbinvd_ok. Cold; clobbers AX, CX, DX, ES. Only reached on >=286 (SMSW).
 ;------------------------------------------------------------------------------
 dma_v86_forbid_check:
         mov     byte [g_v86], 0
+        mov     byte [g_vds_span_held], 0       ; VDS lock bookkeeping (resb: not load-zeroed)
+        mov     byte [g_vds_cold_held], 0
+        push    di
+        mov     di, tx_vds_held
+        mov     cx, TX_RING_N
+        xor     al, al
+        push    es
+        push    ds
+        pop     es
+        rep     stosb
+        pop     es
+        pop     di
         cmp     byte [g_use_dma], 0
         je      .dvf_done               ; already PIO -> nothing to forbid
         push    es
@@ -1188,11 +1213,109 @@ dma_v86_forbid_check:
         xor     ax, ax
         mov     es, ax
         test    byte [es:0x047B], 0x20  ; BIOS data 0040:007Bh bit 5 = VDS available
-        jnz     .dvf_keep               ; V86 + VDS -> keep DMA (phys proven by the bus-master test + stack VDS)
-        call    dma_force_pio           ; V86 + no VDS -> can't address safely -> PIO floor
+        jz      .dvf_forbid             ; V86 + no VDS -> can't address safely -> PIO floor
+        ; V86 + VDS: seg<<4 must be PROVEN, not assumed. Require the 386+ ring (a /2-forced 286 send_pkt
+        ; zero-copies the caller's buffer at seg<<4, dma_tx_single), then VDS-lock the driver's whole DMA
+        ; span [tx_descs, resident_end) -- descriptors, TX slots, RX descriptors -- and require phys ==
+        ; seg<<4 (identity). Hold that lock for the driver's lifetime. Also prove the cold probe span the
+        ; bus-master probes DMA into (released after them). AH=F1 stack buffers are VDS-locked per send.
+        cmp     byte [g_tx_ring], 0
+        je      .dvf_forbid
+        push    si
+        push    di
+        mov     di, tx_span_dds
+        mov     si, tx_descs
+        mov     cx, resident_end - tx_descs
+        call    vds_lock_prove
+        jc      .dvf_pop_forbid
+        mov     byte [g_vds_span_held], 1
+        mov     di, cold_dds
+        mov     si, bm_test_buf
+        mov     cx, coh_probe_end - bm_test_buf
+        call    vds_lock_prove
+        jc      .dvf_unspan
+        mov     byte [g_vds_cold_held], 1
+        pop     di
+        pop     si
+        jmp     .dvf_keep
+.dvf_unspan:
+        mov     di, tx_span_dds
+        call    vds_unlock_di
+        mov     byte [g_vds_span_held], 0
+.dvf_pop_forbid:
+        pop     di
+        pop     si
+.dvf_forbid:
+        call    dma_force_pio
 .dvf_keep:
         pop     es
 .dvf_done:
+        ret
+
+;------------------------------------------------------------------------------
+; vds_lock_prove -- VDS-lock CS:SI, CX bytes via the DDS at CS:DI and require an in-place lock whose
+; physical address equals seg<<4 (identity-mapped under the V86 host). CF=0 -> locked (caller owns the
+; lock); CF=1 -> not provable (nothing left locked). DX=0 (JEMM386 rejects the no-alloc flag); a bounce
+; buffer shows as buffer_id != 0. Cold; clobbers AX, CX, DX.
+;------------------------------------------------------------------------------
+vds_lock_prove:
+        mov     [di + DDS_SIZE], cx
+        mov     [di + DDS_OFFSET], si
+        mov     [di + DDS_SEGMENT], cs
+        xor     ax, ax
+        mov     [di + DDS_SIZE + 2], ax
+        mov     [di + DDS_OFFSET + 2], ax
+        mov     [di + DDS_BUFID], ax
+        mov     [di + DDS_PHYS], ax
+        mov     [di + DDS_PHYS + 2], ax
+        push    es
+        push    cs
+        pop     es                              ; ES:DI = DDS
+        mov     ax, VDS_LOCK_REGION
+        xor     dx, dx
+        stc                                     ; an unhooked INT 4Bh must read as failure
+        int     0x4B
+        pop     es
+        jc      .vlp_fail                       ; CF alone signals failure
+        cmp     word [di + DDS_BUFID], 0
+        jne     .vlp_unlock                     ; bounce buffer -> not in place
+        call    cs_phys                         ; dx:ax = (CS<<4) + SI
+        cmp     ax, [di + DDS_PHYS]
+        jne     .vlp_unlock
+        cmp     dx, [di + DDS_PHYS + 2]
+        jne     .vlp_unlock
+        clc
+        ret
+.vlp_unlock:
+        push    es
+        call    vds_unlock_di
+        pop     es
+.vlp_fail:
+        stc
+        ret
+
+;------------------------------------------------------------------------------
+; vds_cold_release -- after the bus-master probes: release the cold probe span's VDS lock, and if the
+; probes dropped DMA (PIO fallback) release the resident span lock too (the DMA region is freed).
+; Cold; clobbers AX, DX, DI.
+;------------------------------------------------------------------------------
+vds_cold_release:
+        push    es
+        cmp     byte [g_vds_cold_held], 0
+        je      .vcr_span
+        mov     di, cold_dds
+        call    vds_unlock_di
+        mov     byte [g_vds_cold_held], 0
+.vcr_span:
+        cmp     byte [g_use_dma], 0
+        jne     .vcr_done
+        cmp     byte [g_vds_span_held], 0
+        je      .vcr_done
+        mov     di, tx_span_dds
+        call    vds_unlock_di
+        mov     byte [g_vds_span_held], 0
+.vcr_done:
+        pop     es
         ret
 
 ;------------------------------------------------------------------------------
