@@ -724,12 +724,10 @@ f_xms_query:
         or      bx, XMS_CAP_RING | XMS_CAP_VCPI | XMS_CAP_DPMI
 .no_ring:
         mov     [bp + F_BX], bx
-        mov     ax, EL3_MAX_FRAME
-        cmp     byte [g_use_large], 0
-        je      .done
-        mov     ax, TX_SLOT_SZ          ; 1536 (FDDI-sized slot limit)
-.done:
-        mov     [bp + F_DX], ax
+        ; DX = the SLOT size the stack should use (also its CONV ring stride), not the max frame: 1536 =
+        ; the max frame rounded up to a 32-byte multiple, so every CONV slot starts cache-line + paragraph
+        ; aligned (xms_rx_deliver finds a slot's CPU segment as lin >> 4 and reads it at offset 0).
+        mov     word [bp + F_DX], TX_SLOT_SZ
         clc
         ret
 
@@ -760,16 +758,19 @@ f_xms_configure:
         ; validate phys1 < 16 MB
         cmp     byte [es:bx + XMS_CFG_phys1 + 3], 0
         jne     .ephys
-        ; validate slot_size
-        cmp     byte [g_use_large], 0
-        je      .slotchk_std
-        mov     ax, TX_SLOT_SZ
-        jmp     .slotchk_cmp
-.slotchk_std:
-        mov     ax, EL3_MAX_FRAME
-.slotchk_cmp:
-        cmp     [es:bx + XMS_CFG_slot_size], ax
+        ; validate slot_size: 1..TX_SLOT_SZ (the QUERY value); the CONV/COMMONBUF ring is contiguous with
+        ; stride = slot_size, so there it must also be a 32-byte multiple (a 1514 stride puts slots 1..N-1
+        ; off a paragraph -> the lin >> 4 in-place delivery reads the wrong bytes)
+        mov     ax, [es:bx + XMS_CFG_slot_size]
+        or      ax, ax
+        jz      .esz
+        cmp     ax, TX_SLOT_SZ
         ja      .esz
+        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_CONV
+        jb      .slot_ok
+        test    al, 0x1F
+        jnz     .esz
+.slot_ok:
         ; save config pointer + fields
         mov     ax, [es:bx + XMS_CFG_slot_size]
         mov     [xms_slot_sz], ax
