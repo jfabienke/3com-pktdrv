@@ -50,6 +50,10 @@ EL3_CS_RX_COPYBREAK     equ 0x3C     ; MODEL-PRIVATE (el3 emulator, not real sil
 ; StartDma is cmd 0x14 (<<11 = 0xA000): param != 0 -> down (TX), param 0 -> up (RX).
 EL3_CMD_START_DMA_DOWN  equ 0xA001   ; kick the down (TX) descriptor at DownListPtr
 EL3_CMD_START_DMA_UP    equ 0xA000   ; kick the up (RX) descriptor at UpListPtr
+EL3_CMD_UP_STALL        equ 0x3000   ; stall the up (RX) DMA engine (safe to rewrite UpListPtr)
+EL3_CMD_UP_UNSTALL      equ 0x3001
+EL3_CMD_DOWN_STALL      equ 0x3002   ; stall the down (TX) DMA engine (safe to rewrite DownListPtr)
+EL3_CMD_DOWN_UNSTALL    equ 0x3003
 
 ; ---- down/up descriptor (16 bytes, little-endian). Matches the emulator EL3DownDesc:
 ;   +0 next_desc (0 = single transfer)  +4 status  +8 buffer phys  +12 length

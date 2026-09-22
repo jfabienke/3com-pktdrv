@@ -56,11 +56,12 @@ msg_crlf    db 13, 10, '$'
 msg_dma     db 'DMA=', '$'
 msg_dma_on  db 'ON', 13, 10, '$'
 msg_dma_pio db 'PIO', 13, 10, '$'
+msg_dma_pio_nc db 'PIO (non-coherent, no safe flush)', 13, 10, '$'
 msg_cb      db 'COPYBREAK T=0x', '$'
 msg_coh        db 'CACHE FLUSH=', '$'           ; Phase 2 RX coherency verdict report
 msg_coh_none   db 'NONE (coherent)', 13, 10, '$'
 msg_coh_wbinvd db 'WBINVD (non-coherent)', 13, 10, '$'
-msg_coh_evict  db 'SW-EVICT (non-coherent, 386)', 13, 10, '$'
+msg_coh_nosafe db 'NONE (non-coherent, no safe flush)', 13, 10, '$'
 msg_nc_eff     db 'NC=validated (pool+desc NC; RX flush dropped)', 13, 10, '$'
 msg_nc_off     db 'NC=requested, not effective (flush kept)', 13, 10, '$'
 
@@ -94,6 +95,9 @@ g_force8:       resb 1          ; 1 = /8 given -> force the 8088-class (8-bit by
 g_force286:     resb 1          ; 1 = /2 given -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
 g_want_dma:     resb 1          ; 1 = /d given -> request bus-master TX DMA (resolved in build_plan)
 g_want_large:   resb 1          ; 1 = /j given -> request FDDI-sized large frames (gated to 3C515)
+g_want_v86trust: resb 1         ; 1 = /v given -> trust the V86 host (EMM386/JEMM386) to emulate WBINVD
+g_wbinvd_ok:    resb 1          ; 1 = WBINVD may run: 486+ AND (real mode OR /v). Set in dma_v86_forbid_check
+g_coh_nosafe:   resb 1          ; 1 = the coherency probe found a non-coherent cache with no safe flush -> PIO
 tail_end:       resw 1          ; PSP command-tail end offset (cold arg scan)
 g_emitted_len:  resw 1
 g_keep_para:    resw 1
@@ -291,6 +295,8 @@ g_lin_delta:    resd 1             ; Phase 2 4b: CONV/COMMONBUF in-place deliver
 g_desc_far:     resd 1             ; descriptor block far ptr (offset, then segment) -- CPU access (ISR/build/poll)
 g_desc_phys:    resd 1             ; descriptor block physical base -- card UP_LIST/NEXT
 g_rx_flush_fn:  resw 1             ; RX-drain cache helper (= g_cache_flush_fn, or cache_flush_none when NC-relocated)
+g_v86:          resb 1             ; 1 = running under a paging V86 host (SMSW PE=1) -> seg<<4 is not the bus
+                                   ; address; set by dma_v86_forbid_check (DMA region: DMA paths read it)
 
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
@@ -317,8 +323,9 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 7               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
-                                    ; g_want_large (a stale /j must not survive a reload either)
+        mov     cx, 10              ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
+                                    ; g_want_large, g_want_v86trust, g_wbinvd_ok, g_coh_nosafe (a stale /j or
+                                    ; /v must not survive a reload either)
         xor     al, al
         rep     stosb
         ; The NC opt-in state is RESIDENT (read at configure) but set during this cold arg scan, so it can't
@@ -374,6 +381,10 @@ global resident_end
 .chk_nc:
         cmp     al, 'n'
         je      .opt_nc             ; /n=<id> -> opt in to a non-cacheable DMA region on a known chipset
+        cmp     al, 'v'
+        jne     .chk_gen
+        mov     byte [g_want_v86trust], 1 ; /v -> trust the V86 host's WBINVD emulation (JEMM386 does)
+        jmp     .st_next
 .chk_gen:
         cmp     al, '5'
         jne     .st_next
@@ -500,28 +511,19 @@ global resident_end
         call    build_plan          ; per-gen Window-1 base + TX-start cmd + PIO immediates
         call    el3_init            ; bring the activated card to operational state (uses g_tx_start)
         call    phase_validate_dma  ; (>=286) test-before-trust: prove bus-master DMA or fall back to PIO
-        ; report the resolved DMA decision (post-probe) on the console
-        mov     dx, msg_dma
-        call    print_str
-        mov     dx, msg_dma_pio
-        cmp     byte [g_use_dma], 0
-        je      .dma_report
-        mov     dx, msg_dma_on
-.dma_report:
-        call    print_str
 
         ; Phase 2: RX cache-coherency self-test (MAC internal loopback) -> g_flush_tier. On QEMU (no
         ; cache modelled) this concludes coherent -> NONE; on a non-coherent 486+ it picks WBINVD.
         call    phase_validate_coherency
         mov     dx, msg_coh
         call    print_str
+        mov     dx, msg_coh_nosafe
+        cmp     byte [g_coh_nosafe], 0
+        jne     .coh_report
         mov     dx, msg_coh_none
         cmp     byte [g_flush_tier], FLUSH_TIER_NONE
         je      .coh_report
         mov     dx, msg_coh_wbinvd
-        cmp     byte [g_flush_tier], FLUSH_TIER_WBINVD
-        je      .coh_report
-        mov     dx, msg_coh_evict
 .coh_report:
         call    print_str
         ; NC status (only when /n=<id> opted in): validated by the cold re-test, or requested-but-ineffective
@@ -534,6 +536,18 @@ global resident_end
 .nc_report:
         call    print_str
 .nc_noreport:
+        ; report the resolved DMA decision -- AFTER the coherency phase, which can still drop to PIO
+        mov     dx, msg_dma
+        call    print_str
+        mov     dx, msg_dma_on
+        cmp     byte [g_use_dma], 0
+        jne     .dma_report
+        mov     dx, msg_dma_pio_nc
+        cmp     byte [g_coh_nosafe], 0
+        jne     .dma_report
+        mov     dx, msg_dma_pio
+.dma_report:
+        call    print_str
 
         call    copybreak_autotune  ; RX copybreak threshold T = c_setup / a_PIO (cost model + PIT-timed probe)
         mov     dx, msg_cb
@@ -804,13 +818,17 @@ phase_validate_coherency:
         jmp     .pvc_cleanup                            ; all fresh -> coherent -> g_flush_tier stays NONE
 
 .pvc_noncoherent:
-        ; record the always-correct FALLBACK flush tier (the verdict if NC is unavailable/ineffective).
-        ; 486+ -> WBINVD; <486 -> software-evict (deferred, docs/17). On QEMU this branch is unreachable
-        ; without CFG_FORCE_NC (no cache -> the loopback always reads fresh).
-        mov     byte [g_flush_tier], FLUSH_TIER_EVICT
-        cmp     byte [g_cpu_class], CPU_80486
-        jb      .pvc_nc
-        mov     byte [g_flush_tier], FLUSH_TIER_WBINVD
+        ; Non-coherent: DMA is only safe with a flush we may actually execute. WBINVD needs a 486+ AND (real
+        ; mode OR /v -- under V86 it is a privileged #GP the host must emulate). Without it (<486: the 386
+        ; software-evict tier is deferred, docs/17; V86 without /v) there is NO safe flush -> drop to the PIO
+        ; floor rather than DMA with stale lines. On QEMU this branch is unreachable without CFG_FORCE_NC.
+        cmp     byte [g_wbinvd_ok], 0
+        jne     .pvc_flush_ok
+        call    dma_force_pio
+        mov     byte [g_coh_nosafe], 1                  ; report: PIO because non-coherent w/o a safe flush
+        jmp     .pvc_cleanup                            ; tier stays NONE (PIO has no DMA to flush)
+.pvc_flush_ok:
+        mov     byte [g_flush_tier], FLUSH_TIER_WBINVD  ; the always-correct fallback if NC is unavailable
 .pvc_nc:
         ; --- Phase 2 step 4 (opt-in /n=<id>): try to fence a region non-cacheable and RE-TEST. The re-test
         ; uses a VIRGIN buffer (coh_nc_buf, untouched until now) so a stale cached line from the base trials
@@ -823,10 +841,8 @@ phase_validate_coherency:
         ; non-coherence from the RX-READ direction (card writes, CPU reads stale), which fires identically on
         ; write-through AND write-back -- but on a write-through cache the CPU's writes reach memory at once
         ; (the card reads them fresh) so chipset NC is the WRONG tool; invalidation already suffices there.
-        ; Probe the CPU-WRITE->card-READ direction to tell WB from WT. <486 can't WBINVD-probe and the 386
-        ; software-evict tier is deferred (docs/17), so don't arm NC below a 486. ---
-        cmp     byte [g_cpu_class], CPU_80486
-        jb      .pvc_cleanup                            ; <486: no WB probe -> keep the flush, never mark NC
+        ; Probe the CPU-WRITE->card-READ direction to tell WB from WT. (Reached only with g_wbinvd_ok, so the
+        ; probe's WBINVD and the chipset port writes never run under V86 without /v.) ---
         call    coh_is_writeback                        ; CF=1 -> write-back (NC-eligible); CF=0 -> write-through
 %ifdef CFG_FORCE_NC
         stc                                             ; structural test: the cacheless emulator probes as
@@ -860,6 +876,9 @@ phase_validate_coherency:
         mov     byte [g_nc_effective], 1                ; NC works on this chipset -> configure marks ring + drops flush
 
 .pvc_cleanup:
+        ; stop the probe's DMA first: a timed-out trial leaves coh_up_desc armed, and the probe buffers are
+        ; cold memory install reclaims (the PIO fallback above already quiesced; again is harmless)
+        call    dma_quiesce
         ; clear loopback (Window 4 NET_DIAG &= ~INTERNAL_LB), then restore Window 1 (operating)
         mov     dx, [g_nic_io]
         add     dx, EL3_W4_NET_DIAG
@@ -1145,12 +1164,27 @@ build_plan:
 ; the VDS-locking stack (XMS_POLICY_COMMONBUF). Cold; clobbers AX, ES. Only reached on >=286 (SMSW).
 ;------------------------------------------------------------------------------
 dma_v86_forbid_check:
+        mov     byte [g_v86], 0
         cmp     byte [g_use_dma], 0
         je      .dvf_done               ; already PIO -> nothing to forbid
         push    es
         db      0x0F, 0x01, 0xE0        ; SMSW AX (bytes: legal in V86, 286+; the DMA path is >=286)
-        test    ax, 1                   ; CR0.PE: 1 = a protected-mode host is paging us (V86); 0 = real mode
-        jz      .dvf_keep               ; real mode -> seg<<4 is the bus address -> keep DMA
+        and     al, 1                   ; CR0.PE: 1 = a protected-mode host is paging us (V86); 0 = real mode
+        mov     [g_v86], al
+        ; WBINVD (the only flush tier) is usable on a 486+ in real mode, or under V86 only when /v says the
+        ; host emulates it. Decided here (before any probe) so no cold phase ever issues it unguarded.
+        mov     byte [g_wbinvd_ok], 0
+        cmp     byte [g_cpu_class], CPU_80486
+        jb      .dvf_wb_set
+        cmp     al, 0
+        je      .dvf_wb_yes
+        cmp     byte [g_want_v86trust], 0
+        je      .dvf_wb_set
+.dvf_wb_yes:
+        mov     byte [g_wbinvd_ok], 1
+.dvf_wb_set:
+        cmp     byte [g_v86], 0
+        je      .dvf_keep               ; real mode -> seg<<4 is the bus address -> keep DMA
         xor     ax, ax
         mov     es, ax
         test    byte [es:0x047B], 0x20  ; BIOS data 0040:007Bh bit 5 = VDS available
@@ -1170,6 +1204,41 @@ dma_force_pio:
         mov     byte [g_use_dma], 0
         mov     byte [g_async], 0
         mov     byte [g_tx_ring], 0
+        ; fall through: a probe that timed out may still have a descriptor armed -> stop both engines
+
+;------------------------------------------------------------------------------
+; dma_quiesce -- stop the 3C515 up/down DMA engines and zero both list pointers, so a transfer the cold
+; probes left pending (phase_validate_dma, the coherency loopback -- a timeout there leaves the descriptor
+; armed) can never land later in cold memory that install reclaims, or in the DMA region the PIO floor
+; frees. Stall -> clear ptr -> unstall per engine (a null list pointer leaves the engine idle), then ack
+; any Up/DnComplete it latched. Only reached with a 3C515 (g_use_dma was set). Cold; clobbers AX, DX.
+;------------------------------------------------------------------------------
+dma_quiesce:
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_UP_STALL
+        out     dx, ax
+        mov     ax, EL3_CMD_DOWN_STALL
+        out     dx, ax
+        xor     ax, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        out     dx, ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DOWN_LIST_PTR
+        out     dx, ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_UP_UNSTALL
+        out     dx, ax
+        mov     ax, EL3_CMD_DOWN_UNSTALL
+        out     dx, ax
+        mov     ax, EL3_CMD_ACK_INTR | EL3_ST_UP_COMPLETE | 0x0200   ; + DnComplete (bit 9)
+        out     dx, ax
         ret
 
 ;------------------------------------------------------------------------------
