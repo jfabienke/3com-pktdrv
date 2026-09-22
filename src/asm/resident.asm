@@ -113,6 +113,11 @@ pkt_do_dbg:
         jmp     pkt_return
 %endif
 pkt_do_xms:
+        ; The whole extension exists only while the bus-master path is live: on the PIO floor install keeps
+        ; only up to resident_end_pio, so xms_dma_armed / xms_rx_descs / xms_gdt are freed memory (and a
+        ; 3C509 has no UpList registers at io+0x38..0x3C). One gate covers QUERY/CONFIGURE/RELEASE/POLL.
+        cmp     byte [g_use_dma], 0
+        je      .xbad
         mov     al, [bp + F_AL]         ; sub-function in AL
         cmp     al, XMS_DMA_QUERY
         je      .xq
@@ -122,7 +127,7 @@ pkt_do_xms:
         je      .xr
         cmp     al, XMS_DMA_POLL
         je      .xp
-        mov     dh, PD_ERR_BADCMD
+.xbad:  mov     dh, PD_ERR_BADCMD
         stc
         jmp     pkt_error
 .xq:    call    f_xms_query
@@ -711,7 +716,8 @@ dbg_logb:
 ;--- XMS DMA QUERY: return capability flags in BX, max slot size in DX ---
 f_xms_query:
         ; CONV (conventional zero-copy ring) uses the same UpList DMA + in-place deliver as VCPI/DPMI,
-        ; so advertise it alongside the base caps (CONFIGURE gates on actual bus-master availability).
+        ; so advertise it alongside the base caps. Only reached with g_use_dma set (pkt_do_xms gate);
+        ; VCPI/DPMI/RING additionally need the 386+ ring (CONFIGURE enforces the same split).
         mov     bx, XMS_CAP_XMS_COPY | XMS_CAP_SINGLE | XMS_CAP_CONV
         cmp     byte [g_tx_ring], 0
         je      .no_ring
@@ -741,6 +747,12 @@ f_xms_configure:
         ; validate policy (0=VCPI 1=DPMI 2=XMS_COPY 3=CONV; CONV = conventional-memory zero-copy ring)
         cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_MAX
         ja      .epol
+        ; VCPI/DPMI (policies 0/1) are advertised only on the 386+ ring (QUERY) -> reject them without it
+        cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_XMS_COPY
+        jae     .pol_ok
+        cmp     byte [g_tx_ring], 0
+        je      .epol
+.pol_ok:
         ; validate phys0 < 16 MB: byte[3] of the 32-bit physical address must be 0
         ; (if phys[31:24]=0 then phys ≤ 0x00FFFFFF = 16MB-1, within ISA DMA range)
         cmp     byte [es:bx + XMS_CFG_phys0 + 3], 0
