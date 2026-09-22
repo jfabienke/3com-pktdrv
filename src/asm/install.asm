@@ -97,7 +97,15 @@ install:
         or      ax, EL3_ST_TX_COMPLETE
 .intr_set:
         out     dx, ax
+        ; Status indication: the 8 classic sources, plus (bus-master only) DnComplete/UpComplete (bits 9/10).
+        ; A real 3C515 neither shows nor interrupts on a source missing from this mask, so the DMA path needs
+        ; them; the PIO floor leaves them out, which also keeps the ISR's UP_COMPLETE branch (it reads
+        ; xms_dma_armed, freed memory there) unreachable.
         mov     ax, EL3_CMD_SET_STATUS_ENB | 0x00FF
+        cmp     byte [g_use_dma], 0
+        je      .stat_set
+        mov     ax, EL3_CMD_SET_STATUS_ENB | 0x07FF
+.stat_set:
         out     dx, ax
 
         ; arm bus-master TX DMA (386+ ring only): init the TX descriptors/slots. RX is PIO in all

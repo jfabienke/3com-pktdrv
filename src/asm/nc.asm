@@ -22,222 +22,139 @@
 ; 0x24(data); UMC + SiS legacy = 0x22(index)/0x23(data). Write the register number to 0x22, then the value
 ; to the data port. Base addresses are in 64 KB units (A23:A16); size is a power-of-two code per family.
 ;
-; CONTRACT: nc_mark_region / nc_clear_region clobber AX,BX,CX,DX (both call sites -- the cold re-test and
-; f_xms_configure -- are caller-saved). Region 0 only (we need exactly one contiguous NC region; docs/12).
+; REGION POLICY: exactly ONE naturally aligned 64 KB block (review F2). The base registers are in 64 KB
+; units, and many decoders mask the base by the size, so a smaller region can only start on a 64 KB boundary
+; and a larger one may silently cover a different, size-aligned block. One aligned 64 KB block is correct
+; under either decode and pins a single size code per chipset -- the SAME (base, code) shape the cold re-test
+; proves, so the live marking reuses a proven encoding. A span crossing a 64 KB boundary gets no NC (CF=1 ->
+; the caller keeps the flush). nc_mark_region saves the chipset's previous region-0 registers and
+; nc_clear_region restores them (writing 0 could clobber other bits in the SiS/UMC control registers).
+;
+; Placed in the DMA region (past resident_end_pio): only the cold probe and f_xms_configure/release reach it.
+; CONTRACT: nc_span64 clobbers AX,BX,CX,DX; nc_mark_region / nc_clear_region clobber AX,BX,CX,DX (SI saved).
 
 NC_CHIP_NONE        equ 0
-NC_CHIP_OPTI391     equ 1       ; OPTi 82C391 / 82C596-7 Viper / 82C381 -- 0x22/0x24, 8 KB gran
+NC_CHIP_OPTI391     equ 1       ; OPTi 82C391 / 82C596-7 Viper / 82C381 -- 0x22/0x24
 NC_CHIP_ETEQ        equ 2       ; Eteq 82C495WB Bengal -- OPTi-compatible encoding, 0x22/0x24
-NC_CHIP_UMC491      equ 3       ; UMC UM82C491 -- 0x22/0x23, 8 KB gran, 1 region
-NC_CHIP_SIS460      equ 4       ; SiS 85C460 / 85C310 Rabbit -- 0x22/0x23, 64 KB gran
+NC_CHIP_UMC491      equ 3       ; UMC UM82C491 -- 0x22/0x23, 1 region
+NC_CHIP_SIS460      equ 4       ; SiS 85C460 / 85C310 Rabbit -- 0x22/0x23
 NC_CHIP_SYNTH       equ 0xFE    ; synthetic (CFG_FORCE_NC structural test): no port write, mark always "works"
 
+; per chipset: id, base reg, size reg, data port, size value for ONE 64 KB block
+;   OPTi/Eteq: size reg = (code<<4) | A27:A24 nibble, region = 8 KB << (code-1) -> code 4 (nibble 0: <16 MB)
+;   UMC:       size reg = 0x80(enable) | (code<<4), region = 8 KB << code       -> code 3
+;   SiS:       ctrl reg high nibble = code, region = 64 KB << (code-1)          -> code 1
+; !!! base unit UNVERIFIED on real silicon (cache-kit: 64 KB vs 16 KB) -- the cold re-test catches a wrong one.
+NC_ENT_LEN          equ 5
+nc_tab:
+        db      NC_CHIP_OPTI391, 0x52, 0x53, 0x24, 0x40
+        db      NC_CHIP_ETEQ,    0x52, 0x53, 0x24, 0x40
+        db      NC_CHIP_UMC491,  0x50, 0x51, 0x23, 0xB0
+        db      NC_CHIP_SIS460,  0x14, 0x15, 0x23, 0x10
+NC_TAB_N            equ 4
+
 ;------------------------------------------------------------------------------
-; nc_mark_region -- fence [base_kb, base_kb+size_kb) non-cacheable on g_nc_chipset (region 0).
-;   in : BX = base_kb (granularity-aligned by the caller), CX = size_kb
-;   out: CF=0 programmed; CF=1 not encodable -> caller MUST keep the flush (never drop on a failed mark)
-; Clobbers AX,BX,CX,DX. Resident.
+; nc_span64 -- the NC block for a physical span. in: DX:AX = phys start, CX = length (> 0). out: CF=0 ->
+; BX = base_kb of the single 64 KB block holding the WHOLE span (< 16 MB); CF=1 -> it crosses a 64 KB
+; boundary (or reaches past 16 MB): no NC for it. Clobbers AX,BX,CX,DX.
+;------------------------------------------------------------------------------
+nc_span64:
+        mov     bx, dx                          ; BX = start block (phys >> 16)
+        dec     cx
+        add     ax, cx
+        adc     dx, 0                           ; DX = last byte's block
+        cmp     dx, bx
+        jne     .x
+        cmp     bx, 0x00FF
+        ja      .x                              ; base field is A23:A16
+        mov     cl, 6
+        shl     bx, cl                          ; base_kb
+        clc
+        ret
+.x:     stc
+        ret
+
+;------------------------------------------------------------------------------
+; nc_mark_region -- fence the 64 KB block at BX = base_kb (64 KB aligned, < 16 MB) non-cacheable on
+; g_nc_chipset (region 0), saving the registers it overwrites. out: CF=0 programmed; CF=1 unknown chipset
+; -> caller MUST keep the flush. Clobbers AX,BX,CX,DX.
 ;------------------------------------------------------------------------------
 nc_mark_region:
-        mov     al, [g_nc_chipset]
-        cmp     al, NC_CHIP_SYNTH
-        je      .synth
-        cmp     al, NC_CHIP_OPTI391
-        je      .opti
-        cmp     al, NC_CHIP_ETEQ
-        je      .opti                           ; Eteq Bengal == OPTi-compatible encoding
-        cmp     al, NC_CHIP_UMC491
-        je      .umc
-        cmp     al, NC_CHIP_SIS460
-        je      .sis
-        stc                                     ; unknown id
-        ret
-.synth:
-        clc                                     ; structural test: succeed, touch no port
-        ret
-
-        ; OPTi 82C391/Viper/381 + Eteq Bengal. base reg 0x52 = base in 64 KB units (A23:A16); size reg 0x53 =
-        ; (code<<4) | (A27:A24 nibble), region = 8 KB << (code-1). !!! base unit UNVERIFIED (cache-kit 64 vs 16).
-.opti:
-        call    nc_size_code_8k                 ; CX -> AL = code (1..7); CF=1 unrepresentable. BX,CX preserved.
-        jc      .fail
-        mov     ch, al                          ; CH = size code (stash)
-        call    nc_base64_split                 ; BX(base_kb) -> AL=base_val, AH=nibble(A27:A24)
-        mov     bl, al                          ; BL = base_val
-        mov     al, ch                          ; size code
-        call    nc_code_nibble                  ; AL = (code<<4) | nibble(AH) -> size_val
-        mov     bh, al                          ; BH = size_val
-        mov     cl, 0x52
-        mov     ch, bl                          ; reg 0x52 <- base_val
-        call    nc_wr_opti
-        mov     cl, 0x53
-        mov     ch, bh                          ; reg 0x53 <- size_val
-        call    nc_wr_opti
-        clc
-        ret
-
-        ; UMC UM82C491. base reg 0x50 = base in 64 KB units; size reg 0x51 = 0x80(enable) | (code<<4),
-        ; region = 8 KB << code (code 0..7). !!! base unit UNVERIFIED (cache-kit). 1 region.
-.umc:
-        call    nc_size_code_8k_umc             ; CX -> AL = code (0..7); CF=1. BX,CX preserved.
-        jc      .fail
-        mov     ch, al
-        call    nc_base64_split                 ; AL=base_val, AH=nibble
-        test    ah, ah
-        jnz     .fail                           ; >16 MB base -> 8-bit field overflow (never for conv <1 MB)
-        mov     cl, 0x50
-                                                ; CH already = base... no: reuse. set CH=base_val
-        mov     ch, al                          ; reg 0x50 <- base_val
-        call    nc_wr_legacy
-        ; rebuild size byte: 0x80 | (code<<4). code was in CH before the write clobbered it -> recompute.
-        call    nc_size_code_8k_umc             ; AL = code again (BX,CX still hold base/size)
-        shl     al, 1
-        shl     al, 1
-        shl     al, 1
-        shl     al, 1
-        or      al, 0x80
-        mov     cl, 0x51
-        mov     ch, al                          ; reg 0x51 <- enable|size
-        call    nc_wr_legacy
-        clc
-        ret
-
-        ; SiS 85C460/Rabbit. base reg 0x14 = base in 64 KB units; ctrl reg 0x15 high nibble = code,
-        ; region = 64 KB << (code-1). 64 KB granularity.
-.sis:
-        call    nc_size_code_64k                ; CX -> AL = code (1..8); CF=1. BX,CX preserved.
-        jc      .fail
-        mov     ch, al
-        call    nc_base64_split
-        test    ah, ah
-        jnz     .fail
-        mov     cl, 0x14
-        mov     ch, al                          ; reg 0x14 <- base_val
-        call    nc_wr_legacy
-        call    nc_size_code_64k                ; AL = code again
-        shl     al, 1
-        shl     al, 1
-        shl     al, 1
-        shl     al, 1                           ; code<<4
-        mov     cl, 0x15
-        mov     ch, al                          ; reg 0x15 <- ctrl
-        call    nc_wr_legacy
-        clc
-        ret
-.fail:
-        stc
-        ret
-
-;------------------------------------------------------------------------------
-; nc_clear_region -- disable region 0 (size code 0 = off) on g_nc_chipset. Undo a marking whose re-test
-; FAILED. Clobbers AX,CX,DX. Resident.
-;------------------------------------------------------------------------------
-nc_clear_region:
-        mov     al, [g_nc_chipset]
-        xor     ch, ch                          ; value 0 = region disabled
-        cmp     al, NC_CHIP_OPTI391
-        je      .copti
-        cmp     al, NC_CHIP_ETEQ
-        je      .copti
-        cmp     al, NC_CHIP_UMC491
-        je      .culeg
-        cmp     al, NC_CHIP_SIS460
-        je      .csleg
-        ret                                     ; NONE / SYNTH -> nothing to clear
-.copti:
-        mov     cl, 0x53                        ; OPTi size reg
-        jmp     nc_wr_opti
-.culeg:
-        mov     cl, 0x51                        ; UMC size/enable reg
-        jmp     nc_wr_legacy
-.csleg:
-        mov     cl, 0x15                        ; SiS ctrl reg
-        jmp     nc_wr_legacy
-
-;------------------------------------------------------------------------------
-; helpers (resident). nc_wr_* : out 0x22, CL(reg) ; out data_port, CH(val). Clobber AX,DX; preserve BX,CX.
-;------------------------------------------------------------------------------
-nc_wr_opti:
-        mov     dx, 0x22
-        mov     al, cl
-        out     dx, al
-        mov     dx, 0x24
-        mov     al, ch
-        out     dx, al
-        ret
-nc_wr_legacy:
-        mov     dx, 0x22
-        mov     al, cl
-        out     dx, al
-        mov     dx, 0x23
-        mov     al, ch
-        out     dx, al
-        ret
-
-; nc_base64_split -- BX(base_kb) -> AL = base in 64 KB units (low 8 bits), AH = A27:A24 nibble. Clobbers AX,CX.
-nc_base64_split:
+        cmp     byte [g_nc_chipset], NC_CHIP_SYNTH
+        je      .ok                             ; structural test: succeed, touch no port
+        push    si
+        call    nc_find
+        jc      .pop
+        mov     cl, [si + 1]
+        call    nc_rd
+        mov     [nc_saved_base], al
+        mov     cl, [si + 2]
+        call    nc_rd
+        mov     [nc_saved_size], al
+        mov     byte [nc_saved_ok], 1
         mov     ax, bx
         mov     cl, 6
-        shr     ax, cl                          ; AX = base_kb >> 6 (64 KB units)
-        and     ah, 0x0F                        ; AH = A27:A24 nibble
+        shr     ax, cl                          ; AL = base in 64 KB units
+        mov     ch, al
+        mov     cl, [si + 1]
+        call    nc_wr                           ; base first ...
+        mov     ch, [si + 4]
+        mov     cl, [si + 2]
+        call    nc_wr                           ; ... then the size/enable that turns the region on
+        clc
+.pop:   pop     si
         ret
-
-; nc_code_nibble -- AL(code) -> AL = (code<<4) | (AH nibble). Clobbers nothing else.
-nc_code_nibble:
-        shl     al, 1
-        shl     al, 1
-        shl     al, 1
-        shl     al, 1
-        or      al, ah
-        ret
-
-; nc_size_code_8k -- CX(size_kb) -> AL = OPTi code 1..7, region = 8 KB << (code-1) (8 KB..512 KB), rounded UP.
-; CF=1 if size_kb > 512. Clobbers AX,DX; BX,CX preserved.
-nc_size_code_8k:
-        mov     al, 1
-        mov     dx, 8
-.l:     cmp     dx, cx
-        jae     .ok
-        cmp     al, 7
-        jae     .bad
-        inc     al
-        shl     dx, 1
-        jmp     .l
 .ok:    clc
         ret
-.bad:   stc
-        ret
 
-; nc_size_code_8k_umc -- CX -> AL = UMC code 0..7, region = 8 KB << code (8 KB..1 MB), rounded UP. CF=1 if
-; >1 MB. Clobbers AX,DX; BX,CX preserved.
-nc_size_code_8k_umc:
-        mov     al, 0
-        mov     dx, 8
-.l:     cmp     dx, cx
-        jae     .ok
-        cmp     al, 7
-        jae     .bad
-        inc     al
-        shl     dx, 1
-        jmp     .l
-.ok:    clc
-        ret
-.bad:   stc
-        ret
+;------------------------------------------------------------------------------
+; nc_clear_region -- restore region 0 to what nc_mark_region found (no-op if nothing is saved).
+; Clobbers AX,CX,DX. Resident.
+;------------------------------------------------------------------------------
+nc_clear_region:
+        cmp     byte [nc_saved_ok], 0
+        je      .r
+        push    si
+        call    nc_find
+        jc      .pop
+        mov     cl, [si + 2]
+        mov     ch, [nc_saved_size]
+        call    nc_wr                           ; size/enable first (turns our region off) ...
+        mov     cl, [si + 1]
+        mov     ch, [nc_saved_base]
+        call    nc_wr                           ; ... then the base
+        mov     byte [nc_saved_ok], 0
+.pop:   pop     si
+.r:     ret
 
-; nc_size_code_64k -- CX -> AL = SiS code 1..8, region = 64 KB << (code-1), rounded UP. CF=1 if >8 MB.
-; Clobbers AX,DX; BX,CX preserved. (Capped at code 8 so DX can't overflow 16 bits; ample for a DMA ring.)
-nc_size_code_64k:
-        mov     al, 1
-        mov     dx, 64
-.l:     cmp     dx, cx
-        jae     .ok
-        cmp     al, 8
-        jae     .bad
-        inc     al
-        shl     dx, 1
-        jmp     .l
-.ok:    clc
+;------------------------------------------------------------------------------
+; helpers. nc_find: SI -> this chipset's nc_tab entry, CF=1 if unknown (clobbers AL, CX).
+; nc_wr: out 0x22, CL(reg); out [SI+3], CH(val). nc_rd: out 0x22, CL(reg); in AL, [SI+3]. Clobber AL, DX.
+;------------------------------------------------------------------------------
+nc_find:
+        mov     al, [g_nc_chipset]
+        mov     si, nc_tab
+        mov     cx, NC_TAB_N
+.f:     cmp     al, [si]
+        je      .found
+        add     si, NC_ENT_LEN
+        loop    .f
+        stc
         ret
-.bad:   stc
+.found: clc
+        ret
+nc_wr:
+        mov     dx, 0x22
+        mov     al, cl
+        out     dx, al
+        mov     dl, [si + 3]
+        mov     al, ch
+        out     dx, al
+        ret
+nc_rd:
+        mov     dx, 0x22
+        mov     al, cl
+        out     dx, al
+        mov     dl, [si + 3]
+        in      al, dx
         ret
