@@ -167,6 +167,8 @@ g_tx_ring:      resb 1             ; 1 = 386+ -> non-blocking COPY ring (movsd) 
 g_async:        resb 1             ; 1 = zero-copy async TX ring available (AH=0xF1): any bus-master config (>=286)
 g_rx_cksum:     resb 1             ; 1 = RX checksum offload on -> sum IP+TCP+payload during the PIO drain (AH=0xF2)
 g_rx_cksum_val: resw 1             ; folded native-LE ones-complement sum of the last drained frame
+g_rx_is386:     resb 1             ; 1 = 386+ (rx_drain_cksum may use insd); set at install from g_cpu_class,
+                                   ; which lives in cold BSS and is freed once the TSR is resident
 g_cache_flush_fn: resw 1           ; Phase 2: offset of the selected DMA cache-flush helper (cache.asm). The
                                    ; DMA paths `call word [g_cache_flush_fn]`; the cold coherency self-test
                                    ; (docs/17) picks the tier. Default cache_flush_none (coherent) until then.

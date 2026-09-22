@@ -654,8 +654,8 @@ isr_wait_cmd:
 ;------------------------------------------------------------------------------
 rx_drain_cksum:
         mov     dx, [g_w1_base]                 ; DX = RX FIFO port (Window-1 base + 0)
-        cmp     byte [g_cpu_class], CPU_80386
-        jb      .d16
+        cmp     byte [g_rx_is386], 0            ; resident copy: g_cpu_class is cold BSS, freed at install
+        je      .d16
 cpu 386
         ; --- 386+: 32-bit insd burst + 32-bit carry-fold (0x66-prefixed; only runs on 386+) ---
         push    eax                             ; preserve upper halves (ISR only saved the 16-bit regs)

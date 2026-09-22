@@ -19,6 +19,12 @@ install:
         mov     byte [xms_nslots], 0
         mov     byte [g_rx_irq_masked], 0
         mov     byte [g_isr_busy], 0
+        ; resident CPU gate for rx_drain_cksum (the ISR must not read g_cpu_class: cold BSS, freed below)
+        mov     byte [g_rx_is386], 0
+        cmp     byte [g_cpu_class], CPU_80386
+        jb      .cpu_gate_set
+        mov     byte [g_rx_is386], 1
+.cpu_gate_set:
         ; Phase 2: bind the DMA cache-flush helper from the cold coherency verdict (g_flush_tier, set by
         ; phase_validate_coherency before us). WBINVD on a non-coherent 486+; a bare `ret` (cache_flush_none)
         ; otherwise -- coherent, a snooping cache, no cache, or the emulator. (FLUSH_TIER_EVICT, the non-
