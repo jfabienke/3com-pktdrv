@@ -40,9 +40,11 @@ $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
 
 $(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.asm &
                      src/asm/resident.asm src/asm/isr.asm src/asm/install.asm &
-                     src/asm/isapnp.asm &
+                     src/asm/isapnp.asm src/asm/cache.asm src/asm/nc.asm &
+                     src/asm/copybreak.asm &
                      include/codegen.inc include/el3_tomahawk.inc include/el3_core.inc &
-                     include/el3_corkscrew.inc &
+                     include/el3_corkscrew.inc include/xms_dma.inc include/async_tx.inc &
+                     include/rx_cksum.inc &
                      $(BUILD)/frags_asm.inc
     $(ASM) $(AFLAGS) src/asm/start.asm -o $@
 
