@@ -157,9 +157,46 @@ vds_release:
         ret
 
 ;------------------------------------------------------------------------------
-; dma_teardown -- /u (f_uninstall) with the bus-master path live: release the VDS locks.
-; Enter DS=CS. Clobbers AX, BX, CX, DX, SI, DI, ES.
+; xms_release_core -- stop the armed RX ring: zero UpListPtr + StartDmaUp (a null list halts the upload
+; engine), drop UP_COMPLETE from the interrupt mask, disarm, then restore the chipset NC region the
+; configure marked (after the card has stopped DMAing into it) -- otherwise the block stays uncached after
+; the stack frees the pool, slowing whatever DOS puts there next. Enter DS=CS, ring armed.
+; Clobbers AX, CX, DX.
+;------------------------------------------------------------------------------
+xms_release_core:
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_UP_LIST_PTR
+        xor     ax, ax
+        out     dx, ax
+        add     dx, 2
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_START_DMA_UP
+        out     dx, ax
+        mov     ax, EL3_CMD_SET_INTR_ENB | EL3_ST_RX_COMPLETE | EL3_ST_INT_LATCH | EL3_ST_TX_COMPLETE
+        out     dx, ax                          ; (g_use_dma is set whenever a ring can be armed)
+        mov     byte [xms_dma_armed], 0
+        mov     byte [g_rx_irq_masked], 0
+        xor     ax, ax
+        mov     [xms_cfg_off], ax
+        mov     [xms_cfg_seg], ax
+        cmp     byte [g_nc_marked], 0
+        je      .done
+        call    nc_clear_region
+        mov     byte [g_nc_marked], 0
+.done:
+        ret
+
+;------------------------------------------------------------------------------
+; dma_teardown -- /u (f_uninstall) with the bus-master path live: stop an armed RX ring (and restore its
+; NC region) so the card can't keep bus-mastering into the stack's buffer after the driver is gone, then
+; release the VDS locks. Enter DS=CS. Clobbers AX, BX, CX, DX, SI, DI, ES.
 ;------------------------------------------------------------------------------
 dma_teardown:
+        cmp     byte [xms_dma_armed], 0
+        je      .vds
+        call    xms_release_core
+.vds:
         call    vds_release
         ret

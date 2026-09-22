@@ -352,14 +352,11 @@ xms_rx_deliver:
         xor     ax, ax
         mov     [di + EL3_DESC_STATUS], ax
         mov     [di + EL3_DESC_STATUS + 2], ax
-        mov     ax, cs
-        mov     cl, 4
-        shl     ax, cl
-        mov     dx, cs
-        mov     cl, 12
-        shr     dx, cl
-        add     ax, di
-        adc     dx, 0                   ; dx:ax = phys(new descriptor)
+        mov     ax, di
+        sub     ax, xms_rx_desc0        ; 0 or EL3_DESC_SIZE
+        add     ax, [g_desc_phys]
+        mov     dx, [g_desc_phys + 2]
+        adc     dx, 0                   ; dx:ax = phys(new descriptor) = g_desc_phys + idx*EL3_DESC_SIZE
         push    dx
         mov     dx, [g_nic_io]
         add     dx, EL3_CS_UP_LIST_PTR

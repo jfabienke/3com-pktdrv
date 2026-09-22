@@ -36,8 +36,9 @@ XMS_POLICY_XMS_COPY equ 2       ; XMS + INT 15h AH=87h staging -> one CPU copy
 XMS_POLICY_CONV     equ 3       ; ring slots in CONVENTIONAL memory (phys = seg*16) -> deliver in place,
                                 ; NO copy. The doc-10 zero-copy landing ring (mandatory on 286/386).
 XMS_POLICY_COMMONBUF equ 4      ; CONV under a paging VMM: the buffer is VDS-locked so phys0 is the TRUE
-                                ; bus address (!= seg<<4) and lin0 is the V86 segment the CPU polls/reads.
-                                ; Contiguous + <16 MB by VDS construction -> the chipset NC fence covers it.
+                                ; bus address (!= seg<<4) and lin0 is the V86 LINEAR (seg<<4, a 32-bit real-
+                                ; mode linear < 1 MB) the CPU polls/reads. Contiguous + <16 MB by VDS
+                                ; construction -> the chipset NC fence can cover it.
 XMS_POLICY_MAX      equ 4       ; CONFIGURE validation bound (cfg.policy must be <= this)
 
 ; ---- RX ring depth -----------------------------------------------------
@@ -45,20 +46,27 @@ XMS_POLICY_MAX      equ 4       ; CONFIGURE validation bound (cfg.policy must be
 ; 2-slot ping-pong (Phase-3a depth limit). cfg.phys0 = the base of N contiguous slot_size-byte slots;
 ; slot i is at phys0 + i*slot_size. XMS_COPY stays 2 explicit slots (phys0/phys1, non-contiguous EMBs).
 RX_RING_N           equ 8       ; CONV ring depth (slots); must match dos-nvmeotcp xms.h XMS_RX_RING_N
+XMS_RX_DESC_BLOCK   equ RX_RING_N * 16  ; v2 producers reserve this past the CONV/COMMONBUF ring (the driver may
+                                ; relocate its RX descriptors there when NC is effective); = xms.h XMS_RX_DESC_BLOCK
 
 ; ---- error codes (DH on CF=1) -------------------------------------------
 
-XMS_ERR_BAD_VERSION equ 0x01   ; cfg.version != XMS_CFG_VERSION
+XMS_ERR_BAD_VERSION equ 0x01   ; cfg.version outside XMS_CFG_VERSION_MIN..XMS_CFG_VERSION
 XMS_ERR_BAD_POLICY  equ 0x02   ; cfg.policy not in xms_mem_policy_t range
 XMS_ERR_PHYS_RANGE  equ 0x03   ; physical address >= DMA_ISA_16M_LIMIT
 XMS_ERR_SLOT_SIZE   equ 0x04   ; cfg.slot_size > DX returned by QUERY
 XMS_ERR_ALREADY_CFG equ 0x05   ; ring already configured; call RELEASE first
 XMS_ERR_NOT_CFG     equ 0x06   ; RELEASE called but ring not configured
+XMS_ERR_BAD_LIN     equ 0x07   ; CONV/COMMONBUF lin0/phys0 span invalid (0, unaligned, >= 1 MB / 16 MB, or
+                               ; CONV with lin0 != phys0 or under V86)
 
 ; ---- configuration structure (xms_rx_cfg_t) offsets --------------------
 ; Matches the C struct in include/xms_dma.h exactly (20 bytes total).
 
-XMS_CFG_VERSION     equ 1       ; cfg.version must equal this
+XMS_CFG_VERSION     equ 2       ; current cfg version: v2 = the producer reserves XMS_RX_DESC_BLOCK past a
+                                ; CONV/COMMONBUF ring. v1 is still accepted (then the driver never relocates
+                                ; its descriptors / marks NC -- a v1 pool has no room for the block).
+XMS_CFG_VERSION_MIN equ 1
 
 XMS_CFG_version     equ 0       ; uint8_t  version
 XMS_CFG_policy      equ 1       ; uint8_t  policy
