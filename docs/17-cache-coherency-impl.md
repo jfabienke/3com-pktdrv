@@ -77,6 +77,13 @@ just before the DMA (cold init is single-threaded — no eviction in the µs gap
 re-test (no full-cache flush needed to clear it), loopback at the modeled 100 Mbit. Cost ~1–5 ms cold,
 sub-ms over the bus-master test already run; **never full-cache-flush inside the probe**.
 
+> **Superseded in part (review, 2026-09 — see [Review fixes](#review-fixes-2026-09)).** The as-built trial
+> differs from the sketch above: step 2's "warm" is a *seed* + `WBINVD` (where safe) + a **read** of the dest
+> (a store alone doesn't allocate on no-write-allocate caches); step 4 polls **IntStatus `UpComplete`** (I/O,
+> never cached), not the in-memory descriptor; the frame is a well-formed **broadcast** with the patterns at
+> byte 16; and the NC re-test no longer uses a virgin buffer but a probe area at the top of a whole 64 KB block
+> (`13`).
+
 ## Piece 3 — descriptor coherency
 
 The RX descriptors (`xms_rx_descs`) and TX descriptors (`tx_descs`) are DMA-touched (card reads TX desc; card
@@ -92,6 +99,8 @@ line (already `alignb 16`; bump to 32) so an invalidate can't disturb a neighbou
 - `xms_rx_descs` `alignb 16` → bump to `alignb 32`.
 - The conv ring (conventional pool) is already 32-aligned by the stack (`docs/10`); for NC it must additionally
   be aligned/sized to the chipset granularity (8 KB–64 KB) and not share a granule with cached data (`12`).
+  *(As built, 2026-09: the NC fence is always exactly one naturally aligned 64 KB block; the whole pool —
+  slots + descriptor block — must fall inside it, else no NC and the flush is kept. See `12`.)*
 
 ## Piece 5 — NC-region lift (DEFERRED, optional, gated)
 
@@ -137,7 +146,9 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
      base-unit landmine — real-HW only); and the **re-test gate** — when the cold self-test finds the cache
      non-coherent *and* `/n` is set, `phase_validate_coherency` marks a VIRGIN probe region NC (covering the
      probe **descriptor + payload**, so it validates the card-write coherency the conv ring needs) and re-runs
-     the loopback trial. Fresh → `g_nc_effective`; stale → keep the flush. A wrong encoding can only KEEP the
+     the loopback trial (*as built since 2026-09: a 512 B probe area at the top of the first whole 64 KB block
+     above the image, same (base, code) shape as the live marking, both directions — `13`*). Fresh →
+     `g_nc_effective`; stale → keep the flush. A wrong encoding can only KEEP the
      flush (costs the optimization, never correctness). `f_xms_configure` marks the live conv pool NC when
      validated. **Verified on QEMU:** `/n` absent → NONE 15.12 dropped=0; `/n=4` on the coherent emulator →
      "NC=requested, not effective", 15.12 dropped=0; `CFG_FORCE_NC` + `/n=254` (synth, no port writes) drives
@@ -169,12 +180,14 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
          and take `DDS.physical` as the **true bus address** (`seg<<4` is a lie under a paging VMM). Contiguity
          test = `buffer_id == 0` (VDS didn't need a bounce buffer) + a `< 16 MB` ISA range check. (Trust **CF**
          for success, *not* AL — JEMM386 leaves AL≠0 on a successful lock.) `conv_ring_init` now returns the new
-         `COMMONBUF` policy under V86+VDS (`phys0` = bus address, `lin0` = the V86 segment the CPU reads in
-         place), or `CONV` in real mode, or PIO if V86 without usable VDS. Lock held until `xms_release`.
+         `COMMONBUF` policy under V86+VDS (`phys0` = bus address, `lin0` = the ring's V86 **real-mode linear**
+         `seg<<4` — a 32-bit linear < 1 MB the CPU reads in place, *not* a segment value; the ISR turns
+         `lin >> 4` back into a segment), or `CONV` in real mode, or PIO if V86 without usable VDS. Lock held
+         until `xms_release`.
        - **Driver** (`XMS_POLICY_COMMONBUF`): routes through the same contiguous CONV descriptor builder, but
          delivers in place via `lin0` — a resident `g_lin_delta = lin0 - phys0` (0 for CONV) added to each
          descriptor phys in the ISR. The NC-marking gate now covers `CONV` **and** `COMMONBUF`, fencing the
-         **true VDS physical** (`phys0`).
+         **true VDS physical** (`phys0`) — as one aligned 64 KB block that must hold the whole pool (2026-09).
        - **Verified on QEMU under JEMM386 (V86 + VDS):** `VDS avail=1 v86=1`, lock `rc=0 bid=0 isa=1`,
          `CONVRING=on pol=4` (COMMONBUF), conv RX-DMA `[L4RX] delivered=6104260 dropped=0` (= the CONV path, no
          regression); with `CFG_FORCE_NC /n=254` → `NC=validated` marking the VDS physical, still `dropped=0`.
@@ -183,11 +196,15 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
        - **WB w/o VDS (V86, no VDS host).** The driver now makes the documented `DMA_POLICY_FORBID` explicit:
          `dma_v86_forbid_check` (`build_plan`) does `SMSW` (CR0.PE) + the BIOS-data VDS flag (40:7Bh bit 5);
          **V86 && no VDS → force PIO** (`g_use_dma`/`g_async`/`g_tx_ring` = 0). Real mode keeps DMA; V86 *with*
-         VDS keeps DMA. (Note: even without this, TX DMA was already safe — `phase_validate_dma` DMAs with
-         `seg<<4` and polls the descriptor at its V86-linear; under a remapping map those target different
-         physical → timeout → PIO. So the guard is the *explicit, fast* form of what test-before-trust already
-         enforced empirically.) Verified on QEMU: real mode `DMA=ON` CONV pol=3; JEMM386 (V86+VDS) `DMA=ON`
-         COMMONBUF pol=4; forced no-VDS `DMA=PIO` (RX falls to PIO, dropped=0).
+         VDS keeps DMA **only once proven** (2026-09 review): the 386+ ring is required, and the driver
+         VDS-locks its own DMA span `[tx_descs, resident_end)` and requires `phys == seg<<4` (identity), holding
+         that lock for its lifetime (plus the cold probe span, released after the probes); any failure → PIO.
+         ~~Even without this, TX DMA was already safe~~ — **that earlier claim was wrong**: `phase_validate_dma`
+         only proved the page holding `tx_descs`. The TX slots, the RX descriptors and AH=F1 stack buffers
+         (`seg<<4` from the caller) were never proven, so a remapping VMM could have sent the card to the wrong
+         physical memory after a passing probe. Hence the span proof above plus a per-send VDS lock for AH=F1
+         (see [Review fixes](#review-fixes-2026-09)). Verified on QEMU: real mode `DMA=ON` CONV pol=3; JEMM386
+         (V86+VDS) `DMA=ON` COMMONBUF pol=4; forced no-VDS `DMA=PIO` (RX falls to PIO, dropped=0).
        - **>16 MB / non-contiguous → PIO** (for the *zero-copy* ring). A conventional buffer is always <1 MB so
          `>16 MB` can't actually arise here; non-contiguous can only happen on a remapping VMM that fragments
          the conv block's physical pages — there `vds_lock_region` reports a bounce (`buffer_id != 0`) /
@@ -211,13 +228,20 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
          separate from the TX `g_cache_flush_fn`). Every descriptor access (the `.build_conv` loop, the
          `UP_LIST`/`NEXT` arm, the ISR `xms_rx_deliver` STATUS/ADDR/recycle, the `f_xms_poll` drain) goes
          through them. Defaults (`CS:xms_rx_descs`, `phys(CS:xms_rx_descs)`, the flush tier) reproduce the
-         cached path byte-for-byte — verified by no-regression. The 286 2-slot pre-arm stays near (it never
-         relocates: `g_nc_effective` ⇒ 486+ ⇒ deep ring).
+         cached path byte-for-byte — verified by no-regression. The 286 2-slot path never relocates
+         (`g_nc_effective` ⇒ 486+ ⇒ deep ring), but since the 2026-09 review its `NEXT` links and the ISR
+         pre-arm also derive from `g_desc_phys` (no second `CS<<4` computation to drift).
        - **Layout.** The stack reserves a `DESC_BLOCK` (`RX_RING_N * 16 B`) at the **pool END** (past the
-         slots). When `g_nc_effective` + CONV/COMMONBUF + 386+ ring, `f_xms_configure` points `g_desc_far`/
-         `g_desc_phys` at `lin0`/`phys0 + ring_bytes` and sets `g_rx_flush_fn = cache_flush_none`. The one-time
-         configure writeback (`g_cache_flush_fn`) still pushes the cached initial descriptor build to memory
-         *before* the NC marking; the 64 KB NC granule already covers the +128 B block.
+         slots) — since 2026-09 this is the **cfg v2** contract (`XMS_RX_DESC_BLOCK`; a v1 pool never
+         relocates). When `g_nc_effective` + CONV/COMMONBUF + 386+ ring + v2, `f_xms_configure` first fences
+         the pool NC and **only if that succeeds** points `g_desc_far`/`g_desc_phys` at `lin0`/`phys0 +
+         ring_bytes` and sets `g_rx_flush_fn = cache_flush_none`. The one-time configure writeback
+         (`g_cache_flush_fn`) runs **after** the marking and the descriptor build, before `UP_LIST_PTR`
+         (marking evicts nothing, so lines written cached before it are still dirty). ~~The 64 KB NC granule
+         already covers the +128 B block~~ — **wrong as written**: nothing guaranteed the slots + block sat in
+         one fenced granule (the old code sized the region from the slots only and rounded per chipset). Now
+         the fence is exactly one aligned 64 KB block computed over the **whole** span (slots + descriptor
+         block, `nc_span64`); a span crossing a 64 KB boundary gets no NC and keeps the flush.
        - **Verified on QEMU.** Real-mode CONV `pol=3` and JEMM386 COMMONBUF `pol=4` both `[L4RX]
          delivered=6104260 dropped=0` (no regression from the far-pointer refactor). `CFG_FORCE_NC` `/n=254`
          → `NC=validated (pool+desc NC; RX flush dropped)`, descriptors relocated to the pool end, per-drain
@@ -225,6 +249,79 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
          relocated datapath itself is fully exercised.
        This completes Phase 2 step 4 (the whole NC track: safe core → WB gate → VDS/COMMONBUF → fallback ladder
        → descriptor relocation).
+
+## Review fixes (2026-09)
+
+A code review of the step-4b state found defects in the DMA gating, the XMS ABI, V86 addressing, the
+coherency probe and the NC region handling. All are fixed; this is the as-built design. (Commits `62beb3c`
+.. `235d4bb`: `60da35b` `8af42a3` `5f08ff7` `26a1bb7` `18454af` `8b4a940` `ad81cae` `b1f8ede` `235d4bb`, and
+`4a62c5c` (`rx_drain_cksum`'s CPU gate moved to a resident byte); dos-nvmeotcp `0ee2cb9` sends cfg v2.)
+The emulator still verifies structure + no regression only.
+
+1. **AH=F0 gated on `g_use_dma`.** On the PIO floor install frees everything past `resident_end_pio`, so the
+   whole extension (QUERY/CONFIGURE/RELEASE/POLL) returns bad-command there — `xms_*` state is freed memory.
+   VCPI/DPMI configure additionally requires the 386+ ring (QUERY only advertises them with it).
+2. **Slot size / 32-byte stride.** QUERY now always reports `DX = 1536` (`TX_SLOT_SZ`, a 32-byte multiple);
+   CONFIGURE accepts 1..1536 and requires a 32-byte multiple for CONV/COMMONBUF. Root cause: `xms_rx_deliver`
+   finds a CONV slot's CPU segment as `lin >> 4` and reads at offset 0, so every slot must be paragraph-aligned.
+   QUERY used to return 1514 unless `/j`; the cold-flag clear missed `g_want_large`, so stale memory usually
+   turned `/j` on and QUERY returned 1536 *by accident*. Once that clear was fixed, the 1514 stride put slots
+   1..7 mid-paragraph and the conv ring collapsed (~0.01 Mbit).
+3. **V86 + WBINVD.** `g_v86` is recorded (SMSW PE) and a new **`/v`** switch trusts the V86 host (EMM386 /
+   JEMM386) to emulate `WBINVD` (a privileged `#GP` under V86). `g_wbinvd_ok = 486+ && (real mode || /v)`,
+   decided before any probe so no cold phase issues `WBINVD` unguarded. Non-coherent with **no safe flush**
+   (V86 without `/v`, or `<486` since the 386 software-evict tier is still deferred) → PIO, banner
+   `DMA=PIO (non-coherent, no safe flush)`. Every PIO fallback (`dma_force_pio`) and the probe cleanup call
+   `dma_quiesce`: stall both DMA engines, zero both list pointers, unstall, ack — so a timed-out probe
+   descriptor can never land later in reclaimed cold memory or the freed DMA region.
+4. **V86 + VDS addressing.** Requires the 386+ ring. The driver VDS-locks its own DMA span
+   `[tx_descs, resident_end)` and requires `phys == seg<<4` (identity), holding the lock for the driver's
+   lifetime; the cold probe span `[bm_test_buf, coh_probe_end)` is proven likewise and released after the
+   probes. Any failure → PIO (e.g. `LH` into a remapped UMB). AH=F1 async sends under V86 VDS-lock each frame
+   (`DX=0` — JEMM386 rejects the no-alloc flag; `buffer_id` must be 0; end < 16 MB); the lock is released when
+   the ring slot is reused, or at `/u`. If a lock fails the frame is copied into that slot's own `tx_slots`
+   buffer (proven identity) and still succeeds with CF=0. (Corrects the "TX DMA was already safe" claim in the
+   fallback-ladder bullet above.)
+5. **Real-HW status/flush in DMA mode.** `SetStatusEnb` includes Up/DnComplete (`0x07FF`) in DMA mode — a real
+   3C515 neither shows nor interrupts on a source missing from that mask (PIO keeps `0x00FF`).
+   `phase_validate_dma` `WBINVD`-brackets its descriptor (before the kick, and once per BIOS tick while
+   polling) when `g_wbinvd_ok`, so a stale cached descriptor line can't cause a false PIO verdict.
+6. **Coherency probe** (details in `13`). Completion is polled in **IntStatus `UpComplete`** (I/O, uncached),
+   not the in-memory descriptor. Probe frames are **broadcast** with the patterns at byte 16
+   (`COH_PAT_OFF`) so a real MAC's RX filter passes them in loopback. `coh_one_trial` does `WBINVD` (if
+   safe) then a **read-allocate** of the dest before the DMA. `coh_is_writeback` reads src after the
+   `WBINVD` before writing `NEW`, making it a write **hit** — no-write-allocate WB caches (P5 L1, Intel 486
+   WB L1, most 486 L2s) were previously misread as write-through.
+7. **NC region policy** (details in `12`). Exactly **one naturally aligned 64 KB block** (`nc_span64`); a
+   span crossing a 64 KB boundary gets no NC (flush kept). Fixed size codes per chipset (OPTi/Eteq 4, UMC 3,
+   SiS 1) from a table — removing a UMC/SiS bug where the size code was recomputed after `CX` had been
+   overwritten. `nc_mark_region` saves the chipset's region-0 registers; `nc_clear_region` restores them.
+8. **NC re-test.** A 512 B probe area at the **top** of the first whole 64 KB block above the image (a
+   non-zero block, probe at its end, so a wrong base unit or size code misses it), marked with the same
+   (base, code) shape as the live marking; 3 trials, each testing **both** directions (recipe in `13`).
+9. **XMS cfg ABI v2.** `XMS_CFG_VERSION 2` (min 1). v2 = the producer reserves `XMS_RX_DESC_BLOCK`
+   (`RX_RING_N*16`) past a CONV/COMMONBUF ring; v1 is still accepted but never relocates / marks NC. New
+   error `XMS_ERR_BAD_LIN` (0x07). CONFIGURE validates CONV/COMMONBUF `lin0` (non-zero, 16-aligned, span
+   < 1 MB) and the `phys0` span (< 16 MB); CONV additionally requires `lin0 == phys0` and no V86 host. `lin0`
+   is a 32-bit real-mode **linear** (`seg<<4`), not "the V86 segment". The stack (`dos-nvmeotcp`) sends v2
+   and retries once as v1 on `XMS_ERR_BAD_VERSION`. (See `09`.)
+10. **Configure order.** validate → if NC-eligible (`g_nc_effective` && 386+ ring && v2 && CONV/COMMONBUF):
+    `nc_span64` + `nc_mark_region`, and **only on success** relocate the descriptors to the pool end + drop
+    the per-drain RX flush (`g_nc_marked = 1`) → build descriptors → one-time `g_cache_flush_fn` (`WBINVD`)
+    → `UP_LIST_PTR` → `StartDmaUp`. The 2-slot `NEXT` links and the 286 ISR pre-arm derive from `g_desc_phys`.
+11. **Release / uninstall.** `xms_release_core` (shared by RELEASE and `/u`) stops up-DMA, disarms, and
+    restores the NC region if `g_nc_marked` — else the block stays uncached after the stack frees the pool.
+    `/u` calls `dma_teardown` (stop an armed ring + release all VDS locks) before idling the card.
+12. **Where NC actually takes effect.** The install banner still prints `NC=validated (pool+desc NC; RX flush
+    dropped)`, but that line only reports the **cold re-test** verdict (`g_nc_effective`). The marking,
+    descriptor relocation and flush drop happen later, at **CONFIGURE**, and only for a CONV/COMMONBUF v2
+    ring on the 386+ ring whose pool fits one 64 KB block; otherwise the flush stays.
+13. **TX slot ADDR re-stamp.** `send_pkt` re-stamps the ring slot's buffer `ADDR` on every send: an AH=F1
+    async post shares the descriptors and had left the caller's buffer address there, so a later `send_pkt`
+    through that slot transmitted the stale buffer (seen as `CLOSE=FAIL` after async blasts). New file
+    `src/asm/resident_dma.asm` holds DMA-only resident code past `resident_end_pio` (VDS locks, AH=F1 V86
+    lock, `xms_release_core`, `dma_teardown`); `nc.asm` and `cache.asm` moved into the DMA region too, so the
+    PIO floor shrank.
 
 ## What this does and doesn't prove
 
@@ -235,4 +332,6 @@ TUI/board-config. This is its own milestone; do not block the safe core on it.
 
 ---
 
-_Last updated: 2026-06-22 06:00 CEST (4b descriptor relocation landed — Phase 2 step 4 COMPLETE: the conv RX descriptors relocate into the NC pool end when g_nc_effective, parameterised via g_desc_far/g_desc_phys/g_rx_flush_fn (one path; defaults reproduce the cached path), so the per-drain WBINVD drops. Verified: real CONV pol=3 + JEMM386 COMMONBUF pol=4 dropped=0 (no regression); CFG_FORCE_NC → NC=validated, flush dropped, dropped=0. The whole 4 track is in: safe core → WB gate → VDS/COMMONBUF → fallback ladder → relocation)._
+_Last updated: 2026-09-22 21:37 CEST (added "Review fixes (2026-09)"; corrected in place the wrong "TX DMA was already safe" and "64 KB NC granule already covers the +128 B block" claims, the `lin0` = "V86 segment" wording, the configure order, and the 286 pre-arm note)._
+
+_Prior: 2026-06-22 06:00 CEST (4b descriptor relocation landed — Phase 2 step 4 COMPLETE: the conv RX descriptors relocate into the NC pool end when g_nc_effective, parameterised via g_desc_far/g_desc_phys/g_rx_flush_fn (one path; defaults reproduce the cached path), so the per-drain WBINVD drops. Verified: real CONV pol=3 + JEMM386 COMMONBUF pol=4 dropped=0 (no regression); CFG_FORCE_NC → NC=validated, flush dropped, dropped=0. The whole 4 track is in: safe core → WB gate → VDS/COMMONBUF → fallback ladder → relocation)._

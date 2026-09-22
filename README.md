@@ -23,10 +23,42 @@ on a 5150, a 32-bit DMA path on a Pentium — from the same binary.
 Everything above the 5150 (286 bus-master/XMS, 386+ 32-bit/cache, PCI) is **additive**.
 See `docs/01-constraints.md`.
 
-## Build profiles
+## Build
 
-- `wmake minimal` — 8088/5150 floor: 3C509B PIO, conventional memory. Smallest image.
-- `wmake full`    — everything: ISA+PCI, PIO+DMA, XMS, all generations.
+All-assembly: NASM + Open Watcom `wlink` (no C, no C runtime), driven by `wmake` (`Makefile`).
+One binary covers every CPU/NIC tier; the tier is chosen at load time, not build time.
+
+| Target | Builds |
+|--------|--------|
+| `wmake` / `wmake all` | `build/3cpd.exe` (the driver) + `build/blast.com` (raw-frame TX throughput probe) |
+| `wmake fakenic` | test build that skips the NIC probe (`-dCFG_FAKENIC`), for dosbox-x |
+| `wmake debug` | instrumented build for hardware testing (`-dCFG_DEBUG`: cold trace, event log, heartbeat, 0x7F debug block) |
+| `wmake debugfake` | `debug` + `fakenic` |
+| `wmake pnp` | adds the direct ISA PnP probe (3C515 / PnP-mode 3C509B), tried before the ID port on ≥286 (`-dCFG_PNP`) |
+| `wmake debugpnp` | `debug` + `pnp` |
+| `wmake clean` | remove objects, fragment bins, `frags_asm.inc`, the `.exe`/`.com`/`.map` |
+
+Other variant builds pass NASM defines through `DEFS`, after forcing `start.obj` to rebuild:
+
+```sh
+rm build/start.obj && wmake DEFS=-dCFG_FORCE_NC      # force the NC re-test path (structural test; use with /n=254)
+rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush tier on the DMA paths
+```
+
+## Command-line switches
+
+| Switch | Effect |
+|--------|--------|
+| `/u` | uninstall the resident driver and exit |
+| `/b=NNN` | manual I/O base (hex); skips the ID-port probe |
+| `/q=NN` | manual IRQ (decimal); use with `/b=` |
+| `/5` | the card is a 3C515 Corkscrew (EEPROM at +0x2000, Window-1 base +0x10) |
+| `/d` | request bus-master DMA (3C515 + ≥286 only; still test-before-trust — falls back to PIO) |
+| `/j` | request FDDI-sized large frames (3C515 only) |
+| `/8` | force the 8088-class datapath (8-bit PIO), for testing on a faster CPU |
+| `/2` | force the 286-class datapath (16-bit PIO + single-transfer DMA) |
+| `/n=<id>` | opt in to a chipset non-cacheable DMA region: 1=OPTi 2=Eteq 3=UMC 4=SiS 254=synthetic test; re-test-gated (`docs/12`, `docs/17`) |
+| `/v` | trust the V86 host (EMM386/JEMM386) to emulate `WBINVD`; without it a non-coherent cache under V86 falls back to PIO (`docs/17`) |
 
 ## Docs
 
@@ -40,3 +72,17 @@ See `docs/01-constraints.md`.
 | `docs/05-memory-buffering.md` | Three-tier memory, adaptive buffering, size-tiered datapath |
 | `docs/06-boot-sequence.md` | Phased boot + unwind + config cache |
 | `docs/07-porting-plan.md` | What to lift from the old repo, in tiers |
+| `docs/08-nvmeotcp-plan.md` | RetroSAN: DOS NVMe/TCP initiator roadmap & status |
+| `docs/09-xms-dma-ext.md` | Proprietary INT 60h AH=F0 XMS/conv DMA RX-ring extension (cfg ABI v2) |
+| `docs/10-copybreak-pipelines.md` | Copybreak pipelines & the conventional zero-copy DMA ring |
+| `docs/11-capability-matrix.md` | NIC generation × capability matrix |
+| `docs/12-nc-region-lift.md` | Non-cacheable DMA region (chipset NC) lift + region policy |
+| `docs/13-cache-coherency-probe.md` | Cache coherency: measure, don't assume (probe recipe) |
+| `docs/14-bus-detection-lift.md` | Bus detection & enumeration |
+| `docs/15-isa-bus-ceiling.md` | The ISA bus ceiling (3C515 @ 100 Mbit) |
+| `docs/16-l4-rxtx-optimization.md` | L4 raw-TCP RX/TX optimization |
+| `docs/17-cache-coherency-impl.md` | Cache coherency implementation (Phase 2) + 2026-09 review fixes |
+
+---
+
+_Last updated: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._

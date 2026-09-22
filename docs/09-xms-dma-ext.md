@@ -124,8 +124,9 @@ RX: CPU frag  ×  mem policy  (CONVENTIONAL-PIO /
 
 ## INT 60h AH=0xF0 — function definitions
 
-All three sub-functions follow the Crynwr error convention: CF=0 success,
-CF=1 error with DH = error code (`XMS_ERR_*` from `xms_dma.h`).
+All sub-functions (QUERY/CONFIGURE/RELEASE below, plus `AL=0x03`
+`XMS_DMA_POLL`, the NAPI drain) follow the Crynwr error convention: CF=0
+success, CF=1 error with DH = error code (`XMS_ERR_*` from `xms_dma.h`).
 
 ### AL=0x00 — Query XMS DMA capabilities
 
@@ -135,14 +136,19 @@ In:   AH = XMS_DMA_FUNC   (0xF0)
 
 Out (CF=0):
       BX = capability flags  (XMS_CAP_* bitmask)
-      DX = maximum slot_size in bytes  (TX_SLOT_SZ; 4500 with FDDI)
+      DX = slot_size to use, in bytes  (always TX_SLOT_SZ = 1536; also the CONV ring stride)
 
 Out (CF=1):  extension not supported — fall back to MEM_CONVENTIONAL
 ```
 
 `nvmetsr.exe` calls this before allocating any XMS. An old `3cpd.exe` that
 does not implement `0xF0` returns CF=1 from its dispatcher (bad-command), and
-the caller silently takes the conventional path.
+the caller silently takes the conventional path. **The same CF=1 comes back
+when 3cpd is on the PIO floor** (no bus-master DMA: 3C509, `/d` not given, a
+failed DMA probe, V86 without a provable VDS lock, non-coherent without a safe
+flush): the whole AH=F0 extension (QUERY/CONFIGURE/RELEASE/POLL) exists only
+while DMA is active, because the PIO floor frees the `xms_*` state. See
+[v2 ABI and validation](#v2-abi-and-validation-2026-09).
 
 ### AL=0x01 — Configure XMS DMA receive ring
 
@@ -155,13 +161,15 @@ Out (CF=0):  ring programmed, UP_LIST_PTR armed, DMA running
 Out (CF=1):  DH = XMS_ERR_*  (ring not started; caller may retry or fall back)
 ```
 
-`3cpd.exe` validation steps:
+`3cpd.exe` validation steps (current; the full rules are in
+[v2 ABI and validation](#v2-abi-and-validation-2026-09)):
 
-1. `cfg.version == XMS_CFG_VERSION` (1)
-2. `cfg.policy` in `[XMS_POLICY_VCPI, XMS_POLICY_XMS_COPY]`
+1. `XMS_CFG_VERSION_MIN (1) ≤ cfg.version ≤ XMS_CFG_VERSION (2)`
+2. `cfg.policy ≤ XMS_POLICY_MAX` (4 = `COMMONBUF`); VCPI/DPMI (0/1) only on the 386+ ring
 3. `cfg.phys0` and `cfg.phys1` both `< DMA_ISA_16M_LIMIT` (0x1000000) — ISA
    bus-master 24-bit addressing limit
-4. `cfg.slot_size ≤ TX_SLOT_SZ`
+4. `1 ≤ cfg.slot_size ≤ TX_SLOT_SZ` (1536); a 32-byte multiple for CONV/COMMONBUF
+5. CONV/COMMONBUF: the `lin0`/`phys0` span checks (`XMS_ERR_BAD_LIN`)
 
 On success, `3cpd.exe` builds two 16-byte descriptors in its resident data
 (`ALIGNB 16`). The `EL3_DESC_NEXT` field is set by the JIT based on CPU tier:
@@ -202,9 +210,11 @@ Out (CF=1):  DH = XMS_ERR_NOT_CFG
 ```
 
 `3cpd.exe` writes zero to `UP_LIST_PTR` and issues `START_DMA_UP` with a null
-pointer to halt the RX engine. The resident config pointer is cleared. After
-this call, the ring descriptors and the caller's `xms_rx_cfg_t` are dead and
-the XMS buffers may be freed.
+pointer to halt the RX engine. The resident config pointer is cleared. If
+CONFIGURE fenced the pool non-cacheable (Phase 2, `docs/12`), the chipset's
+previous NC registers are restored here too. After this call, the ring
+descriptors and the caller's `xms_rx_cfg_t` are dead and the XMS buffers may be
+freed. `3cpd /u` does the same for a still-armed ring before it unloads.
 
 ---
 
@@ -259,18 +269,64 @@ Standard Crynwr AX=1 / AX=0 upcall into conventional `__far` rcvbuf.
 
 ```
 offset  size  field
-     0     1  version      must be XMS_CFG_VERSION (1)
+     0     1  version      XMS_CFG_VERSION (2); 1 = legacy, still accepted
      1     1  policy       xms_mem_policy_t
-     2     2  slot_size    bytes per slot
-     4     4  phys0        VDS physical address, slot 0
-     8     4  lin0         VCPI/DPMI linear address, slot 0  (0 = XMS_COPY)
-    12     4  phys1        VDS physical address, slot 1
-    16     4  lin1         VCPI/DPMI linear address, slot 1  (0 = XMS_COPY)
+     2     2  slot_size    bytes per slot (CONV/COMMONBUF: the ring stride)
+     4     4  phys0        bus physical address, slot 0 (CONV/COMMONBUF: ring base)
+     8     4  lin0         XMS_COPY: 0; CONV/COMMONBUF: ring base as a real-mode
+                           LINEAR (seg<<4, < 1 MB)
+    12     4  phys1        bus physical address, slot 1 (XMS_COPY; unused by CONV)
+    16     4  lin1         0 (reserved for VCPI/DPMI)
 total  20 bytes
 ```
 
 Must remain resident (not on the stack) for the lifetime of the DMA ring.
 The `3cpd.exe` ISR reads `lin0`/`lin1` on every received frame.
+
+---
+
+## v2 ABI and validation (2026-09)
+
+Changes from the Phase 2 code review (`docs/17` "Review fixes (2026-09)"):
+
+**AH=F0 needs DMA.** The extension answers only while the bus-master path is
+live (`g_use_dma`); on the PIO floor every sub-function returns CF=1
+bad-command. VCPI/DPMI configure additionally needs the 386+ ring (QUERY only
+advertises `XMS_CAP_VCPI`/`DPMI`/`RING` there).
+
+**cfg version 2.** `XMS_CFG_VERSION` = 2, `XMS_CFG_VERSION_MIN` = 1. A v2
+producer reserves `XMS_RX_DESC_BLOCK` (`RX_RING_N * 16` = 128 B) directly past
+a CONV/COMMONBUF ring (pool = `RX_RING_N * slot_size + XMS_RX_DESC_BLOCK`), so
+3cpd may relocate its RX descriptors there when a chipset NC fence is effective
+(`docs/17` step 4b). v1 is still accepted but then 3cpd never relocates or
+marks NC (a v1 pool has no room for the block). `dos-nvmeotcp` sends v2 and, on
+`XMS_ERR_BAD_VERSION`, retries once as v1 (for an older 3cpd).
+
+**Slot size.** QUERY always returns `DX = 1536` (`TX_SLOT_SZ`, a 32-byte
+multiple) — the slot size/stride to use, not the max frame. CONFIGURE accepts
+`1..1536`, and for CONV/COMMONBUF requires a **32-byte multiple**: the ISR
+finds each slot's CPU segment as `lin >> 4` and reads it at offset 0, so every
+slot must start on a paragraph (a 1514 stride put slots 1..7 mid-paragraph).
+
+**`lin0` semantics.** For CONV/COMMONBUF, `lin0` is a 32-bit **real-mode
+linear** address, `seg<<4` of the ring base (< 1 MB) — not a segment value and
+not a protected-mode linear. For CONV (real mode, identity) `lin0 == phys0`;
+for COMMONBUF (V86 + VDS lock) `phys0` is the VDS-reported bus address and
+`lin0` is where the CPU reads the same bytes.
+
+**Span checks (CONV/COMMONBUF).** With span = ring bytes (+ the descriptor
+block for v2) — 2 slots on the 286 single-transfer path, `RX_RING_N` on the
+386+ ring:
+
+| Check | Error |
+|-------|-------|
+| `lin0` non-zero, 16-byte aligned, `lin0 + span − 1 < 1 MB` | `XMS_ERR_BAD_LIN` (0x07) |
+| `phys0 + span − 1 < 16 MB` | `XMS_ERR_PHYS_RANGE` (0x03) |
+| CONV: `lin0 == phys0` and not running under a V86 host | `XMS_ERR_BAD_LIN` (0x07) |
+
+Error codes: `0x01 BAD_VERSION` (outside 1..2), `0x02 BAD_POLICY`,
+`0x03 PHYS_RANGE`, `0x04 SLOT_SIZE`, `0x05 ALREADY_CFG`, `0x06 NOT_CFG`,
+`0x07 BAD_LIN`.
 
 ---
 
@@ -330,7 +386,11 @@ nvmetsr.exe cold phase:
 
 ---
 
-_Last updated: 2026-06-24 19:42 CEST — clarified that `CONV` is CPU-gated by ring *depth*, not
+_Last updated: 2026-09-22 21:23 CEST — v2 cfg ABI (`XMS_RX_DESC_BLOCK`, v1
+still accepted), QUERY slot size always 1536 + the 32-byte CONV/COMMONBUF
+stride rule, `XMS_ERR_BAD_LIN` + span checks, `lin0` = real-mode linear, AH=F0
+only available with DMA active, RELEASE restores the NC region. Prior:
+2026-06-24 19:42 CEST — clarified that `CONV` is CPU-gated by ring *depth*, not
 availability (a 286 runs `CONV` as a 2-slot single-transfer ring; only the deep `RX_RING_N=8`
 `NEXT`-chained ring needs the 386+ ring-mode engine). Prior: 2026-06-13 20:49 CEST — scrubbed stale
 "no 64K crossing" note from the cold-phase sequence (the 3C515 first-party bus master has no 8237A

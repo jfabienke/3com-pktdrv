@@ -62,7 +62,7 @@ msg_coh        db 'CACHE FLUSH=', '$'           ; Phase 2 RX coherency verdict r
 msg_coh_none   db 'NONE (coherent)', 13, 10, '$'
 msg_coh_wbinvd db 'WBINVD (non-coherent)', 13, 10, '$'
 msg_coh_nosafe db 'NONE (non-coherent, no safe flush)', 13, 10, '$'
-msg_nc_eff     db 'NC=validated (pool+desc NC; RX flush dropped)', 13, 10, '$'
+msg_nc_eff     db 'NC=validated (applied at CONFIGURE: CONV/COMMONBUF v2 on the 386+ ring)', 13, 10, '$'
 msg_nc_off     db 'NC=requested, not effective (flush kept)', 13, 10, '$'
 
 ; uninstall (`3cpd /u`)

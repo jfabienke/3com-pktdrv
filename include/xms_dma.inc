@@ -52,13 +52,13 @@ XMS_RX_DESC_BLOCK   equ RX_RING_N * 16  ; v2 producers reserve this past the CON
 ; ---- error codes (DH on CF=1) -------------------------------------------
 
 XMS_ERR_BAD_VERSION equ 0x01   ; cfg.version outside XMS_CFG_VERSION_MIN..XMS_CFG_VERSION
-XMS_ERR_BAD_POLICY  equ 0x02   ; cfg.policy not in xms_mem_policy_t range
-XMS_ERR_PHYS_RANGE  equ 0x03   ; physical address >= DMA_ISA_16M_LIMIT
-XMS_ERR_SLOT_SIZE   equ 0x04   ; cfg.slot_size > DX returned by QUERY
+XMS_ERR_BAD_POLICY  equ 0x02   ; cfg.policy not in xms_mem_policy_t range (or VCPI/DPMI without the 386+ ring)
+XMS_ERR_PHYS_RANGE  equ 0x03   ; physical address (or a CONV/COMMONBUF phys0 span) >= DMA_ISA_16M_LIMIT
+XMS_ERR_SLOT_SIZE   equ 0x04   ; cfg.slot_size 0 or > DX from QUERY, or (CONV/COMMONBUF) not a 32-byte multiple
 XMS_ERR_ALREADY_CFG equ 0x05   ; ring already configured; call RELEASE first
 XMS_ERR_NOT_CFG     equ 0x06   ; RELEASE called but ring not configured
-XMS_ERR_BAD_LIN     equ 0x07   ; CONV/COMMONBUF lin0/phys0 span invalid (0, unaligned, >= 1 MB / 16 MB, or
-                               ; CONV with lin0 != phys0 or under V86)
+XMS_ERR_BAD_LIN     equ 0x07   ; CONV/COMMONBUF lin0 invalid (0, not paragraph-aligned, span reaching 1 MB), or
+                               ; CONV with lin0 != phys0 or under a V86 host
 
 ; ---- configuration structure (xms_rx_cfg_t) offsets --------------------
 ; Matches the C struct in include/xms_dma.h exactly (20 bytes total).

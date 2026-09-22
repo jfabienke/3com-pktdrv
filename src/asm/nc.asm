@@ -27,8 +27,9 @@
 ; and a larger one may silently cover a different, size-aligned block. One aligned 64 KB block is correct
 ; under either decode and pins a single size code per chipset -- the SAME (base, code) shape the cold re-test
 ; proves, so the live marking reuses a proven encoding. A span crossing a 64 KB boundary gets no NC (CF=1 ->
-; the caller keeps the flush). nc_mark_region saves the chipset's previous region-0 registers and
-; nc_clear_region restores them (writing 0 could clobber other bits in the SiS/UMC control registers).
+; the caller keeps the flush). nc_mark_region saves the chipset's previous region-0 base + size/control bytes
+; and nc_clear_region writes them back, so whatever the board had there (including any other bits sharing
+; the SiS/UMC control byte, which the whole-byte mark overwrites while it is active) is restored afterwards.
 ;
 ; Placed in the DMA region (past resident_end_pio): only the cold probe and f_xms_configure/release reach it.
 ; CONTRACT: nc_span64 clobbers AX,BX,CX,DX; nc_mark_region / nc_clear_region clobber AX,BX,CX,DX (SI saved).

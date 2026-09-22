@@ -1,12 +1,13 @@
 # 3com-pktdrv -- fully-assembly build (NASM + wlink, no C, no C runtime).
 #
-#   wmake            build build/3cpd.exe (8088/5150 floor)
+#   wmake            build build/3cpd.exe (one binary: 8088 floor .. 386+ DMA, chosen at load time)
 #   wmake clean
+#   test variants:   rm build/start.obj && wmake DEFS=-dCFG_FORCE_NC   (or -dCFG_FORCE_FLUSH);
+#                    targets fakenic / debug / debugfake / pnp / debugpnp below
 #
 # The driver is one NASM object (src/asm/start.asm) linked to a DOS MZ .EXE. The hot-path
 # fragment palette (src/asm/frag/*.asm) is assembled to raw bins by tools/mkfrag.py and
-# embedded as data (build/frags_asm.inc) -- it is not linked directly. Profiles (minimal vs
-# full) return once the >=286 cold phases + their fragments land; the floor is the default.
+# embedded as data (build/frags_asm.inc) -- it is not linked directly.
 
 ASM    = nasm        # Netwide Assembler
 LINK   = wlink       # Open Watcom linker

@@ -71,6 +71,8 @@ The cold probe already runs for bus-master trust (`04`); NC detection rides the 
         snooping bus (PCI/CardBus)      → no flush fragment at all; NC irrelevant
         non-snoop + NC verified         → mark pool NC once at init (align/size to granularity,
                                           1 region); emit DMA path WITHOUT FRAG_CACHE_FLUSH
+                                          [as built 2026-09: one aligned 64 KB block, marked at
+                                           CONFIGURE — see "Region policy as built" below]
         non-snoop + no/failed NC        → emit FRAG_CACHE_FLUSH (batched WBINVD, once per batch — 05)
 ```
 
@@ -123,7 +125,45 @@ safe core lands, behind that gate.
   write-back machines with a recognized chipset. NC effect is **structurally verified only** (QEMU/TCG
   models no CPU cache — see `13`); the real cache benefit needs real 386/486 hardware. See
   [`17-cache-coherency-impl.md`](17-cache-coherency-impl.md) step 4 for the build order + commits.
+- **Region policy revised 2026-09** after a code review (below; `17` "Review fixes (2026-09)").
+
+## Region policy as built (review fix, 2026-09)
+
+The first cut sized the NC region from the ring (slack + ring KB, rounded up per chipset granularity to
+8 KB–512 KB) and re-derived the size code per family. A review found that shape fragile and one family
+buggy, so `nc.asm` now uses a single fixed shape:
+
+- **Exactly one naturally aligned 64 KB block.** The base registers are in 64 KB units (A23:A16) and many
+  decoders mask the base by the size, so a smaller region can only start on a 64 KB boundary and a larger one
+  may silently cover a *different*, size-aligned block. One aligned 64 KB block is correct under either decode.
+  `nc_span64` takes the physical span (the **whole** pool: slots + the v2 descriptor block) and returns the
+  block's `base_kb` only if the span fits inside one block below 16 MB. A span crossing a 64 KB boundary gets
+  **no NC** — the flush is kept (correct, just not faster). The stack does not align the pool to 64 KB, so
+  whether NC applies depends on where DOS put the pool.
+- **Fixed size codes per chipset** (a 5-byte table `nc_tab`: id, base reg, size reg, data port, size value):
+
+  | Chipset | ports | base / size reg | size value for one 64 KB block |
+  |---------|-------|-----------------|--------------------------------|
+  | OPTi 82C391/Viper/381, Eteq Bengal | 0x22 / 0x24 | 0x52 / 0x53 | `0x40` — code 4 (`8 KB << (code-1)`), A27:A24 nibble 0 |
+  | UMC UM82C491 | 0x22 / 0x23 | 0x50 / 0x51 | `0xB0` — enable `0x80` \| code 3 (`8 KB << code`) |
+  | SiS 85C460 / Rabbit | 0x22 / 0x23 | 0x14 / 0x15 | `0x10` — code 1 (`64 KB << (code-1)`) |
+
+  This removed a UMC/SiS bug in the old encoder, which recomputed the size code *after* `CX` (the size input)
+  had been overwritten by the base register write. The base unit is still **UNVERIFIED on real silicon**
+  (cache-kit's 64 KB vs 16 KB question) — the cold re-test is what catches a wrong one.
+- **Save / restore.** `nc_mark_region` reads and saves the chipset's current region-0 base + size registers
+  before writing (base first, then the size/enable that turns the region on); `nc_clear_region` restores them
+  (size first, then base) instead of writing 0, which could clobber other bits in the SiS/UMC control
+  registers. Used for the transient cold re-test marking and for the live marking, which RELEASE and `/u`
+  undo (`xms_release_core`, when `g_nc_marked`).
+- **Same shape proven and used.** The cold re-test (`13`) marks its probe area with exactly this (base, code)
+  shape, so the live CONFIGURE marking reuses an encoding the re-test proved. The probe area sits at the
+  *top* of a *non-zero* block, so a wrong base unit or a too-small size code misses it and fails the re-test.
+- **Marked at CONFIGURE, not install.** Install only records the re-test verdict (`g_nc_effective`; banner
+  `NC=validated …`). The live pool is fenced in `f_xms_configure` only for a v2 CONV/COMMONBUF ring on the
+  386+ ring; only if that marking succeeds are the RX descriptors relocated and the per-drain flush dropped.
+- `nc.asm` now lives in the DMA-only resident region (past `resident_end_pio`), so the PIO floor drops it.
 
 ---
 
-_Last updated: 2026-06-24 19:42 CEST._
+_Last updated: 2026-09-22 21:23 CEST (region policy as built: one aligned 64 KB block, fixed per-chipset size codes, register save/restore, marked at CONFIGURE)._
