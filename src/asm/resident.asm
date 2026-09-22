@@ -165,12 +165,14 @@ pkt_do_async:
 .a_send:
         cmp     byte [g_async], 0      ; zero-copy async ring available? (any bus-master config, >=286)
         je      .a_unsup
+        call    tx_len_ok               ; 1..EL3_MAX_FRAME, else CANT_SEND
+        jc      .a_err
         call    dma_tx_async                          ; F_DS:F_SI = frame, F_CX = len; CF=1 if ring full
         jc      .a_full
         jmp     pkt_return                            ; CF=0 queued
 .a_full:
         mov     dh, PD_ERR_CANTSEND
-        jmp     pkt_error                             ; CF=1 -> caller throttles on tx_completed, retries
+.a_err: jmp     pkt_error                             ; CF=1 -> caller throttles on tx_completed, retries
 .a_unsup:
         mov     dh, PD_ERR_BADCMD
         jmp     pkt_error                             ; CF=1 -> caller falls back to send_pkt
@@ -279,8 +281,29 @@ f_release_type:
         stc
         ret
 
+;------------------------------------------------------------------------------
+; tx_len_ok -- validate a TX length before any datapath touches it: 1..EL3_MAX_FRAME (1514). The DMA
+; copy ring's slots are TX_SLOT_SZ (1536) and nothing bounded the copy, so a longer frame overran its slot
+; (the last one past resident_end); a zero length builds a zero-length descriptor. Large-frame (/j) TX
+; needs FDDI-sized slots first, so /j is RX-only until then. Enter bp -> INT 60h frame.
+; out: CF=0 ok; CF=1 + DH = PD_ERR_CANTSEND. Clobbers AX.
+;------------------------------------------------------------------------------
+tx_len_ok:
+        mov     ax, [bp + F_CX]
+        or      ax, ax
+        jz      .bad
+        cmp     ax, EL3_MAX_FRAME
+        ja      .bad
+        clc
+        ret
+.bad:   mov     dh, PD_ERR_CANTSEND
+        stc
+        ret
+
 ;--- 4: send_pkt -- DS:SI = packet, CX = length; near-call the emitted TX datapath ---
 f_send_pkt:
+        call    tx_len_ok               ; 1..EL3_MAX_FRAME, else CANT_SEND (no datapath is entered)
+        jc      .ret
         ; Recover any pending TX error from a prior (early-start) transmission so an
         ; underrun/jabber doesn't leave the transmitter stuck. Bounded loop -> safe on a
         ; floating bus. DS = our segment here (stat_* and g_nic_io are addressable).
@@ -319,7 +342,7 @@ f_send_pkt:
 .tx_single:
         call    dma_tx_single           ; 286: zero-copy DMA straight from the caller's buffer (blocking)
         clc
-        ret
+.ret:   ret
 .tx_pio:
         ; --- wait for FIFO room before bursting. With early-start enabled the card may still
         ; be draining a prior frame; a fast 286+ doing `rep outsw` can outrun a 2 KB FIFO
