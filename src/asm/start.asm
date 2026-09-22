@@ -167,21 +167,6 @@ g_nc_chipset:   resb 1             ; Phase 2 step 4: /n=<id> opt-in NC chipset (
                                    ; cold arg scan, read at f_xms_configure (resident) -> must NOT be in cold BSS.
 g_nc_effective: resb 1             ; 1 = the cold NC re-test confirmed NC fences the cache -> f_xms_configure marks
                                    ; the ring NC and drops the flush. 0 (default/emulator) -> keep the flush tier.
-g_lin_delta:    resd 1             ; Phase 2 4b: CONV/COMMONBUF in-place delivery linear-vs-physical offset =
-                                   ; cfg.lin0 - cfg.phys0 (set in f_xms_configure .build_conv). 0 for CONV (real
-                                   ; mode, identity-mapped). Under a paging VMM (COMMONBUF/VDS) phys0 is the bus
-                                   ; address and lin0 the V86 linear the CPU uses; the ISR recovers each slot's
-                                   ; CPU segment as (descriptor.phys + g_lin_delta) >> 4. RESIDENT (ISR reads it).
-; Phase 2 4b descriptor relocation: the conv RX descriptors normally live in the CACHED driver region
-; (xms_rx_descs); the card writes UP_COMPLETE there and the CPU polls it, so the per-drain RX flush is
-; required. When NC is effective the descriptors are RELOCATED into the (NC-fenced) DMA pool so that flush
-; can be DROPPED. These three vars parameterise the descriptor block's location so one code path serves
-; both: g_desc_far = CPU far ptr (seg:off), g_desc_phys = the card-facing physical base, g_rx_flush_fn =
-; the RX-side flush helper (separate from the TX g_cache_flush_fn so only the RX flush drops). Defaults
-; (set at install/configure) reproduce the cached path exactly: CS:xms_rx_descs + the selected flush tier.
-g_desc_far:     resd 1             ; descriptor block far ptr (offset, then segment) -- CPU access (ISR/build/poll)
-g_desc_phys:    resd 1             ; descriptor block physical base -- card UP_LIST/NEXT
-g_rx_flush_fn:  resw 1             ; RX-drain cache helper (= g_cache_flush_fn, or cache_flush_none when NC-relocated)
 ; (the bus-master TX-DMA structures -- tx_descs / tx_slots -- are placed LAST, past resident_end_pio,
 ;  so the TSR drops them on the PIO floor; the 286 single-transfer path also drops tx_slots.)
 g_mac:          resb 6             ; station address
@@ -289,6 +274,23 @@ xms_rx_descs:   resb RX_RING_N * EL3_DESC_SIZE
 xms_rx_desc0    equ xms_rx_descs                    ; slot-0 alias (the XMS_COPY / 286 2-slot path)
 xms_rx_desc1    equ xms_rx_descs + EL3_DESC_SIZE    ; slot-1 alias
 xms_gdt:        resb 48            ; INT 15h AH=87h GDT (6 x 8-byte entries; access bytes pre-set)
+g_lin_delta:    resd 1             ; Phase 2 4b: CONV/COMMONBUF in-place delivery linear-vs-physical offset =
+                                   ; cfg.lin0 - cfg.phys0 (set in f_xms_configure .build_conv). 0 for CONV (real
+                                   ; mode, identity-mapped). Under a paging VMM (COMMONBUF/VDS) phys0 is the bus
+                                   ; address and lin0 the V86 linear the CPU uses; the ISR recovers each slot's
+                                   ; CPU segment as (descriptor.phys + g_lin_delta) >> 4. DMA region: only
+                                   ; read with the ring armed, which needs g_use_dma.
+; Phase 2 4b descriptor relocation: the conv RX descriptors normally live in the CACHED driver region
+; (xms_rx_descs); the card writes UP_COMPLETE there and the CPU polls it, so the per-drain RX flush is
+; required. When NC is effective the descriptors are RELOCATED into the (NC-fenced) DMA pool so that flush
+; can be DROPPED. These three vars parameterise the descriptor block's location so one code path serves
+; both: g_desc_far = CPU far ptr (seg:off), g_desc_phys = the card-facing physical base, g_rx_flush_fn =
+; the RX-side flush helper (separate from the TX g_cache_flush_fn so only the RX flush drops). Defaults
+; (set at configure) reproduce the cached path exactly: CS:xms_rx_descs + the selected flush tier. They live
+; in the DMA region (past resident_end_pio): every reader is behind the pkt_do_xms g_use_dma gate.
+g_desc_far:     resd 1             ; descriptor block far ptr (offset, then segment) -- CPU access (ISR/build/poll)
+g_desc_phys:    resd 1             ; descriptor block physical base -- card UP_LIST/NEXT
+g_rx_flush_fn:  resw 1             ; RX-drain cache helper (= g_cache_flush_fn, or cache_flush_none when NC-relocated)
 
 resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops TX ring slots)
 global resident_end_xms_single
