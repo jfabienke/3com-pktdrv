@@ -315,7 +315,8 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 6               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma
+        mov     cx, 7               ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
+                                    ; g_want_large (a stale /j must not survive a reload either)
         xor     al, al
         rep     stosb
         ; The NC opt-in state is RESIDENT (read at configure) but set during this cold arg scan, so it can't
@@ -736,8 +737,7 @@ phase_validate_dma:
         cmp     ax, EL3_DMA_TX_TICKS
         jb      .pv_wait
         ; timeout: bus-master unproven -> fall back to the PIO floor
-        mov     byte [g_use_dma], 0
-        mov     byte [g_tx_ring], 0
+        call    dma_force_pio
 .pv_pass:
         pop     es
 .pv_done:
@@ -1153,12 +1153,21 @@ dma_v86_forbid_check:
         mov     es, ax
         test    byte [es:0x047B], 0x20  ; BIOS data 0040:007Bh bit 5 = VDS available
         jnz     .dvf_keep               ; V86 + VDS -> keep DMA (phys proven by the bus-master test + stack VDS)
-        mov     byte [g_use_dma], 0     ; V86 + no VDS -> can't address safely -> PIO floor
-        mov     byte [g_async], 0
-        mov     byte [g_tx_ring], 0
+        call    dma_force_pio           ; V86 + no VDS -> can't address safely -> PIO floor
 .dvf_keep:
         pop     es
 .dvf_done:
+        ret
+
+;------------------------------------------------------------------------------
+; dma_force_pio -- drop to the PIO floor: clear EVERY bus-master flag together. install keeps only up to
+; resident_end_pio when g_use_dma == 0, so a flag left set (g_async -> AH=F1 dma_tx_async, g_tx_ring)
+; would let a resident path touch the freed DMA region (tx_descs / xms_* state). Cold; no clobbers.
+;------------------------------------------------------------------------------
+dma_force_pio:
+        mov     byte [g_use_dma], 0
+        mov     byte [g_async], 0
+        mov     byte [g_tx_ring], 0
         ret
 
 ;------------------------------------------------------------------------------
