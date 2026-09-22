@@ -407,11 +407,28 @@ dma_tx_enqueue:
         and     cx, 3                           ; trailing bytes
         rep     movsb
         pop     ds                              ; DS = CS again
-        ; fill slot[head]'s descriptor: LEN = len, STATUS = 0 (ADDR/NEXT set at install)
+        ; fill slot[head]'s descriptor: ADDR = phys(slot), LEN = len, STATUS = 0 (NEXT set at install).
+        ; ADDR is re-stamped every time: an AH=F1 zero-copy post (dma_tx_async) shares these descriptors
+        ; and leaves the CALLER's buffer address in ADDR, so a later send_pkt through the same slot would
+        ; otherwise transmit that stale buffer (seen as the FIN after an async blast: CLOSE=FAIL).
         mov     bx, [tx_ring_head]
         mov     cl, 4
         shl     bx, cl                          ; head * 16
         add     bx, tx_descs
+        mov     ax, [tx_ring_head]
+        mov     dx, TX_SLOT_SZ
+        mul     dx
+        add     ax, tx_slots                    ; ax = slot offset
+        mov     cx, cs
+        mov     dx, cx
+        cpu     386
+        shl     cx, 4
+        shr     dx, 12
+        cpu     8086
+        add     ax, cx
+        adc     dx, 0                           ; dx:ax = phys(CS:slot)
+        mov     [bx + EL3_DESC_ADDR], ax
+        mov     [bx + EL3_DESC_ADDR + 2], dx
         mov     ax, [bp + F_CX]
         mov     [bx + EL3_DESC_LEN], ax
         xor     ax, ax
