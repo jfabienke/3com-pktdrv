@@ -63,9 +63,11 @@ XMS_ERR_BAD_LIN     equ 0x07   ; CONV/COMMONBUF lin0 invalid (0, not paragraph-a
 ; ---- configuration structure (xms_rx_cfg_t) offsets --------------------
 ; Matches the C struct in include/xms_dma.h exactly (20 bytes total).
 
-XMS_CFG_VERSION     equ 2       ; current cfg version: v2 = the producer reserves XMS_RX_DESC_BLOCK past a
-                                ; CONV/COMMONBUF ring. v1 is still accepted (then the driver never relocates
-                                ; its descriptors / marks NC -- a v1 pool has no room for the block).
+XMS_CFG_VERSION     equ 3       ; current cfg version. v2: the producer reserves XMS_RX_DESC_BLOCK past a
+                                ; CONV/COMMONBUF ring (NC descriptor relocation allowed). v3: its receiver also
+                                ; takes CONV/COMMONBUF slots IN PLACE -- it accepts the upcall hint (the slot)
+                                ; and queues up to RX_RING_N of them until its next AH=F0/03 poll. v1/v2 are
+                                ; still accepted (v1: no relocation/NC; v1/v2: CONV frames are copied out).
 XMS_CFG_VERSION_MIN equ 1
 
 XMS_CFG_version     equ 0       ; uint8_t  version

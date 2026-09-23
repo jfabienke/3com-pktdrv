@@ -517,13 +517,19 @@ xms_rx_deliver:
         mov     [cur_handle], si
 
         ; --- 8. Upcall 1 (AX=0): request buffer ---
-        ; VCPI/DPMI reference the slot in place (hint lin_seg:0). XMS_COPY + CONV copy the frame into
-        ; the receiver's OWN buffer (no hint), so the slot can be recycled immediately -- the conv slot
-        ; is a zero-copy *landing*, but the one mandatory payload-extraction copy (slot -> receiver ring)
-        ; still happens; CONV just does it as a fast rep movs instead of XMS_COPY's INT 15h (see step 9).
+        ; Every CPU-addressable slot is offered IN PLACE as the hint lin_seg:0 (VCPI/DPMI/CONV/COMMONBUF);
+        ; only XMS_COPY (slot not CPU-addressable) asks for the receiver's own buffer. A receiver that
+        ; returns the hint takes the slot in place (no copy) and holds it until its next AH=F0/03 poll --
+        ; the slot's STATUS is left complete (the upload engine stalls on it, the emulator backpressures)
+        ; and released at the top of that poll (xms_release_held). A receiver that returns its OWN buffer
+        ; gets the one-pass copy (step 9) and the slot is recycled at once, as before.
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
-        jae     .up1_no_hint
-        mov     es, [bp-6]              ; VCPI/DPMI hint: lin_seg:0
+        je      .up1_no_hint
+        jb      .up1_hint               ; VCPI/DPMI: always hinted (the original in-place path)
+        cmp     byte [xms_cfg_ver], 3   ; CONV/COMMONBUF: only a v3 producer queues in-place slots
+        jb      .up1_no_hint            ; (an older receiver's single hint slot would be overrun)
+.up1_hint:
+        mov     es, [bp-6]              ; hint: the slot itself, lin_seg:0
         xor     di, di
         jmp     .up1_call
 .up1_no_hint:
@@ -540,13 +546,25 @@ xms_rx_deliver:
         jz      .discard
         mov     [appbuf_seg], es
         mov     [appbuf_off], di
+        mov     byte [xms_inplace], 0
+        cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
+        je      .copy_dispatch
+        ; hinted slot (VCPI/DPMI/CONV/COMMONBUF): taken in place (returned exactly the hint lin_seg:0)?
+        or      di, di
+        jnz     .copy_dispatch
+        mov     ax, es
+        cmp     ax, [bp-6]
+        jne     .copy_dispatch
+        mov     byte [xms_inplace], 1
+        jmp     .no_copy
 
+.copy_dispatch:
         ; --- 9. Frame copy into the receiver buffer (the one mandatory payload-extraction pass):
         ; VCPI/DPMI reference the slot in place (no copy); XMS_COPY copies via INT 15h (XMS slot not
         ; CPU-addressable); CONV copies via a fast rep movs (conv slot IS addressable -> no INT 15h). ---
         cmp     byte [xms_rx_policy], XMS_POLICY_XMS_COPY
         jb      .no_copy                ; VCPI/DPMI: in-place reference
-        ja      .conv_copy              ; CONV: rep movs conv-slot -> appbuf (one copy, no slot race)
+        ja      .conv_copy              ; CONV declined the hint: rep movs conv-slot -> appbuf
         ; src: phys_N, limit = rx_len - 1
         mov     ax, [bp-2]
         mov     cl, [bp-4]
@@ -593,19 +611,37 @@ xms_rx_deliver:
         mov     cx, [rx_len]
         mov     bx, [cur_handle]
         mov     ax, 1
+        xor     dx, dx                  ; DX = 0: no RX checksum-offload sum for DMA frames (AH=F2 sums
+                                        ; only the PIO drain; 0 is never a real folded sum -> the stack
+                                        ; falls back to its own verify instead of trusting garbage)
         mov     ds, [appbuf_seg]
         call far [cs:bx]
         mov     ax, cs
         mov     ds, ax
         inc     word [stat_rx]
+        cmp     byte [xms_inplace], 0
+        je      .release_now
+        ; in place: leave STATUS complete (the receiver still reads the slot); release at the next poll
+        mov     bl, [xms_slot_idx]
+        cmp     byte [g_tx_ring], 0
+        jne     .held_idx
+        xor     bl, 1                   ; 286: the pre-arm already toggled idx -> the completed slot is the other
+.held_idx:
+        xor     bh, bh
+        mov     byte [xms_held + bx], 1
+        inc     byte [xms_nheld]
+        jmp     .advance
 
 .discard:
+        inc     word [stat_rxdrop]      ; receiver declined the frame (0:0) or runt
+.release_now:
         ; --- 11. Clear completed slot STATUS ---
         mov     si, [bp-8]              ; completed descriptor ptr (offset)
         mov     es, [g_desc_far + 2]   ; ES = descriptor segment (reload; the hdr/lin paths clobbered ES)
         xor     ax, ax
         mov     [es:si + EL3_DESC_STATUS], ax
         mov     [es:si + EL3_DESC_STATUS + 2], ax
+.advance:
         ; 386+ ring: advance to the next slot AFTER delivery -- (idx+1) mod nslots. nslots=2 for the
         ; XMS_COPY ring (cycles 0/1) and RX_RING_N for the deep CONV ring (0..N-1).
         cmp     byte [g_tx_ring], 0

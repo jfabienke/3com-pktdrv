@@ -77,8 +77,9 @@ typedef enum {
 
 /* ---- configuration structure (passed via ES:DI to CONFIGURE) ----------- */
 
-#define XMS_CFG_VERSION     2u      /* current: v2 = producer reserves XMS_RX_DESC_BLOCK past a
-                                     * CONV/COMMONBUF ring                                   */
+#define XMS_CFG_VERSION     3u      /* current: v3 = the receiver takes CONV/COMMONBUF slots
+                                     * in place (queues >= RX_RING_N until its next poll);
+                                     * v2 = producer reserves XMS_RX_DESC_BLOCK past the ring */
 #define XMS_CFG_VERSION_MIN 1u      /* v1 still accepted: 3cpd then never relocates its
                                      * descriptors / marks NC (no room for the block)        */
 
@@ -100,7 +101,7 @@ typedef enum {
  *              (it is the ring stride).
  */
 typedef struct {
-    uint8_t  version;       /* XMS_CFG_VERSION (2); 1 = legacy                */
+    uint8_t  version;       /* XMS_CFG_VERSION (3); 2 / 1 = older producers   */
     uint8_t  policy;        /* xms_mem_policy_t                               */
     uint16_t slot_size;     /* bytes per slot; must be <= DX from QUERY       */
     uint32_t phys0;         /* bus physical address — slot 0 / ring base      */

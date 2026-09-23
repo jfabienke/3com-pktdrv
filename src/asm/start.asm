@@ -312,6 +312,9 @@ g_v86:          resb 1             ; 1 = running under a paging V86 host (SMSW P
 g_vds_span_held: resb 1            ; 1 = tx_span_dds holds the VDS lock on [tx_descs, resident_end) (V86)
 g_nc_marked:    resb 1             ; 1 = f_xms_configure fenced the live ring's 64 KB block NC (release restores)
 xms_cfg_ver:    resb 1             ; the configured cfg.version (1 = legacy pool: never relocate / mark NC)
+xms_inplace:    resb 1             ; xms_rx_deliver scratch: 1 = the receiver took this slot in place
+xms_nheld:      resb 1             ; slots currently held in place by the receiver (released at the next poll)
+xms_held:       resb RX_RING_N     ; per slot: 1 = held in place (STATUS left complete until released)
 nc_saved_ok:    resb 1             ; 1 = nc_saved_base/size hold the chipset's pre-mark region-0 registers
 nc_saved_base:  resb 1
 nc_saved_size:  resb 1

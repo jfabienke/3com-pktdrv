@@ -1039,8 +1039,9 @@ f_xms_configure:
         mov     [xms_gdt + 42], ax
         mov     [xms_gdt + 44], ax
         mov     [xms_gdt + 46], ax
-        ; slot index = 0
+        ; slot index = 0, no in-place holds
         mov     byte [xms_slot_idx], 0
+        call    xms_clear_held
         ; close the copybreak autotune loop: hand the emulator our autotuned threshold T so its size-
         ; routing (len<=T -> PIO FIFO, len>T -> this DMA ring) matches the driver's live decision. The
         ; el3 model register at EL3_CS_RX_COPYBREAK consumes it; a real 3C515 ignores base+0x3C (the
@@ -1198,6 +1199,13 @@ f_xms_poll:
         ; Hold off ISR reentrancy on the shared receiver ring while we drain + upcall (the ISR honours
         ; g_isr_busy and no-ops; the level-triggered source re-fires after we clear it).
         mov     byte [g_isr_busy], 1
+        ; Release the slots the receiver took IN PLACE at the previous poll: it calls us again only after
+        ; consuming (and releasing) every frame we handed it, so their STATUS can be cleared now -- before
+        ; the batched flush below, which then also writes the cleared descriptors back to memory.
+        cmp     byte [xms_nheld], 0
+        je      .p_noheld
+        call    xms_release_held
+.p_noheld:
         ; Phase 2: ONE batched cache invalidate before reading any descriptor STATUS or slot payload, so a
         ; non-coherent cache doesn't spin on a stale descriptor (the card wrote UP_COMPLETE) or read a stale
         ; slot. Coherent/emulator -> a bare `ret` (nil cost). Helper preserves all GP regs + flags. RX-side,
@@ -1213,6 +1221,12 @@ f_xms_poll:
         test    word [es:si + EL3_DESC_STATUS], EL3_DESC_UP_COMPLETE
         jz      .p_drained              ; current slot not filled -> ring drained
         call    xms_rx_deliver          ; deliver desc[xms_slot_idx] (upcall); advances xms_slot_idx
+        ; 286 2-slot ping-pong: delivering a slot re-arms the OTHER one, which must not still be held --
+        ; so at most one in-place frame per poll there (the receiver releases it before polling again)
+        cmp     byte [g_tx_ring], 0
+        jne     .p_loop
+        cmp     byte [xms_nheld], 0
+        jne     .p_drained
         jmp     .p_loop
 .p_drained:
         mov     byte [g_isr_busy], 0

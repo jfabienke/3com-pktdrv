@@ -157,6 +157,49 @@ vds_release:
         ret
 
 ;------------------------------------------------------------------------------
+; xms_clear_held -- forget every in-place hold (configure / release). Clobbers AX, CX, DI, ES.
+;------------------------------------------------------------------------------
+xms_clear_held:
+        push    cs
+        pop     es
+        mov     di, xms_held
+        mov     cx, RX_RING_N
+        xor     al, al
+        cld
+        rep     stosb
+        mov     [xms_nheld], al
+        ret
+
+;------------------------------------------------------------------------------
+; xms_release_held -- clear STATUS on every slot a receiver took in place (xms_held[i]) and let the
+; upload engine continue: a real 3C515/Boomerang stalls on a still-complete descriptor, UpUnstall resumes
+; it (the emulator re-offers the frame it was holding back). Enter DS=CS. Clobbers AX, BX, CX, DX, SI, ES.
+;------------------------------------------------------------------------------
+xms_release_held:
+        mov     es, [g_desc_far + 2]
+        mov     si, [g_desc_far]                ; ES:SI = &desc[0]
+        xor     bx, bx
+        mov     cl, [xms_nslots]
+        xor     ch, ch
+.rh_loop:
+        cmp     byte [xms_held + bx], 0
+        je      .rh_next
+        mov     byte [xms_held + bx], 0
+        xor     ax, ax
+        mov     [es:si + EL3_DESC_STATUS], ax
+        mov     [es:si + EL3_DESC_STATUS + 2], ax
+.rh_next:
+        add     si, EL3_DESC_SIZE
+        inc     bx
+        loop    .rh_loop
+        mov     byte [xms_nheld], 0
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_UP_UNSTALL
+        out     dx, ax
+        ret
+
+;------------------------------------------------------------------------------
 ; xms_release_core -- stop the armed RX ring: zero UpListPtr + StartDmaUp (a null list halts the upload
 ; engine), drop UP_COMPLETE from the interrupt mask, disarm, then restore the chipset NC region the
 ; configure marked (after the card has stopped DMAing into it) -- otherwise the block stays uncached after
@@ -178,6 +221,7 @@ xms_release_core:
         out     dx, ax                          ; (g_use_dma is set whenever a ring can be armed)
         mov     byte [xms_dma_armed], 0
         mov     byte [g_rx_irq_masked], 0
+        call    xms_clear_held                  ; the ring is stopped: forget any in-place holds
         xor     ax, ax
         mov     [xms_cfg_off], ax
         mov     [xms_cfg_seg], ax
