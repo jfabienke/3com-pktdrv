@@ -62,6 +62,14 @@ nic_isr:
         in      ax, dx                  ; adapter status
         test    ax, EL3_ST_TX_COMPLETE  ; bus-master TX DMA done
         jz      .no_txdone
+        ; Ack TxComplete HERE, where it is serviced (every mode). .recv_done's blanket ack leaves it out:
+        ; a completion latched between the loop's last status read and that ack was cleared unserviced
+        ; -> the ring's in-flight frame never retired, tx_dma_busy stuck at 1, every later send_pkt
+        ; waited out its timeout and dropped (a timing-dependent TX wedge).
+        push    ax
+        mov     ax, EL3_CMD_ACK_INTR | EL3_ST_TX_COMPLETE
+        out     dx, ax
+        pop     ax
         cmp     byte [g_use_dma], 0
         je      .no_txdone              ; PIO mode: no DMA (TxComplete just acked at .recv_done)
         cmp     word [tx_ring_count], 0 ; ring frames in flight? (386+ copy ring OR 286/386+ async ring)
@@ -275,10 +283,17 @@ nic_isr:
 .recv_done:
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD
-        mov     ax, EL3_CMD_ACK_INTR | 0x07FF   ; ack all latched sources (11-bit field: incl
+        mov     ax, EL3_CMD_ACK_INTR | (0x07FF & ~EL3_ST_TX_COMPLETE)
+                                                ; ack all latched sources (11-bit field: incl
                                                 ; UpComplete bit 10 / DnComplete bit 9 -- 0x00FF
                                                 ; left the bus-master RX IRQ un-acked -> storm)
+                                                ; EXCEPT TxComplete, acked only where serviced
         out     dx, ax
+        ; A TxComplete that latched after the loop's last read is still pending: service it now. The
+        ; PIC is edge-triggered, so leaving with it latched (line already high) would never re-interrupt.
+        in      ax, dx
+        test    ax, EL3_ST_TX_COMPLETE
+        jnz     .recv_loop
         dec     byte [g_isr_busy]
 .eoi:
         ; restore the interrupted task's stack
