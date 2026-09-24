@@ -318,6 +318,7 @@ xms_held:       resb RX_RING_N     ; per slot: 1 = held in place (STATUS left co
 nc_saved_ok:    resb 1             ; 1 = nc_saved_base/size hold the chipset's pre-mark region-0 registers
 nc_saved_base:  resb 1
 nc_saved_size:  resb 1
+g_tx_slot_sz:   resw 1             ; TX ring slot size: TX_SLOT_SZ, or TX_SLOT_LARGE with /j (build_plan)
 tx_vds_held:    resb TX_RING_N     ; per TX slot: 1 = tx_vds_dds[i] still holds an AH=F1 frame's VDS lock
                 alignb 2
 tx_span_dds:    resb DDS_LEN       ; VDS DDS: the driver's own DMA span, locked for the driver's lifetime
@@ -327,11 +328,13 @@ resident_end_xms_single:          ; <== TSR keep boundary: 286 DMA + XMS (drops 
 global resident_end_xms_single
 
                 alignb 32                       ; Phase 2 (docs/17 Piece 4): cache-line align the DMA TX slots
-                                                ; (card reads them; TX_SLOT_SZ=1536 is a multiple of 32, so
+                                                ; (card reads them; both slot sizes are multiples of 32, so
                                                 ; every slot stays line-aligned) -- 386+-only, past the 286 boundary
-tx_slots:       resb TX_RING_N * TX_SLOT_SZ     ; 386+ COPY-ring frame slots (dma_tx_enqueue movsd's the frame in)
+tx_slots:       resb TX_RING_N * TX_SLOT_LARGE  ; 386+ COPY-ring frame slots (dma_tx_enqueue movsd's the frame in).
+                                                ; Reserved for /j; install keeps TX_RING_N * g_tx_slot_sz of it
 
-resident_end:                      ; <== TSR keep boundary for the 386+ ring DMA path
+resident_end:                      ; <== end of the image's resident reservation (the 386+ ring keeps up to
+                                   ;     tx_slots + TX_RING_N * g_tx_slot_sz: see install)
 global resident_end
 
 ;==============================================================================
@@ -1387,12 +1390,14 @@ build_plan:
         ;     length mask to the 13-bit Corkscrew field so a >2047 B frame's length isn't truncated.
         ;     el3_init sets allowLargePackets in MacControl when g_use_large. ---
         mov     byte [g_use_large], 0
+        mov     word [g_tx_slot_sz], TX_SLOT_SZ  ; standard TX ring slots unless /j
         mov     word [g_rx_len_mask], 0x07FF     ; default: standard Ethernet (11-bit-safe)
         cmp     byte [g_want_large], 0
         je      .large_resolved
         cmp     byte [g_nic_gen], 1              ; Corkscrew (3C515) only
         jne     .large_resolved
         mov     byte [g_use_large], 1
+        mov     word [g_tx_slot_sz], TX_SLOT_LARGE   ; FDDI-sized TX ring slots
         mov     word [g_rx_len_mask], 0x1FFF     ; 13-bit length field (FDDI-sized RX)
 .large_resolved:
         call    dma_v86_forbid_check    ; V86 + no VDS -> force the PIO floor (dma.h DMA_POLICY_FORBID)
@@ -1458,7 +1463,11 @@ dma_v86_forbid_check:
         mov     bx, cs
         mov     di, tx_span_dds
         mov     si, tx_descs
-        mov     cx, resident_end - tx_descs
+        mov     ax, [g_tx_slot_sz]              ; span = [tx_descs, end of the kept TX slots)
+        mov     cx, TX_RING_N
+        mul     cx
+        add     ax, tx_slots - tx_descs
+        mov     cx, ax
         call    vds_lock_prove
         jc      .dvf_pop_forbid
         mov     byte [g_vds_span_held], 1

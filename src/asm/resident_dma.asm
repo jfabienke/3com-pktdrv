@@ -97,8 +97,7 @@ tx_v86_phys:
 .copy:
         ; fallback: copy the frame into tx_slots[head] and post the slot (phys = CS<<4 + off, proven)
         mov     ax, si
-        mov     dx, TX_SLOT_SZ
-        mul     dx                              ; AX = head * TX_SLOT_SZ (< 64 KB)
+        mul     word [g_tx_slot_sz]             ; AX = head * slot size (< 64 KB)
         mov     di, ax
         add     di, tx_slots                    ; DI = slot offset
         push    di

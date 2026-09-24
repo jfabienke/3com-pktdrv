@@ -97,7 +97,8 @@ typedef enum {
  *              segment value; the ISR delivers slot i in place at
  *              (lin0 + i*slot_size) >> 4 : 0. CONV requires lin0 == phys0.
  *              lin1 unused (VCPI/DPMI mapping is reserved, see docs/09).
- * slot_size:   <= DX from QUERY (1536); CONV/COMMONBUF: a 32-byte multiple
+ * slot_size:   <= DX from QUERY (1536, or 4512 with /j: then >= 4490);
+ *              CONV/COMMONBUF: a 32-byte multiple
  *              (it is the ring stride).
  */
 typedef struct {

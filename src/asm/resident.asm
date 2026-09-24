@@ -314,17 +314,23 @@ tx_status_drain:
         ret
 
 ;------------------------------------------------------------------------------
-; tx_len_ok -- validate a TX length before any datapath touches it: 1..EL3_MAX_FRAME (1514). The DMA
-; copy ring's slots are TX_SLOT_SZ (1536) and nothing bounded the copy, so a longer frame overran its slot
-; (the last one past resident_end); a zero length builds a zero-length descriptor. Large-frame (/j) TX
-; needs FDDI-sized slots first, so /j is RX-only until then. Enter bp -> INT 60h frame.
+; tx_len_ok -- validate a TX length before any datapath touches it: 1..EL3_MAX_FRAME (1514), or
+; 1..EL3_MAX_FRAME_LARGE (4490) with /j (the TX ring slots are then TX_SLOT_LARGE). Nothing else bounds the
+; ring's slot copy, and a zero length builds a zero-length descriptor. (PIO refuses > 1514 separately.) Enter bp -> INT 60h frame.
 ; out: CF=0 ok; CF=1 + DH = PD_ERR_CANTSEND. Clobbers AX.
 ;------------------------------------------------------------------------------
 tx_len_ok:
         mov     ax, [bp + F_CX]
         or      ax, ax
         jz      .bad
+        cmp     byte [g_use_large], 0
+        jne     .large
         cmp     ax, EL3_MAX_FRAME
+        ja      .bad
+        clc
+        ret
+.large:
+        cmp     ax, EL3_MAX_FRAME_LARGE         ; /j: FDDI-sized frames (the TX slots are sized for them)
         ja      .bad
         clc
         ret
@@ -357,6 +363,14 @@ f_send_pkt:
         clc
 .ret:   ret
 .tx_pio:
+        ; an FDDI-sized (/j) frame can never fit the ~2 KB TX FIFO (TxFree never reaches len+4): only the
+        ; bus-master paths carry it -- refuse it here (a /j 3C515 may run PIO when /d is absent)
+        cmp     word [bp + F_CX], EL3_MAX_FRAME
+        jbe     .tx_pio_len
+        mov     dh, PD_ERR_CANTSEND
+        stc
+        ret
+.tx_pio_len:
         ; --- wait for FIFO room before bursting. With early-start enabled the card may still
         ; be draining a prior frame; a fast 286+ doing `rep outsw` can outrun a 2 KB FIFO
         ; (an 8088 loop never does). Require TxFree >= length + 4 (the 2 preamble words).
@@ -421,8 +435,7 @@ dma_tx_enqueue:
 .eq_have:
         ; copy caller frame (F_DS:F_SI, F_CX bytes) into slot[head] = tx_slots + head*TX_SLOT_SZ
         mov     ax, [tx_ring_head]
-        mov     dx, TX_SLOT_SZ
-        mul     dx                              ; dx:ax = head * TX_SLOT_SZ  (< 64 KB -> ax)
+        mul     word [g_tx_slot_sz]             ; dx:ax = head * slot size  (< 64 KB -> ax)
         mov     di, ax
         add     di, tx_slots
         mov     ax, cs
@@ -452,8 +465,7 @@ dma_tx_enqueue:
         shl     bx, cl                          ; head * 16
         add     bx, tx_descs
         mov     ax, [tx_ring_head]
-        mov     dx, TX_SLOT_SZ
-        mul     dx
+        mul     word [g_tx_slot_sz]
         add     ax, tx_slots                    ; ax = slot offset
         mov     cx, cs
         mov     dx, cx
@@ -793,6 +805,10 @@ f_xms_query:
         ; the max frame rounded up to a 32-byte multiple, so every CONV slot starts cache-line + paragraph
         ; aligned (xms_rx_deliver finds a slot's CPU segment as lin >> 4 and reads it at offset 0).
         mov     word [bp + F_DX], TX_SLOT_SZ
+        cmp     byte [g_use_large], 0
+        je      .q_slot
+        mov     word [bp + F_DX], XMS_SLOT_LARGE     ; /j: a slot must hold an FDDI-sized frame
+.q_slot:
         clc
         ret
 
@@ -833,8 +849,17 @@ f_xms_configure:
         mov     ax, [es:bx + XMS_CFG_slot_size]
         or      ax, ax
         jz      .esz
+        cmp     byte [g_use_large], 0
+        je      .slot_std
+        cmp     ax, EL3_MAX_FRAME_LARGE          ; /j: every slot must hold an FDDI-sized frame
+        jb      .esz
+        cmp     ax, XMS_SLOT_LARGE
+        ja      .esz
+        jmp     .slot_max
+.slot_std:
         cmp     ax, TX_SLOT_SZ
         ja      .esz
+.slot_max:
         cmp     byte [es:bx + XMS_CFG_policy], XMS_POLICY_CONV
         jb      .slot_ok
         test    al, 0x1F

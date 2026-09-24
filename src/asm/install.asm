@@ -141,7 +141,10 @@ install:
         mov     ax, resident_end_xms_single     ; 286 single-transfer DMA: keep XMS state, drop TX ring slots
         cmp     byte [g_tx_ring], 0
         je      .keep_calc
-        mov     ax, resident_end                ; 386+ ring DMA: keep through the TX slots + ring vars
+        mov     ax, [g_tx_slot_sz]              ; 386+ ring DMA: keep through the TX slots (sized by /j)
+        mov     cx, TX_RING_N
+        mul     cx
+        add     ax, tx_slots
 .keep_calc:
         add     ax, 15
         mov     cl, 4
@@ -198,7 +201,7 @@ tx_ring_init:
         mov     [si + EL3_DESC_STATUS], ax
         mov     [si + EL3_DESC_STATUS + 2], ax
         add     si, EL3_DESC_SIZE
-        add     di, TX_SLOT_SZ
+        add     di, [g_tx_slot_sz]
         dec     bx
         jnz     .tri_loop
         ret

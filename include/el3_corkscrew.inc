@@ -70,7 +70,11 @@ EL3_DESC_LEN_MASK       equ 0x1FFF   ; 13-bit length field
 ; TxComplete ISR). send_pkt copies the frame into a free slot and returns; the ISR frees the
 ; finished slot and kicks the next, overlapping CPU frame-prep with the card's DMA.
 TX_RING_N               equ 4        ; ring slots (frames that can be queued in flight)
-TX_SLOT_SZ              equ 1536     ; per-slot buffer (holds a max standard frame; FDDI later)
+TX_SLOT_SZ              equ 1536     ; per-slot buffer for a standard frame (32-byte multiple)
+TX_SLOT_LARGE           equ 4608     ; per-slot buffer with /j (FDDI-sized frames; 32-byte multiple). The
+                                     ; image reserves TX_RING_N of these; install keeps only g_tx_slot_sz each
+EL3_MAX_FRAME_LARGE     equ 4490     ; max FDDI-sized frame excl FCS (allowLargePackets oversize limit - 1)
+XMS_SLOT_LARGE          equ 4512     ; RX ring slot with /j: EL3_MAX_FRAME_LARGE rounded up to 32 bytes
 
 ; TX-DMA completion wait: dma_tx_single sti/hlt's until the TxComplete ISR flags g_tx_done,
 ; bounded by ELAPSED time via the BIOS 18.2 Hz tick (0040:006C) -- NOT by a wakeup count, since

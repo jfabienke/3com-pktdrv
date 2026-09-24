@@ -3,8 +3,8 @@
 ; Calls the packet driver at INT 60h with send_pkt (AH=4) and, when available, the async zero-copy send
 ; (AH=0xF1 AL=1) for a set of frame lengths, and prints one line per call:
 ;   SENDLEN fn=04 len=05DC cf=0 dh=00
-; Lengths 1..1514 must succeed (cf=0); 0 and anything above 1514 must fail with CANT_SEND (cf=1 dh=0C)
-; without touching a datapath. The frame is a broadcast with a zero payload. Build:
+; Lengths 1..1514 (1..4490 with /j on the DMA paths) must succeed (cf=0); 0 and anything longer must fail
+; with CANT_SEND (cf=1 dh=0C) without touching a datapath. The frame is a zero-payload broadcast. Build:
 ;   nasm -f bin tools/sendlen.asm -o build/sendlen.com
 cpu 8086
 bits 16
@@ -135,7 +135,7 @@ print_hex8:
         int     0x21
         ret
 
-lens:     dw 60, 1514, 0, 1515, 1600, 0xFFFF
+lens:     dw 60, 1514, 0, 1515, 1600, 4490, 4491, 0xFFFF
 msg_pre:  db 'SENDLEN fn=$'
 msg_len:  db ' len=$'
 msg_cf:   db ' cf=$'
@@ -146,4 +146,4 @@ cur_len:  dw 0
 frame:    times 6 db 0
           times 6 db 0x52
           db 0x08, 0x00
-          times 1600 - 14 db 0
+          times 4491 - 14 db 0

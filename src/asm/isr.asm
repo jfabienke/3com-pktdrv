@@ -397,6 +397,10 @@ xms_rx_deliver:
         ; SI still points to the COMPLETED (old) slot
 
 .no_prearm:
+        mov     ax, [rx_len]
+        cmp     ax, [xms_slot_sz]
+        ja      .discard                ; longer than the posted slot (the card truncated it) -> drop
+                                        ; (after the 286 pre-arm, so the other slot stays armed)
         ; --- 5. Load phys from the completed descriptor; derive lin_seg ---
         ; The descriptor ADDR field holds the slot phys for EVERY policy (f_xms_configure wrote it), so
         ; this works for the deep CONV ring (slots 2..N-1 aren't in the 2-entry cfg) and is identical to

@@ -302,9 +302,12 @@ a CONV/COMMONBUF ring (pool = `RX_RING_N * slot_size + XMS_RX_DESC_BLOCK`), so
 marks NC (a v1 pool has no room for the block). `dos-nvmeotcp` sends v2 and, on
 `XMS_ERR_BAD_VERSION`, retries once as v1 (for an older 3cpd).
 
-**Slot size.** QUERY always returns `DX = 1536` (`TX_SLOT_SZ`, a 32-byte
-multiple) — the slot size/stride to use, not the max frame. CONFIGURE accepts
-`1..1536`, and for CONV/COMMONBUF requires a **32-byte multiple**: the ISR
+**Slot size.** QUERY returns `DX = 1536` (`TX_SLOT_SZ`), or `DX = 4512`
+(`XMS_SLOT_LARGE`) when 3cpd runs with `/j` (FDDI-sized frames, max 4490) —
+both 32-byte multiples, the slot size/stride to use, not the max frame.
+CONFIGURE accepts `1..1536`, or `4490..4512` with `/j` (a slot must hold the
+largest frame the NIC may deliver; the ISR also discards any frame longer than
+the configured slot), and for CONV/COMMONBUF requires a **32-byte multiple**: the ISR
 finds each slot's CPU segment as `lin >> 4` and reads it at offset 0, so every
 slot must start on a paragraph (a 1514 stride put slots 1..7 mid-paragraph).
 
@@ -386,8 +389,9 @@ nvmetsr.exe cold phase:
 
 ---
 
-_Last updated: 2026-09-22 21:23 CEST — v2 cfg ABI (`XMS_RX_DESC_BLOCK`, v1
-still accepted), QUERY slot size always 1536 + the 32-byte CONV/COMMONBUF
+_Last updated: 2026-09-24 23:51 CEST — QUERY slot size per mode (1536, or 4512 with
+`/j`), CONFIGURE bounds `4490..4512` under `/j`. Prior: 2026-09-22 21:23 CEST — v2 cfg ABI (`XMS_RX_DESC_BLOCK`, v1
+still accepted), QUERY slot size 1536 + the 32-byte CONV/COMMONBUF
 stride rule, `XMS_ERR_BAD_LIN` + span checks, `lin0` = real-mode linear, AH=F0
 only available with DMA active, RELEASE restores the NC region. Prior:
 2026-06-24 19:42 CEST — clarified that `CONV` is CPU-gated by ring *depth*, not

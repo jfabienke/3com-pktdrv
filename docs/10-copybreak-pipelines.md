@@ -146,8 +146,10 @@ payload-extraction copy — by deleting the *extra* XMS copy that `XMS_COPY` pay
 ## Buffer geometry for the conventional ring
 
 - **MTU-sized from QUERY.** The slot size is `max_slot` reported by `INT 60h AH=F0h` QUERY —
-  Ethernet-sized in standard mode, FDDI-sized (~4.5 KB) when `g_use_large`. (Today `TX_SLOT_SZ`
-  is 1536, "FDDI later"; the ~4.5 KB slot is the target for this design.) The ring is `RX_RING_N`
+  Ethernet-sized in standard mode, FDDI-sized when `g_use_large` (`/j`): QUERY returns 1536, or
+  `XMS_SLOT_LARGE` = 4512 with `/j` (max frame `EL3_MAX_FRAME_LARGE` = 4490, MSS 4436). The TX
+  slots are sized at install (`g_tx_slot_sz` = 1536, or `TX_SLOT_LARGE` = 4608 with `/j`), so the
+  resident image does not grow without `/j`. The ring is `RX_RING_N`
   slots deep (8): ≈ 12 KB (Ethernet) or ≈ 36 KB (FDDI). Depth buffers the in-flight window, but it
   is **not** what fixes the windowed-RX-DMA collapse — that was **receive livelock** (at 100 Mbit the
   RX IRQ rate outruns a CPU-bound guest, so a per-IRQ ISR drain starves the stack's poll loop; a
@@ -264,4 +266,5 @@ policy** rather than XMS_COPY:
 
 ---
 
-_Last updated: 2026-06-15 09:02 CEST — added "Copy economics by CPU generation"._
+_Last updated: 2026-09-24 23:51 CEST — FDDI-sized slots (`/j`) implemented: QUERY 4512, TX slots
+4608 sized at install. Prior: 2026-06-15 09:02 CEST — added "Copy economics by CPU generation"._
