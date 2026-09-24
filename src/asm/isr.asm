@@ -71,6 +71,17 @@ nic_isr:
         out     dx, ax
         pop     ax
         cmp     byte [g_use_dma], 0
+        je      .no_txdone              ; PIO: send_pkt drains the TX status stack
+        ; bus-master: drain the TX status stack HERE (send_pkt no longer does -- its pop would clear a
+        ; TxComplete that latched while it ran, before this ISR could retire the ring slot)
+        push    ax
+        push    cx
+        push    dx
+        call    tx_status_drain
+        pop     dx
+        pop     cx
+        pop     ax
+        cmp     byte [g_use_dma], 0
         je      .no_txdone              ; PIO mode: no DMA (TxComplete just acked at .recv_done)
         cmp     word [tx_ring_count], 0 ; ring frames in flight? (386+ copy ring OR 286/386+ async ring)
         jne     .tx_ring_adv            ; yes -> advance the ring (frees a slot, kicks the next)

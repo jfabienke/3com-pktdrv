@@ -282,6 +282,38 @@ f_release_type:
         ret
 
 ;------------------------------------------------------------------------------
+; tx_status_drain -- pop the TX status stack (up to 8 entries); an underrun/jabber entry resets and
+; re-enables the transmitter so it isn't left stuck. Bounded -> safe on a floating bus. PIO: called by
+; send_pkt; bus-master: by the ISR while servicing TxComplete. Enter DS=CS. Clobbers AX, CX, DX.
+;------------------------------------------------------------------------------
+tx_status_drain:
+        mov     dx, [g_w1_base]
+        add     dx, EL3_W1_TX_STATUS
+        mov     cx, 8
+.txs:   in      al, dx
+        or      al, al
+        jz      .done
+        test    al, EL3_TXS_RESET_MASK
+        jz      .pop
+        inc     word [stat_txunderrun]
+        push    dx
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_TX_RESET
+        out     dx, ax
+        mov     ax, EL3_CMD_TX_ENABLE
+        out     dx, ax
+        mov     ax, [g_tx_start]              ; per-generation TX-start (early vs store-forward)
+        out     dx, ax
+        pop     dx
+.pop:
+        xor     al, al
+        out     dx, al                  ; pop this entry off the TX status stack
+        loop    .txs
+.done:
+        ret
+
+;------------------------------------------------------------------------------
 ; tx_len_ok -- validate a TX length before any datapath touches it: 1..EL3_MAX_FRAME (1514). The DMA
 ; copy ring's slots are TX_SLOT_SZ (1536) and nothing bounded the copy, so a longer frame overran its slot
 ; (the last one past resident_end); a zero length builds a zero-length descriptor. Large-frame (/j) TX
@@ -304,32 +336,13 @@ tx_len_ok:
 f_send_pkt:
         call    tx_len_ok               ; 1..EL3_MAX_FRAME, else CANT_SEND (no datapath is entered)
         jc      .ret
-        ; Recover any pending TX error from a prior (early-start) transmission so an
-        ; underrun/jabber doesn't leave the transmitter stuck. Bounded loop -> safe on a
-        ; floating bus. DS = our segment here (stat_* and g_nic_io are addressable).
-        mov     dx, [g_w1_base]
-        add     dx, EL3_W1_TX_STATUS
-        mov     cx, 8
-.txs:   in      al, dx
-        or      al, al
-        jz      .txs_done
-        test    al, EL3_TXS_RESET_MASK
-        jz      .txs_pop
-        inc     word [stat_txunderrun]
-        push    dx
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_TX_RESET
-        out     dx, ax
-        mov     ax, EL3_CMD_TX_ENABLE
-        out     dx, ax
-        mov     ax, [g_tx_start]              ; per-generation TX-start (early vs store-forward)
-        out     dx, ax
-        pop     dx
-.txs_pop:
-        xor     al, al
-        out     dx, al                  ; pop this entry off the TX status stack
-        loop    .txs
+        ; PIO: recover any pending TX error from a prior (early-start) transmission. NOT on the
+        ; bus-master path: popping the TX status stack also clears TxComplete, so a DMA completion
+        ; that latched while we're in here (IF=0) would be consumed before the ISR retires its ring
+        ; slot -> the ring wedges. There the ISR drains the stack when it services TxComplete.
+        cmp     byte [g_use_dma], 0
+        jne     .txs_done
+        call    tx_status_drain
 .txs_done:
         inc     word [stat_tx]
         cmp     byte [g_use_dma], 0     ; bus-master DMA TX path (3C515, >=286)?
