@@ -41,6 +41,7 @@ $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
 
 $(BUILD)/start.obj : src/asm/start.asm src/asm/el3_probe.asm src/asm/el3_init.asm &
                      src/asm/resident.asm src/asm/isr.asm src/asm/install.asm &
+                     src/asm/resident_dma_paths.asm src/asm/isr_dma.asm &
                      src/asm/isapnp.asm src/asm/cache.asm src/asm/nc.asm &
                      src/asm/copybreak.asm src/asm/resident_dma.asm &
                      include/codegen.inc include/el3_tomahawk.inc include/el3_core.inc &

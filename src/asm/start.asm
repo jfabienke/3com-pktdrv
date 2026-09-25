@@ -229,11 +229,13 @@ dbg_log_head:   dw 0               ; ring write index (wraps at DBG_LOG_SIZE)
 dbg_log:        times DBG_LOG_SIZE db 0
 %endif
 
-; --- end of the always-resident (PIO floor) region. When the bus-master DMA path is inactive
-;     (g_use_dma == 0) the TSR keeps only up to here, reclaiming the DMA region below (~4.6 KB).
+; --- end of the always-resident (PIO floor) region. DMA entry points below are reached only
+;     when g_use_dma/g_async is active, so a PIO installation can reclaim their code as well.
 resident_end_pio:
 global resident_end_pio
 
+%include "resident_dma_paths.asm"   ; TX DMA and XMS packet-driver entry points
+%include "isr_dma.asm"              ; XMS receive delivery, called by the XMS poll path
 %include "resident_dma.asm"         ; DMA-only resident code (VDS locks, teardown) -- dropped on the PIO floor
 %include "cache.asm"                ; bus-master DMA cache-coherency flush helper (Phase 2; DMA paths only)
 %include "nc.asm"                   ; non-cacheable DMA-region marking (Phase 2 step 4; opt-in /n, real-HW only)
