@@ -70,10 +70,11 @@ nic_isr:
         mov     ax, EL3_CMD_ACK_INTR | EL3_ST_TX_COMPLETE
         out     dx, ax
         pop     ax
-        cmp     byte [g_use_dma], 0
-        je      .no_txdone              ; PIO: send_pkt drains the TX status stack
-        ; bus-master: drain the TX status stack HERE (send_pkt no longer does -- its pop would clear a
-        ; TxComplete that latched while it ran, before this ISR could retire the ring slot)
+        ; Drain the TX status stack HERE, in every mode. On a real 3C509 TxComplete is cleared ONLY by
+        ; popping that stack (AckIntr doesn't touch it): a PIO TX error (underrun, 16 collisions, jabber)
+        ; left undrained kept TxComplete up, and the .recv_done re-check looped forever with IF=0. (The
+        ; emulator's AckIntr clears it, which hid this.) Bus-master: send_pkt no longer drains -- its pop
+        ; would clear a TxComplete that latched while it ran, before this ISR could retire the ring slot.
         push    ax
         push    cx
         push    dx

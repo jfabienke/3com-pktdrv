@@ -60,6 +60,9 @@ EL3_TX_START_THRESH     equ 512      ; early-start (overlap, low latency) -- 3C5
 ; impossible at ANY link speed. Mandatory where the wire can out-drain PIO fill (e.g. a 3C515
 ; at 100 Mbit: ~12.5 MB/s wire vs ~2-4 MB/s ISA PIO). The 8 KB 3C515 FIFO is sized for this.
 EL3_TX_THRESH_SF        equ 1536
+; Adaptive raise after an underrun (tx_status_drain): the threshold climbs by this step toward SF, so a
+; CPU/bus that can't keep the FIFO ahead of the wire stops losing frames after a few underruns.
+EL3_TX_START_STEP       equ 256
 
 ; Window-1 register relocation across the lineage. On the 3C509/B the FIFO/status/free block
 ; is window-relative at +0x00; the Vortex generation (3C515 "Corkscrew" onward) moved it to a
@@ -72,6 +75,7 @@ EL3_W1_DELTA_VORTEX     equ 0x10
 ; TX status (W1_TX_STATUS, a byte popped off a small stack)
 EL3_TXS_COMPLETE        equ 0x80     ; a TX status entry is present
 EL3_TXS_RESET_MASK      equ 0x30     ; underrun (0x10) | jabber (0x20) -> needs TxReset
+EL3_TXS_UNDERRUN        equ 0x10     ; the FIFO ran dry mid-frame (fill slower than the wire)
 
 ; ---- status bits ----
 EL3_ST_INT_LATCH        equ 0x0001

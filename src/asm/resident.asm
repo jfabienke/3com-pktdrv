@@ -283,8 +283,10 @@ f_release_type:
 
 ;------------------------------------------------------------------------------
 ; tx_status_drain -- pop the TX status stack (up to 8 entries); an underrun/jabber entry resets and
-; re-enables the transmitter so it isn't left stuck. Bounded -> safe on a floating bus. PIO: called by
-; send_pkt; bus-master: by the ISR while servicing TxComplete. Enter DS=CS. Clobbers AX, CX, DX.
+; re-enables the transmitter so it isn't left stuck, and an underrun raises the TX start threshold by
+; EL3_TX_START_STEP (up to store-and-forward). Bounded -> safe on a floating bus. Called by the ISR while
+; servicing TxComplete (every mode: on a real 3C509 only this pop clears TxComplete), and by PIO send_pkt.
+; Enter DS=CS. Clobbers AX, CX, DX.
 ;------------------------------------------------------------------------------
 tx_status_drain:
         mov     dx, [g_w1_base]
@@ -296,6 +298,12 @@ tx_status_drain:
         test    al, EL3_TXS_RESET_MASK
         jz      .pop
         inc     word [stat_txunderrun]
+        test    al, EL3_TXS_UNDERRUN
+        jz      .restart                ; jabber: restart at the same threshold
+        cmp     word [g_tx_start], EL3_CMD_SET_TX_START | (EL3_TX_THRESH_SF - EL3_TX_START_STEP)
+        ja      .restart                ; already store-and-forward
+        add     word [g_tx_start], EL3_TX_START_STEP   ; the fill can't stay ahead: start later
+.restart:
         push    dx
         mov     dx, [g_nic_io]
         add     dx, EL3_CMD

@@ -1358,11 +1358,19 @@ build_plan:
         add     ax, [g_nic_io]
         mov     [g_w1_base], ax             ; Window-1 data-register base (FIFO/status/free)
         ; PIO TX uses early-start on BOTH generations: the wire overlaps the FIFO fill, keeping a
-        ; slow CPU near wire rate at 10 Mbit. The 3C515's former store-and-forward threshold (1536)
-        ; exceeds a standard frame, so the wire never early-started -- serialized fill+transmit,
-        ; ~16x slower at 286/10M (598 vs 9717 kbit/s). 100 Mbit uses DMA (PIO@100 is impractical),
-        ; so SF bought nothing here; and DMA TX bypasses this FIFO threshold entirely.
+        ; CPU that fills faster than the wire near wire rate at 10 Mbit. (The ~16x store-and-forward
+        ; penalty once measured here -- 598 vs 9717 kbit/s at 286/10M -- was an emulator artifact: it
+        ; didn't start a complete frame that sat below the threshold. Fixed in elink-qemu; SF costs
+        ; only the lost overlap.) DMA TX bypasses this FIFO threshold entirely.
+        ; EXCEPT the 8088 class: its fill (~0.3 MB/s at 4.77 MHz) is slower than the 10 Mbit wire drain
+        ; (1.25 MB/s), so early start underruns any frame much over the threshold -- the frame is lost and
+        ; every retransmit underruns again. Store-and-forward there (tx_status_drain also raises the
+        ; threshold adaptively after an underrun on any CPU).
         mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        cmp     byte [g_cpu_class], CPU_8088
+        jne     .tx_start_set
+        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_THRESH_SF
+.tx_start_set:
         mov     [g_tx_start], bx            ; precomputed SET_TX_START command
         mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
         mov     [g_plan_tx_imm], ax
