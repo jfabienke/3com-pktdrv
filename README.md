@@ -51,12 +51,12 @@ rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush ti
 |--------|--------|
 | `/u` | uninstall the resident driver and exit |
 | `/b=NNN` | manual I/O base (hex); skips the ID-port probe |
-| `/q=NN` | manual IRQ (decimal); use with `/b=` |
+| `/q=NN` | manual IRQ (decimal); use with `/b=`. On an AT, 2 is taken as 9 (the cascade line); on a PC/XT-class board (one 8259) 9 is taken as 2 and 10–15 are refused. Default without `/q=`: 10 |
 | `/5` | the card is a 3C515 Corkscrew (EEPROM at +0x2000, Window-1 base +0x10) |
 | `/d` | request bus-master DMA (3C515 + ≥286 only; still test-before-trust — falls back to PIO) |
 | `/j` | request FDDI-sized large frames (3C515 only) |
 | `/8` | force the 8088-class datapath (8-bit PIO), for testing on a faster CPU |
-| `/2` | force the 286-class datapath (16-bit PIO + single-transfer DMA) |
+| `/2` | force the 286-class datapath (16-bit PIO + single-transfer DMA); ignored on an 8088/8086-class CPU |
 | `/n=<id>` | opt in to a chipset non-cacheable DMA region: 1=OPTi 2=Eteq 3=UMC 4=SiS 254=synthetic test; re-test-gated (`docs/12`, `docs/17`) |
 | `/v` | trust the V86 host (EMM386/JEMM386) to emulate `WBINVD`; without it a non-coherent cache under V86 falls back to PIO (`docs/17`) |
 
@@ -85,4 +85,4 @@ rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush ti
 
 ---
 
-_Last updated: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._
+_Last updated: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._

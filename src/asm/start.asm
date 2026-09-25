@@ -53,6 +53,9 @@ msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
 msg_badmac  db 'ERROR: invalid station MAC (all-FF/all-00/multicast) -- wrong card gen?', 13, 10
             db '       (/5 selects 3C515 EEPROM at +0x2000; omit it for a 3C509)', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
+msg_no286   db '/2 ignored: CPU below 286', 13, 10, '$'
+msg_badirq  db 13, 10, 'ERROR: IRQ 8-15 needs a second 8259 (AT); this PC/XT-class board has IRQ 0-7 only', 13, 10
+            db '       (set the card to IRQ 3/5/7 or 9 [=IRQ2] and pass /q=)', 13, 10, '$'
 msg_dma     db 'DMA=', '$'
 msg_dma_on  db 'ON', 13, 10, '$'
 msg_dma_pio db 'PIO', 13, 10, '$'
@@ -98,6 +101,7 @@ g_want_large:   resb 1          ; 1 = /j given -> request FDDI-sized large frame
 g_want_v86trust: resb 1         ; 1 = /v given -> trust the V86 host (EMM386/JEMM386) to emulate WBINVD
 g_wbinvd_ok:    resb 1          ; 1 = WBINVD may run: 486+ AND (real mode OR /v). Set in dma_v86_forbid_check
 g_coh_nosafe:   resb 1          ; 1 = the coherency probe found a non-coherent cache with no safe flush -> PIO
+g_cpu_hw:       resb 1          ; the DETECTED CPU class (before /8 or /2 override the datapath class)
 g_vds_cold_held: resb 1         ; 1 = cold_dds holds the VDS lock on the cold probe span (V86)
                 alignb 2
 cold_dds:       resb 16         ; VDS DDS for the cold probe span [bm_test_buf, coh_probe_end)
@@ -353,9 +357,9 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 10              ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
-                                    ; g_want_large, g_want_v86trust, g_wbinvd_ok, g_coh_nosafe (a stale /j or
-                                    ; /v must not survive a reload either)
+        mov     cx, 11              ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
+                                    ; g_want_large, g_want_v86trust, g_wbinvd_ok, g_coh_nosafe, g_cpu_hw
+                                    ; (a stale /j or /v must not survive a reload either)
         xor     al, al
         rep     stosb
         ; The NC opt-in state is RESIDENT (read at configure) but set during this cold arg scan, so it can't
@@ -455,6 +459,8 @@ global resident_end
 %endif
 
         call    detect_cpu          ; -> g_cpu_class
+        mov     al, [g_cpu_class]
+        mov     [g_cpu_hw], al      ; keep the real class: the overrides below only pick a datapath
         cmp     byte [g_force8], 0  ; /8 -> force the 8088-class datapath (test 8-bit PIO on a fast CPU)
         je      .chk_force286
         mov     byte [g_cpu_class], CPU_8088
@@ -462,7 +468,15 @@ global resident_end
 .chk_force286:
         cmp     byte [g_force286], 0 ; /2 -> force the 286-class datapath (16-bit PIO + single-transfer DMA)
         je      .cpu_ok
+        ; only a DOWNGRADE is safe: the 286 fragments use rep insw/outsw (opcodes 6Ch-6Fh are Jcc on an
+        ; 8088) and the DMA checks run SMSW (0Fh = POP CS) -- on an 8088/8086 /2 is ignored
+        cmp     al, CPU_80286
+        jb      .no_force286
         mov     byte [g_cpu_class], CPU_80286
+        jmp     .cpu_ok
+.no_force286:
+        mov     dx, msg_no286
+        call    print_str
 .cpu_ok:
         mov     dx, msg_cpu
         call    print_str
@@ -525,6 +539,8 @@ global resident_end
 %endif
         jc      .nic_none           ; no card found
 .nic_found:
+        call    irq_fixup           ; map IRQ 2/9 to the board's PIC layout; refuse 10-15 on a PC/XT
+        jc      .bad_irq
         mov     dx, msg_nic         ; "3C509 I/O=0x"
         call    print_str
         mov     ax, [g_nic_io]
@@ -616,6 +632,53 @@ global resident_end
         mov     dx, msg_badmac
         call    print_str
         jmp     .fail
+.bad_irq:
+        mov     dx, msg_badirq
+        call    print_str
+        jmp     .fail
+
+;------------------------------------------------------------------------------
+; irq_fixup -- fit g_nic_irq to the board's interrupt controllers (the card's own IRQ is set by its
+; EEPROM/config utility; g_nic_irq only selects our vector, PIC mask and EOI).
+; A PC/XT-class board has ONE 8259 (IRQ 0-7): ports A0h-AFh are the NMI mask register there, and the bus
+; pin an AT calls IRQ9 is the XT's IRQ2. Single-PIC = an 8088/8086-class CPU (V20/V30/80186 included; the
+; PS/2 25/30 and PC Convertible are 8086 boards with one 8259) or a PC/XT/PCjr/PS/2-30 BIOS model byte.
+; Single PIC: 9 -> 2, 10-15 -> refused. Two PICs: 2 -> 9 (IRQ2 is the cascade; the pin arrives as IRQ9).
+; out: CF=1 -> this IRQ can't work on this board. Clobbers AX, ES.
+;------------------------------------------------------------------------------
+irq_fixup:
+        cmp     byte [g_cpu_hw], CPU_8088
+        je      .single
+        mov     ax, 0xF000
+        mov     es, ax
+        mov     al, [es:0xFFFE]     ; BIOS model byte
+        push    ds
+        pop     es                  ; ES = DS again
+        cmp     al, 0xFB            ; FF PC, FE/FB XT, FD PCjr, FA PS/2 30, F9 Convertible;
+        jae     .xt_model           ; FC = AT / XT-286 / PS/2 50+ (two PICs)
+        cmp     al, 0xF9
+        jb      .dual
+        jmp     .single             ; F9/FA
+.xt_model:
+        cmp     al, 0xFC
+        je      .dual
+.single:
+        mov     ax, [g_nic_irq]
+        cmp     ax, 9
+        jne     .s_chk
+        mov     word [g_nic_irq], 2 ; the IRQ2/9 bus pin is IRQ2 on an XT
+        clc
+        ret
+.s_chk:
+        cmp     ax, 8
+        cmc                         ; CF = 1 if IRQ >= 8 (no slave PIC to deliver it)
+        ret
+.dual:
+        cmp     word [g_nic_irq], 2
+        jne     .d_ok
+        mov     word [g_nic_irq], 9 ; IRQ2 is the cascade input on an AT: the pin arrives as IRQ9
+.d_ok:  clc
+        ret
 
 ;------------------------------------------------------------------------------
 ; do_uninstall -- `3cpd /u`: find the resident driver via the INT 60h vector + the
