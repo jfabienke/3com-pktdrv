@@ -34,7 +34,7 @@ One binary covers every CPU/NIC tier; the tier is chosen at load time, not build
 | `wmake fakenic` | test build that skips the NIC probe (`-dCFG_FAKENIC`), for dosbox-x |
 | `wmake debug` | instrumented build for hardware testing (`-dCFG_DEBUG`: cold trace, event log, heartbeat, 0x7F debug block) |
 | `wmake debugfake` | `debug` + `fakenic` |
-| `wmake pnp` | adds the direct ISA PnP probe (3C515 / PnP-mode 3C509B), tried before the ID port on ≥286 (`-dCFG_PNP`) |
+| `wmake pnp` | adds the direct ISA PnP probe (3C515 / PnP-mode 3C509B), tried before the legacy probes on ≥286 (`-dCFG_PNP`); CI publishes it as `3cpdpnp.exe` |
 | `wmake debugpnp` | `debug` + `pnp` |
 | `wmake clean` | remove objects, fragment bins, `frags_asm.inc`, the `.exe`/`.com`/`.map` |
 
@@ -47,9 +47,21 @@ rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush ti
 
 ### Prebuilt binaries
 
-GitHub Actions (`.github/workflows/build.yml`) builds `3cpd.exe`, `blast.com` and `sendlen.com` with
-NASM and Open Watcom on every push and pull request; download them from the run's **3cpd-binaries**
-artifact. Pushing a `v*` tag also attaches them to that GitHub release.
+GitHub Actions (`.github/workflows/build.yml`) builds `3cpd.exe`, `3cpdpnp.exe` (the `pnp` profile),
+`blast.com` and `sendlen.com` with NASM and Open Watcom on every push and pull request; download them from
+the run's **3cpd-binaries** artifact. Pushing a `v*` tag also attaches them to that GitHub release.
+
+### Finding the card
+
+- **3C509/3C509B:** found through the 3Com ID port (I/O base and IRQ from its EEPROM).
+- **3C515:** it doesn't answer the ID port. Without `/b=` the driver scans I/O bases 0x100-0x3E0 for a
+  3C515 at the base its EEPROM configures and takes the IRQ from the card (`/5` alone: scan for a 3C515
+  only). This finds a card whose Plug and Play mode is **off**.
+- **3C515 in Plug and Play mode** on a machine without a PnP BIOS (e.g. an IBM PC/AT) is inactive until
+  isolated: use `3cpdpnp.exe`, which runs ISA PnP isolation first. Or disable PnP with 3Com's
+  configuration utility, or give the resources by hand: `3cpd /b=300 /q=10 /5`.
+- **Bus mastering (`/d`, 3C515):** the card's ISA DMA channel (from the card) is put in cascade mode and
+  unmasked before the DMA self-test (`ISA DMA channel (cascade)=N`); a failed self-test falls back to PIO.
 
 ## At load time
 
@@ -74,7 +86,7 @@ The driver prints what it chose. Beyond the CPU class, NIC and DMA/coherency lin
 | `/u` | uninstall the resident driver and exit |
 | `/b=NNN` | manual I/O base (hex); skips the ID-port probe |
 | `/q=NN` | manual IRQ (decimal); use with `/b=`. On an AT, 2 is taken as 9 (the cascade line); on a PC/XT-class board (one 8259) 9 is taken as 2 and 10–15 are refused. Default without `/q=`: 10 |
-| `/5` | the card is a 3C515 Corkscrew (EEPROM at +0x2000, Window-1 base +0x10) |
+| `/5` | the card is a 3C515 Corkscrew (EEPROM at +0x2000, Window-1 base +0x10); without `/b=`, scan for it only |
 | `/d` | request bus-master DMA (3C515 + ≥286 only; still test-before-trust — falls back to PIO) |
 | `/j` | request FDDI-sized large frames (3C515 only) |
 | `/8` | force the 8088-class datapath (8-bit PIO), for testing on a faster CPU |
@@ -107,4 +119,4 @@ The driver prints what it chose. Beyond the CPU class, NIC and DMA/coherency lin
 
 ---
 
-_Last updated: 2026-09-26 15:25 CEST (prebuilt binaries via GitHub Actions; "At load time": 3C515 link speed from the transceiver, TX start threshold per link, resident size; `sendlen.com` in `wmake all`; docs/09 is cfg ABI v3). Prior: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._
+_Last updated: 2026-09-26 16:45 CEST ("Finding the card": 3C515 legacy I/O scan, `3cpdpnp.exe` for PnP-mode cards, ISA DMA cascade for `/d`; CI builds `3cpdpnp.exe`). Prior: 2026-09-26 15:25 CEST (prebuilt binaries via GitHub Actions; "At load time": 3C515 link speed from the transceiver, TX start threshold per link, resident size; `sendlen.com` in `wmake all`; docs/09 is cfg ABI v3). Prior: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._

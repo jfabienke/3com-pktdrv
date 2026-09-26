@@ -1,5 +1,5 @@
 # Build the DOS packet driver (NASM + Open Watcom wlink/wmake) and publish the binaries.
-#   every push / PR: upload build/3cpd.exe, blast.com, sendlen.com as the "3cpd-binaries" artifact
+#   every push / PR: upload build/3cpd.exe, 3cpdpnp.exe, blast.com, sendlen.com as the "3cpd-binaries" artifact
 #   a pushed v* tag: also attach them to that GitHub release
 name: build
 
@@ -31,12 +31,19 @@ jobs:
         with:
           version: "2.0"
 
+      # 3cpdpnp.exe = the pnp profile (-dCFG_PNP): adds ISA Plug and Play isolation, which a 3C515 in PnP
+      # mode needs on a board with no PnP BIOS (it stays inactive until isolated). Built first, then the
+      # default 3cpd.exe.
       - name: Build
         run: |
           nasm -v
+          wmake -h DEFS=-dCFG_PNP
+          mv build/3cpd.exe build/3cpdpnp.exe
+          mv build/3cpd.map build/3cpdpnp.map
+          rm -f build/start.obj
           wmake -h
-          ls -l build/3cpd.exe build/blast.com build/sendlen.com
-          sha256sum build/3cpd.exe build/blast.com build/sendlen.com | tee build/SHA256SUMS
+          ls -l build/3cpd.exe build/3cpdpnp.exe build/blast.com build/sendlen.com
+          (cd build && sha256sum 3cpd.exe 3cpdpnp.exe blast.com sendlen.com) | tee build/SHA256SUMS
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -44,6 +51,8 @@ jobs:
           name: 3cpd-binaries
           path: |
             build/3cpd.exe
+            build/3cpdpnp.exe
+            build/3cpdpnp.map
             build/blast.com
             build/sendlen.com
             build/3cpd.map
@@ -55,6 +64,7 @@ jobs:
         with:
           files: |
             build/3cpd.exe
+            build/3cpdpnp.exe
             build/blast.com
             build/sendlen.com
             build/SHA256SUMS
