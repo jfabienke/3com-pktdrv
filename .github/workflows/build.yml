@@ -68,3 +68,24 @@ jobs:
             build/blast.com
             build/sendlen.com
             build/SHA256SUMS
+
+  # ISA PnP diagnostics (GPL-2.0 isapnptools, real-mode DOS build via tools/isapnptools-dos)
+  isapnptools-dos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: retroprom/isapnptools
+          ref: b818477dc5a9343f13321f0303e7928a22172f9d
+          path: isapnptools
+      - name: Install Open Watcom 2.0
+        uses: open-watcom/setup-watcom@v0
+        with:
+          version: "2.0"
+      - name: Build pnpdump.exe + isapnp.exe
+        run: bash tools/isapnptools-dos/build.sh isapnptools dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isapnptools-dos
+          path: dist/
