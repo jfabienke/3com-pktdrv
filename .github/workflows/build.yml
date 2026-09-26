@@ -42,8 +42,8 @@ jobs:
           mv build/3cpd.map build/3cpdpnp.map
           rm -f build/start.obj
           wmake -h
-          ls -l build/3cpd.exe build/3cpdpnp.exe build/blast.com build/sendlen.com
-          (cd build && sha256sum 3cpd.exe 3cpdpnp.exe blast.com sendlen.com) | tee build/SHA256SUMS
+          ls -l build/3cpd.exe build/3cpdpnp.exe build/blast.com build/sendlen.com build/3cdiag.com
+          (cd build && sha256sum 3cpd.exe 3cpdpnp.exe blast.com sendlen.com 3cdiag.com) | tee build/SHA256SUMS
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -55,6 +55,7 @@ jobs:
             build/3cpdpnp.map
             build/blast.com
             build/sendlen.com
+            build/3cdiag.com
             build/3cpd.map
             build/SHA256SUMS
 
@@ -67,6 +68,7 @@ jobs:
             build/3cpdpnp.exe
             build/blast.com
             build/sendlen.com
+            build/3cdiag.com
             build/SHA256SUMS
 
   # ISA PnP diagnostics (GPL-2.0 isapnptools, real-mode DOS build via tools/isapnptools-dos)

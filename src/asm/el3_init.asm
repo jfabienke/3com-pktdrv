@@ -18,6 +18,15 @@ el3_init:
         mov     dx, bx
         add     dx, EL3_CMD                 ; DX = command/status register
 
+        ; --- reset the TX and RX engines, waiting out CmdInProgress after each (Linux corkscrew_open /
+        ;     el3_up). A 3C515 found by the legacy scan or ISA PnP never had the ID-port global reset. ---
+        mov     ax, EL3_CMD_TX_RESET
+        out     dx, ax
+        call    isr_wait_cmd
+        mov     ax, EL3_CMD_RX_RESET
+        out     dx, ax
+        call    isr_wait_cmd
+
         ; --- station address: Window 2, write the 6 MAC bytes (offsets 0..5) ---
         mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W2_STATION_ADDR
         out     dx, ax
@@ -68,6 +77,10 @@ el3_init:
 
         ; clear any latched interrupts
         mov     ax, EL3_CMD_ACK_INTR | 0x07FF
+        out     dx, ax
+
+        ; hardware statistics on (Window 6 counters: frames TX/RX OK, collisions -- 3cdiag reads them)
+        mov     ax, EL3_CMD_STATS_ENABLE
         out     dx, ax
 
         ; enable receiver and transmitter

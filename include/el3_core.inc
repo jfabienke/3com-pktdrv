@@ -45,6 +45,7 @@ EL3_CMD_RX_RESET        equ 0x2800
 EL3_CMD_RX_DISCARD      equ 0x4000
 EL3_CMD_TX_ENABLE       equ 0x4800
 EL3_CMD_TX_RESET        equ 0x5800
+EL3_CMD_STATS_ENABLE    equ 0xA800   ; statistics counters on (Window 6)
 EL3_CMD_ACK_INTR        equ 0x6800
 EL3_CMD_SET_INTR_ENB    equ 0x7000
 EL3_CMD_SET_STATUS_ENB  equ 0x7800   ; which status bits are visible in the status register

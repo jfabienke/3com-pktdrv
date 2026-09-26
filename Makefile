@@ -34,7 +34,7 @@ FRAG_SRC = &
 
 # ---- targets ----
 
-all: .SYMBOLIC $(TARGET) $(BUILD)/blast.com $(BUILD)/sendlen.com
+all: .SYMBOLIC $(TARGET) $(BUILD)/blast.com $(BUILD)/sendlen.com $(BUILD)/3cdiag.com
 
 $(BUILD)/frags_asm.inc : tools/mkfrag.py $(FRAG_SRC)
     python3 tools/mkfrag.py
@@ -61,6 +61,10 @@ $(BUILD)/blast.com : tools/blast.asm
 # sendlen.com -- send_pkt / async-send length-guard probe (prints CF/DH per length).
 $(BUILD)/sendlen.com : tools/sendlen.asm
     $(ASM) -f bin tools/sendlen.asm -o $@
+
+# 3cdiag.com -- field diagnostic: the loaded 3cpd's counters + the card's registers (link, MAC stats, PIC).
+$(BUILD)/3cdiag.com : tools/3cdiag.asm
+    $(ASM) -f bin tools/3cdiag.asm -o $@
 
 # fakenic: test build that skips the probe (no emulator has a 3C509) so the install +
 # resident handler are exercisable in dosbox-x. Forces a recompile with -dCFG_FAKENIC.
@@ -96,4 +100,5 @@ clean: .SYMBOLIC
     @if exist $(TARGET) del $(TARGET)
     @if exist $(BUILD)\blast.com del $(BUILD)\blast.com
     @if exist $(BUILD)\sendlen.com del $(BUILD)\sendlen.com
+    @if exist $(BUILD)\3cdiag.com del $(BUILD)\3cdiag.com
     @if exist $(BUILD)\3cpd.map del $(BUILD)\3cpd.map
