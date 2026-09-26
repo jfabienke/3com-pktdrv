@@ -164,6 +164,14 @@ detect_nic_corkscrew:
         xor     ax, bx
         test    ax, EL3_CS_RESCFG_IOMASK
         jnz     .skip                       ; nothing (0xFFFF) or not configured for this base
+        ; A card decoding only 10 address bits (an XT-IDE, most 8-bit cards) answers base+0x2002 exactly
+        ; as base+0x0002. Never send it the EEPROM read below (a write into its registers): skip a base
+        ; whose +0x2002 reads the same as +0x0002.
+        mov     dx, bx
+        add     dx, 2
+        in      ax, dx
+        cmp     ax, di
+        je      .skip
         mov     dx, bx
         add     dx, EL3_CS_W0_EE_CMD
         mov     ax, EL3_EE_READ | EL3_EE_MFG_ID

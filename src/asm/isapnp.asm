@@ -47,8 +47,7 @@ PNP_CFG_RESETCSN equ 0x04       ; reset all CSNs to 0 (does NOT touch resources/
 PNP_CFG_WAITKEY  equ 0x02       ; return cards to Wait-for-Key
 PNP_LFSR_SEED    equ 0x6A       ; isolation checksum LFSR seed
 
-PNP_DEF_IOBASE   equ 0x300      ; resources given to an unconfigured card
-PNP_DEF_IRQ      equ 10
+PNP_DEF_IRQ      equ 10         ; unless /q= (the I/O base is the first FREE one of pnp_io_cands, or /b=)
 PNP_DEF_DMA      equ 5          ; 16-bit channel for the 3C515 bus master (free on a stock AT)
 
 ; delays, in ~1 us reads of port 0x80
@@ -70,7 +69,9 @@ msg_pnp_csn     db ' CSN=', '$'
 msg_pnp_rdp     db ' read port 0x', '$'
 msg_pnp_none    db 'PnP: no card isolated (read ports 0x0213-0x03FB)', 13, 10, '$'
 msg_pnp_no3com  db 'PnP: no 3Com card among them', 13, 10, '$'
-msg_pnp_active  db ' (already active)', '$'
+msg_pnp_busy    db 'PnP: I/O 0x', '$'
+msg_pnp_inuse   db ' in use (another card answers there), not used', 13, 10, '$'
+msg_pnp_nobase  db 'PnP: no free I/O base -- give one with /b= (and /q=)', 13, 10, '$'
 
 ;------------------------------------------------------------------------------
 ; detect_nic_pnp -- isolate every ISA PnP card, configure + activate the first 3Com one, read its MAC.
@@ -147,19 +148,71 @@ detect_nic_pnp:
         mov     al, PNP_R_LDN
         xor     ah, ah
         call    pnp_write_reg
-        mov     al, PNP_R_ACTIVATE        ; read-don't-clobber: already active?
+        ; The base must be FREE: another card decoding the same ports (an XT-IDE sits at 0x300 by default)
+        ; shares every access with the NIC -- on a real IBM PC/AT that hung the disk and corrupted the CF.
+        ; Deactivate first so only other devices answer, then check the range reads all 0xFF. An already-
+        ; active card (a PnP BIOS, or our previous run surviving a warm boot) keeps its base if that is free.
+        mov     al, PNP_R_ACTIVATE
         call    pnp_read_reg
+        mov     bx, 0
         test    al, 1
-        jnz     .existing
-        ; unconfigured -> assign the default base/IRQ/DMA and activate
+        jz      .inactive
+        mov     al, PNP_R_IOBASE_HI       ; active: remember its base, then take it off the bus
+        call    pnp_read_reg
+        mov     bh, al
+        mov     al, PNP_R_IOBASE_LO
+        call    pnp_read_reg
+        mov     bl, al
+        mov     al, PNP_R_ACTIVATE
+        xor     ah, ah
+        call    pnp_write_reg
+        mov     cx, PNP_US_READ
+        call    pnp_delay
+.inactive:
+        cmp     byte [g_manual], 1        ; /b= given: that base, or nothing
+        jne     .pick
+        mov     bx, [g_nic_io]
+        call    pnp_io_free
+        jnc     .have_base
+        call    pnp_say_busy
+        jmp     .nobase
+.pick:
+        or      bx, bx                    ; the previous base first, if it was set and is free
+        jz      .cands
+        call    pnp_io_free
+        jnc     .have_base
+        call    pnp_say_busy
+.cands:
+        mov     si, pnp_io_cands
+.cand:
+        lodsw
+        or      ax, ax
+        jz      .nobase
+        mov     bx, ax
+        call    pnp_io_free
+        jnc     .have_base
+        call    pnp_say_busy
+        jmp     .cand
+.nobase:
+        mov     dx, msg_pnp_nobase
+        call    print_str
+        jmp     .fail
+.have_base:
+        mov     [g_nic_io], bx
         mov     al, PNP_R_IOBASE_HI
-        mov     ah, PNP_DEF_IOBASE >> 8
+        mov     ah, bh
         call    pnp_write_reg
         mov     al, PNP_R_IOBASE_LO
-        mov     ah, PNP_DEF_IOBASE & 0xFF
+        mov     ah, bl
         call    pnp_write_reg
+        mov     ax, [g_nic_irq]           ; /q= if given, else the default
+        or      ax, ax
+        jnz     .irq
+        mov     ax, PNP_DEF_IRQ
+        mov     [g_nic_irq], ax
+.irq:
+        mov     ah, al
         mov     al, PNP_R_IRQ
-        mov     ah, PNP_DEF_IRQ
         call    pnp_write_reg
         mov     al, PNP_R_DMA
         mov     ah, PNP_DEF_DMA
@@ -169,29 +222,45 @@ detect_nic_pnp:
         call    pnp_write_reg
         mov     cx, PNP_US_READ           ; activation settle (Linux: 250 us)
         call    pnp_delay
-        mov     word [g_nic_io], PNP_DEF_IOBASE
-        mov     word [g_nic_irq], PNP_DEF_IRQ
-        jmp     .got
-.existing:
-        ; already active (a PnP BIOS or configuration tool set it up) -> inherit its resources
-        mov     dx, msg_pnp_active
-        call    print_str
-        mov     al, PNP_R_IOBASE_HI
-        call    pnp_read_reg
-        mov     bh, al
-        mov     al, PNP_R_IOBASE_LO
-        call    pnp_read_reg
-        mov     bl, al
-        mov     [g_nic_io], bx
-        mov     al, PNP_R_IRQ
-        call    pnp_read_reg
-        and     ax, 0x000F
-        mov     [g_nic_irq], ax
-.got:
         call    pnp_wait_key              ; quiesce: back to Wait-for-Key (the card stays active)
         call    el3_load_mac_io           ; read the MAC via the now-live I/O base
         clc
         ret
+
+; pnp_io_free -- CF=0 if nothing decodes I/O [BX, BX+0x20): every port reads 0xFF (the ISA bus floats
+; high). Only ports we are about to give the NIC are read. Clobbers AX, CX, DX.
+pnp_io_free:
+        mov     dx, bx
+        mov     cx, 0x20
+.f:     in      al, dx
+        cmp     al, 0xFF
+        jne     .busy
+        inc     dx
+        loop    .f
+        clc
+        ret
+.busy:
+        stc
+        ret
+
+; pnp_say_busy -- "PnP: I/O 0x0300 in use" for base BX. Preserves BX, SI.
+pnp_say_busy:
+        push    ax
+        push    dx
+        mov     dx, msg_pnp_busy
+        call    print_str
+        mov     ax, bx
+        call    print_hex16
+        mov     dx, msg_pnp_inuse
+        call    print_str
+        pop     dx
+        pop     ax
+        ret
+
+; Bases to try, all inside the 3C515's PnP range 0x280-0x3E0 (32-byte aligned), skipping the ones holding
+; standard devices (0x2E0 COM4/COM2, 0x360 LPT1, 0x3A0-0x3DF MDA/CGA/VGA, 0x3E0 COM3/floppy).
+pnp_io_cands:
+        dw 0x300, 0x320, 0x340, 0x280, 0x2A0, 0x2C0, 0x380, 0
 
 ;------------------------------------------------------------------------------
 ; pnp_rdp_select -- (Linux isapnp_isolate_rdp_select) reset CSNs, re-key, Wake[0], and set the read

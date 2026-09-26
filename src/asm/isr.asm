@@ -237,6 +237,9 @@ nic_isr:
         add     dx, EL3_CMD
         mov     ax, EL3_CMD_RX_DISCARD
         out     dx, ax
+        call    isr_wait_cmd            ; the card pops the frame while CmdInProgress is set: reading RX
+                                        ; status before it clears sees the SAME frame again (Crynwr + Linux
+                                        ; wait here; the emulator's discard is instant)
         dec     byte [isr_work]
         jz      .recv_done              ; per-interrupt cap hit -> yield; pending IRQ re-fires
         jmp     .recv_loop

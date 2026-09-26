@@ -524,6 +524,17 @@ global resident_end
         ; manual config (/b= given): skip the ID-port probe, attach at the specified base.
         cmp     byte [g_manual], 1
         jne     .auto_detect
+%ifdef CFG_PNP
+        ; a PnP-mode card is inactive until isolated: with /b= (and /q=) the PnP build isolates it and
+        ; gives it exactly those resources (if the base is free); no PnP card -> the plain manual attach
+        cmp     byte [g_cpu_class], CPU_8088
+        jbe     .manual_plain
+        call    detect_nic_pnp
+        jnc     .nic_found
+        cmp     byte [pnp_found_csn], 0
+        jne     .nic_none           ; a 3Com PnP card is there but its base is busy: never attach blind
+.manual_plain:
+%endif
         cmp     word [g_nic_irq], 0
         jne     .have_irq
         mov     word [g_nic_irq], 0x000A    ; default IRQ 10 if /q= omitted
@@ -540,6 +551,8 @@ global resident_end
         jbe     .legacy_only
         call    detect_nic_pnp      ; direct ISA PnP isolation -> g_nic_io/irq/mac
         jnc     .nic_found
+        cmp     byte [pnp_found_csn], 0
+        jne     .nic_none           ; our PnP card, but no free I/O base: stop (it stays inactive)
 .legacy_only:
 %endif
         ; Legacy probes. The 3C509 answers the ID port; the 3C515 doesn't -- it sits at the I/O base
