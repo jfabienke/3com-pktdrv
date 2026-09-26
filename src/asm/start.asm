@@ -57,6 +57,7 @@ msg_badmac  db 'ERROR: invalid station MAC (all-FF/all-00/multicast) -- wrong ca
 msg_crlf    db 13, 10, '$'
 msg_isadma  db 'ISA DMA channel (cascade)=', '$'
 msg_no286   db '/2 ignored: CPU below 286', 13, 10, '$'
+msg_already db 'A packet driver is already loaded at INT 60h -- unload it first (3cpd /u)', 13, 10, '$'
 msg_link10  db 'LINK=10 Mbit', 13, 10, '$'
 msg_link100 db 'LINK=100 Mbit (store-and-forward TX)', 13, 10, '$'
 msg_linkq   db 'LINK=? (MII transceiver)', 13, 10, '$'
@@ -463,6 +464,13 @@ global resident_end
 
         mov     dx, msg_banner
         call    print_str
+        call    pkt_already             ; a packet driver already answers INT 60h -> don't stack a second one
+        jnc     .not_loaded
+        mov     dx, msg_already
+        call    print_str
+        mov     ax, 0x4C01
+        int     0x21
+.not_loaded:
 %ifdef CFG_DEBUG
         mov     dx, msg_dbgon
         call    print_str
@@ -713,6 +721,34 @@ irq_fixup:
         jne     .d_ok
         mov     word [g_nic_irq], 9 ; IRQ2 is the cascade input on an AT: the pin arrives as IRQ9
 .d_ok:  clc
+        ret
+
+;------------------------------------------------------------------------------
+; pkt_already -- CF=1 if INT 60h already holds a packet driver ("PKT DRVR" at vector+3): installing again
+; would hook the same vector and IRQ a second time (on a real AT three copies ended up resident).
+; Clobbers AX, BX, CX, SI, DI; preserves ES.
+;------------------------------------------------------------------------------
+pkt_already:
+        push    es
+        mov     ax, 0x3500 | PKTINT     ; ES:BX = INT 60h vector
+        int     0x21
+        mov     di, bx
+        add     di, 3
+        mov     si, sig_pktdrvr
+        mov     cx, 8
+.cmp:
+        mov     al, [si]
+        cmp     al, [es:di]
+        jne     .none
+        inc     si
+        inc     di
+        loop    .cmp
+        pop     es
+        stc
+        ret
+.none:
+        pop     es
+        clc
         ret
 
 ;------------------------------------------------------------------------------

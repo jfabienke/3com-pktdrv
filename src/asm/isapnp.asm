@@ -178,11 +178,7 @@ detect_nic_pnp:
         call    pnp_say_busy
         jmp     .nobase
 .pick:
-        or      bx, bx                    ; the previous base first, if it was set and is free
-        jz      .cands
-        call    pnp_io_free
-        jnc     .have_base
-        call    pnp_say_busy
+        ; (no preference for a previous base: on the AT that was our own earlier placement on the XT-IDE)
 .cands:
         mov     si, pnp_io_cands
 .cand:
@@ -311,9 +307,12 @@ pnp_say_busy:
         ret
 
 ; Bases to try, all inside the 3C515's PnP range 0x280-0x3E0 (32-byte aligned), skipping the ones holding
-; standard devices (0x2E0 COM4/COM2, 0x360 LPT1, 0x3A0-0x3DF MDA/CGA/VGA, 0x3E0 COM3/floppy).
+; standard devices (0x2E0 COM4/COM2, 0x360 LPT1, 0x3A0-0x3DF MDA/CGA/VGA, 0x3E0 COM3/floppy), rarely-used
+; ones first. The range check only catches a device that out-drives the 3C515 on the bus -- on a real AT an
+; XT-IDE at 0x300 passed it (the 3C515 won the contention) -- so the usual homes of XT-IDE, NE2000 clones and
+; the MPU-401 (0x330) come last.
 pnp_io_cands:
-        dw 0x300, 0x320, 0x340, 0x280, 0x2A0, 0x2C0, 0x380, 0
+        dw 0x2A0, 0x2C0, 0x340, 0x280, 0x380, 0x300, 0x320, 0
 
 ;------------------------------------------------------------------------------
 ; pnp_rdp_select -- (Linux isapnp_isolate_rdp_select) reset CSNs, re-key, Wake[0], and set the read
