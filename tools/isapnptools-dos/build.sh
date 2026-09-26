@@ -5,6 +5,7 @@
 # ISA PnP diagnostics for a PnP card on a machine with no PnP BIOS (e.g. a 3C515 in an IBM PC/AT): pnpdump
 # isolates and lists every card, isapnp configures + activates one from a config file.
 set -e
+export INCLUDE="$WATCOM/h"             # DOS headers (setup-watcom points INCLUDE at the Linux ones)
 SRC="$(cd "$1" && pwd)"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$SRC/ow" && cp "$HERE"/config.h "$HERE"/shim.c "$HERE"/getopt.h "$SRC/ow/"
 cd "$SRC/src"
