@@ -54,6 +54,9 @@ msg_badmac  db 'ERROR: invalid station MAC (all-FF/all-00/multicast) -- wrong ca
             db '       (/5 selects 3C515 EEPROM at +0x2000; omit it for a 3C509)', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
 msg_no286   db '/2 ignored: CPU below 286', 13, 10, '$'
+msg_link10  db 'LINK=10 Mbit', 13, 10, '$'
+msg_link100 db 'LINK=100 Mbit (store-and-forward TX)', 13, 10, '$'
+msg_linkq   db 'LINK=? (MII transceiver)', 13, 10, '$'
 msg_badirq  db 13, 10, 'ERROR: IRQ 8-15 needs a second 8259 (AT); this PC/XT-class board has IRQ 0-7 only', 13, 10
             db '       (set the card to IRQ 3/5/7 or 9 [=IRQ2] and pass /q=)', 13, 10, '$'
 msg_dma     db 'DMA=', '$'
@@ -102,6 +105,7 @@ g_want_v86trust: resb 1         ; 1 = /v given -> trust the V86 host (EMM386/JEM
 g_wbinvd_ok:    resb 1          ; 1 = WBINVD may run: 486+ AND (real mode OR /v). Set in dma_v86_forbid_check
 g_coh_nosafe:   resb 1          ; 1 = the coherency probe found a non-coherent cache with no safe flush -> PIO
 g_cpu_hw:       resb 1          ; the DETECTED CPU class (before /8 or /2 override the datapath class)
+g_link_mbit:    resb 1          ; link rate from the transceiver: 10 / 100 / 0 = unknown (link_speed)
 g_vds_cold_held: resb 1         ; 1 = cold_dds holds the VDS lock on the cold probe span (V86)
                 alignb 2
 cold_dds:       resb 16         ; VDS DDS for the cold probe span [bm_test_buf, coh_probe_end)
@@ -1407,6 +1411,39 @@ coh_probe_end:                                  ; end of the cold bus-master pro
 %include "install.asm"
 
 ;------------------------------------------------------------------------------
+; link_speed -- g_link_mbit = the link rate in Mbit/s: 10 for a 3C509 (10 Mbit only); for a 3C515 from
+; the transceiver its InternalConfig selects (Window 3): 10 (10BASE-T/AUI/BNC), 100 (100BASE-TX/FX), or
+; 0 = unknown (MII: the PHY negotiates the rate off-chip). Prints " LINK=...". Leaves the card in
+; Window 3 (el3_init selects its own windows). Clobbers AX, CX, DX.
+;------------------------------------------------------------------------------
+link_speed:
+        mov     byte [g_link_mbit], 10
+        mov     dx, msg_link10
+        cmp     byte [g_nic_gen], 0
+        je      .say
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W3_CONFIG
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_W3_INTCFG_HI
+        in      ax, dx
+        mov     cl, EL3_CS_XCVR_SHIFT
+        shr     ax, cl
+        and     al, EL3_CS_XCVR_MASK        ; AL = xcvrSelect
+        mov     dx, msg_link10
+        cmp     al, EL3_CS_XCVR_100TX
+        jb      .say                        ; 0-3: 10 Mbit
+        mov     byte [g_link_mbit], 100
+        mov     dx, msg_link100
+        cmp     al, EL3_CS_XCVR_MII
+        jb      .say                        ; 4-5: 100BASE-TX/FX
+        mov     byte [g_link_mbit], 0
+        mov     dx, msg_linkq               ; MII / reserved: rate unknown
+.say:   call    print_str
+        ret
+
+;------------------------------------------------------------------------------
 ; build_plan -- resolve the per-generation hardware parameters and hand the composer its
 ; immediates. Two generation-dependent values: the Window-1 register base (3C509 at io_base,
 ; Corkscrew at io_base+0x10) and the SET_TX_START command (3C509 early-start vs 3C515
@@ -1429,16 +1466,22 @@ build_plan:
         ; (1.25 MB/s), so early start underruns any frame much over the threshold -- the frame is lost and
         ; every retransmit underruns again. Store-and-forward there (tx_status_drain also raises the
         ; threshold adaptively after an underrun on any CPU).
-        ; A 286+ on the 3C509 (10 Mbit only) starts at once: its 16-bit fill outruns the wire, so the frame
-        ; leaves while it is still being written (was 512: the wire started only near the end of a small
-        ; frame -- 14% fill/wire overlap vs Crynwr's 99%). The 3C515 keeps 512: at 100 Mbit the wire drains
-        ; faster than any ISA PIO fill, and the driver can't tell the link speed from here.
+        ; A 286+ on a 10 Mbit link starts at once: its 16-bit fill outruns the wire, so the frame leaves
+        ; while it is still being written (was 512: the wire started only near the end of a small frame --
+        ; 14% fill/wire overlap vs Crynwr's 99%). The 3C509 is always 10 Mbit; the 3C515's link speed comes
+        ; from its transceiver (link_speed). At 100 Mbit the wire drains faster than any ISA PIO fill, so
+        ; it transmits store-and-forward; an unknown speed (MII) keeps the conservative 512.
+        push    ax                          ; AX = Window-1 base (the PIO immediates below)
+        call    link_speed                  ; -> g_link_mbit (10 / 100 / 0 = unknown), prints LINK=
+        pop     ax
         mov     bx, EL3_CMD_SET_TX_START | EL3_TX_THRESH_SF
         cmp     byte [g_cpu_class], CPU_8088
         je      .tx_start_set
+        cmp     byte [g_link_mbit], 100
+        je      .tx_start_set               ; 100 Mbit: store-and-forward
         mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
-        cmp     byte [g_nic_gen], 0
-        jne     .tx_start_set
+        cmp     byte [g_link_mbit], 10
+        jne     .tx_start_set               ; unknown: 512
         mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_IMMED
 .tx_start_set:
         mov     [g_tx_start], bx            ; precomputed SET_TX_START command

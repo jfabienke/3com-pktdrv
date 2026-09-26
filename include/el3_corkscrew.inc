@@ -89,4 +89,14 @@ EL3_CS_W3_MAC_CTRL      equ 0x06     ; Window 3 MAC control register
 EL3_CS_FULL_DUPLEX      equ 0x20     ; set = full duplex (optional; not set by the PIO floor)
 EL3_MAC_CTRL_ALLOW_LARGE equ 0x40    ; bit 6 = allowLargePackets: oversize at >=4491 B not 1515 (FDDI)
 
+; ---- Window 3 InternalConfig (32-bit at offset 0): the active transceiver = the link speed ----
+; xcvrSelect is bits 20-22 (bits 4-6 of the high word at +2): 0 10BASE-T, 1 AUI, 2 10BASE-T only,
+; 3 10BASE2 (all 10 Mbit); 4 100BASE-TX, 5 100BASE-FX (100 Mbit); 6 MII (speed unknown here).
+; Bit 24 (autoselect) only permits a driver to change it -- the field is the transceiver in use.
+EL3_CS_W3_INTCFG_HI     equ 0x02     ; Window 3: InternalConfig bits 16-31
+EL3_CS_XCVR_SHIFT       equ 4        ; xcvrSelect within the high word
+EL3_CS_XCVR_MASK        equ 0x07
+EL3_CS_XCVR_100TX       equ 4        ; first 100 Mbit code (4 TX, 5 FX); 0-3 are 10 Mbit
+EL3_CS_XCVR_MII         equ 6        ; MII PHY: rate negotiated off-chip, not visible here
+
 %endif ; EL3_CORKSCREW_INC
