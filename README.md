@@ -30,7 +30,7 @@ One binary covers every CPU/NIC tier; the tier is chosen at load time, not build
 
 | Target | Builds |
 |--------|--------|
-| `wmake` / `wmake all` | `build/3cpd.exe` (the driver) + `build/blast.com` (raw-frame TX throughput probe) |
+| `wmake` / `wmake all` | `build/3cpd.exe` (the driver) + `build/blast.com` (raw-frame TX throughput probe) + `build/sendlen.com` (send-length guard probe) |
 | `wmake fakenic` | test build that skips the NIC probe (`-dCFG_FAKENIC`), for dosbox-x |
 | `wmake debug` | instrumented build for hardware testing (`-dCFG_DEBUG`: cold trace, event log, heartbeat, 0x7F debug block) |
 | `wmake debugfake` | `debug` + `fakenic` |
@@ -44,6 +44,28 @@ Other variant builds pass NASM defines through `DEFS`, after forcing `start.obj`
 rm build/start.obj && wmake DEFS=-dCFG_FORCE_NC      # force the NC re-test path (structural test; use with /n=254)
 rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush tier on the DMA paths
 ```
+
+### Prebuilt binaries
+
+GitHub Actions (`.github/workflows/build.yml`) builds `3cpd.exe`, `blast.com` and `sendlen.com` with
+NASM and Open Watcom on every push and pull request; download them from the run's **3cpd-binaries**
+artifact. Pushing a `v*` tag also attaches them to that GitHub release.
+
+## At load time
+
+The driver prints what it chose. Beyond the CPU class, NIC and DMA/coherency lines:
+
+- **Link speed (`LINK=`).** The 3C509 is 10 Mbit only. For a 3C515 the speed comes from the transceiver
+  its EEPROM selects (Window 3 InternalConfig `xcvrSelect`): 10BASE-T/AUI/BNC = 10 Mbit, 100BASE-TX/FX
+  = 100 Mbit, MII = unknown.
+- **TX start threshold** (how much of a frame is queued before the card starts transmitting it):
+  0 on a 286+ at 10 Mbit (the frame leaves while it is still being written); store-and-forward at
+  100 Mbit (the wire drains faster than any ISA PIO fill) and on the 8088 class (its fill is slower
+  than even the 10 Mbit wire); 512 when the speed is unknown. After a TX underrun the threshold rises
+  by 256 bytes, up to store-and-forward.
+- **Resident size.** The keep boundary depends on the chosen datapath: the PIO floor stays about
+  2.3 KB resident (`MEM /C`: 2,336 bytes including the PSP); the DMA paths keep their descriptors,
+  rings and code above it.
 
 ## Command-line switches
 
@@ -73,7 +95,7 @@ rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush ti
 | `docs/06-boot-sequence.md` | Phased boot + unwind + config cache |
 | `docs/07-porting-plan.md` | What to lift from the old repo, in tiers |
 | `docs/08-nvmeotcp-plan.md` | RetroSAN: DOS NVMe/TCP initiator roadmap & status |
-| `docs/09-xms-dma-ext.md` | Proprietary INT 60h AH=F0 XMS/conv DMA RX-ring extension (cfg ABI v2) |
+| `docs/09-xms-dma-ext.md` | Proprietary INT 60h AH=F0 XMS/conv DMA RX-ring extension (cfg ABI v3; FDDI-sized slots with `/j`) |
 | `docs/10-copybreak-pipelines.md` | Copybreak pipelines & the conventional zero-copy DMA ring |
 | `docs/11-capability-matrix.md` | NIC generation × capability matrix |
 | `docs/12-nc-region-lift.md` | Non-cacheable DMA region (chipset NC) lift + region policy |
@@ -85,4 +107,4 @@ rm build/start.obj && wmake DEFS=-dCFG_FORCE_FLUSH   # force the WBINVD flush ti
 
 ---
 
-_Last updated: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._
+_Last updated: 2026-09-26 15:25 CEST (prebuilt binaries via GitHub Actions; "At load time": 3C515 link speed from the transceiver, TX start threshold per link, resident size; `sendlen.com` in `wmake all`; docs/09 is cfg ABI v3). Prior: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._

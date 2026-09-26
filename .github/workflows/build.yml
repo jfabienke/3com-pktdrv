@@ -1,0 +1,56 @@
+# Build the DOS packet driver (NASM + Open Watcom wlink/wmake) and publish the binaries.
+#   every push / PR: upload build/3cpd.exe, blast.com, sendlen.com as the "3cpd-binaries" artifact
+#   a pushed v* tag: also attach them to that GitHub release
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # attach assets to the release on a tag push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Install Open Watcom 2.0
+        uses: open-watcom/setup-watcom@v0
+        with:
+          version: "2.0"
+
+      - name: Build
+        run: |
+          nasm -v
+          wmake -h
+          ls -l build/3cpd.exe build/blast.com build/sendlen.com
+          sha256sum build/3cpd.exe build/blast.com build/sendlen.com | tee build/SHA256SUMS
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3cpd-binaries
+          path: |
+            build/3cpd.exe
+            build/blast.com
+            build/sendlen.com
+            build/3cpd.map
+            build/SHA256SUMS
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/3cpd.exe
+            build/blast.com
+            build/sendlen.com
+            build/SHA256SUMS
