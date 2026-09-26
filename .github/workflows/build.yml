@@ -19,8 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install NASM
-        run: sudo apt-get update && sudo apt-get install -y nasm
+      # NASM 3.01, the version the binaries are tested with: 2.x emits the operand-size and REP prefixes
+      # of `rep movsd`/`rep outsd` in the other order (F3 66 vs 66 F3) -- equivalent, but not byte-identical
+      - name: Install NASM 3.01
+        uses: ilammy/setup-nasm@v1
+        with:
+          version: "3.01"
 
       - name: Install Open Watcom 2.0
         uses: open-watcom/setup-watcom@v0
