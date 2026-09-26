@@ -46,6 +46,18 @@ EL3_CMD_RX_DISCARD      equ 0x4000
 EL3_CMD_TX_ENABLE       equ 0x4800
 EL3_CMD_TX_RESET        equ 0x5800
 EL3_CMD_STATS_ENABLE    equ 0xA800   ; statistics counters on (Window 6)
+EL3_CMD_START_COAX      equ 0x1000   ; start the internal (BNC/10BASE2) transceiver
+
+; ---- media (transceiver) selection: the 3C515 xcvrSelect codes, also used for the 3C509 -------------
+MEDIA_TP                equ 0        ; 10BASE-T (RJ45) -- the default
+MEDIA_AUI               equ 1        ; AUI (DB-15)
+MEDIA_BNC               equ 3        ; 10BASE2 (BNC coax)
+MEDIA_TX                equ 4        ; 100BASE-TX (RJ45, 3C515)
+MEDIA_FX                equ 5        ; 100BASE-FX (3C515)
+MEDIA_MII               equ 6        ; MII PHY (3C515)
+EL3_W0_ADDR_CFG         equ 0x06     ; 3C509 Window 0 address configuration: bits 14-15 = transceiver
+                                     ; (00 10BASE-T, 01 AUI, 11 BNC, 10 reserved)
+EL3_MEDIA_SQE_ENABLE    equ 0x0008   ; Window 4 media: AUI SQE test
 EL3_CMD_ACK_INTR        equ 0x6800
 EL3_CMD_SET_INTR_ENB    equ 0x7000
 EL3_CMD_SET_STATUS_ENB  equ 0x7800   ; which status bits are visible in the status register

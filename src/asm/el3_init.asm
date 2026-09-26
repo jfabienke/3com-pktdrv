@@ -41,16 +41,81 @@ el3_init:
         loop    .macw
         pop     dx                          ; DX = command register again
 
-        ; --- media: Window 4, enable 10BaseT link beat + jabber guard ---
+        ; --- transceiver (media_select chose g_media): make the card use it ---
+        cmp     byte [g_nic_gen], 0
+        je      .xcvr509
+        ; 3C515: InternalConfig xcvrSelect (Window 3, bits 20-22 = high word bits 4-6)
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W3_CONFIG
+        out     dx, ax
+        push    dx
+        mov     dx, bx
+        add     dx, EL3_CS_W3_INTCFG_HI
+        in      ax, dx
+        and     ax, ~(EL3_CS_XCVR_MASK << EL3_CS_XCVR_SHIFT) & 0xFFFF
+        mov     cl, [g_media]
+        xor     ch, ch
+        shl     cx, 1
+        shl     cx, 1
+        shl     cx, 1
+        shl     cx, 1
+        or      ax, cx
+        out     dx, ax
+        pop     dx
+        jmp     .media
+.xcvr509:
+        ; 3C509: only an explicit /m= rewrites the address configuration's transceiver bits (the EEPROM value
+        ; is already there)
+        cmp     byte [g_media_src], 2
+        jne     .media
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W0_SETUP
+        out     dx, ax
+        push    dx
+        mov     dx, bx
+        add     dx, EL3_W0_ADDR_CFG
+        in      ax, dx
+        and     ax, 0x3FFF
+        mov     ch, [g_media]               ; 0 TP, 1 AUI, 3 BNC -> bits 14-15
+        mov     cl, 6
+        shl     ch, cl
+        xor     cl, cl
+        or      ax, cx
+        out     dx, ax
+        pop     dx
+.media:
+        ; --- media: Window 4 -- 10BASE-T link beat + jabber guard, AUI SQE, 100BASE-TX/FX link detect,
+        ;     BNC/MII nothing (Linux media_tbl), keeping the other bits ---
         mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W4_MEDIA
         out     dx, ax
         push    dx
         mov     dx, bx
         add     dx, EL3_W4_MEDIA_STATUS
         in      ax, dx
+        and     ax, ~(EL3_MEDIA_LBEAT_ENABLE | EL3_MEDIA_JABBER_ENABLE | EL3_MEDIA_SQE_ENABLE) & 0xFFFF
+        mov     cl, [g_media]
+        cmp     cl, MEDIA_TP
+        jne     .m_aui
         or      ax, EL3_MEDIA_LBEAT_ENABLE | EL3_MEDIA_JABBER_ENABLE
+        jmp     .m_set
+.m_aui:
+        cmp     cl, MEDIA_AUI
+        jne     .m_100
+        or      ax, EL3_MEDIA_SQE_ENABLE
+        jmp     .m_set
+.m_100:
+        cmp     cl, MEDIA_TX
+        jb      .m_set                      ; BNC: none
+        cmp     cl, MEDIA_MII
+        jae     .m_set                      ; MII: none
+        or      ax, EL3_MEDIA_LBEAT_ENABLE  ; 100BASE-TX/FX: link detect (Media_Lnk)
+.m_set:
         out     dx, ax
         pop     dx
+        cmp     byte [g_media], MEDIA_BNC
+        jne     .no_coax
+        mov     ax, EL3_CMD_START_COAX      ; BNC: start the internal transceiver, give it ~1 ms
+        out     dx, ax
+        call    io_delay
+.no_coax:
 
         ; --- large frames: set allowLargePackets in MacControl (Window 3, off 6, bit 6) so the MAC
         ;     accepts FDDI-sized (<=4490 B excl FCS) RX instead of flagging oversize at 1518.

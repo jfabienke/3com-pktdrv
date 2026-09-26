@@ -98,5 +98,7 @@ EL3_CS_XCVR_SHIFT       equ 4        ; xcvrSelect within the high word
 EL3_CS_XCVR_MASK        equ 0x07
 EL3_CS_XCVR_100TX       equ 4        ; first 100 Mbit code (4 TX, 5 FX); 0-3 are 10 Mbit
 EL3_CS_XCVR_MII         equ 6        ; MII PHY: rate negotiated off-chip, not visible here
+EL3_CS_AUTOSELECT       equ 0x0100   ; InternalConfig bit 24 (high word bit 8): "driver, pick the media"
+EL3_CS_W3_OPTIONS       equ 0x08     ; Window 3 reset options: the media this card has (Linux Wn3_Options)
 
 %endif ; EL3_CORKSCREW_INC

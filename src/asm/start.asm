@@ -59,6 +59,7 @@ msg_isadma  db 'ISA DMA channel (cascade)=', '$'
 msg_no286   db '/2 ignored: CPU below 286', 13, 10, '$'
 msg_already db 'A packet driver is already loaded at INT 60h -- unload it first (3cpd /u)', 13, 10, '$'
 msg_link10  db 'LINK=10 Mbit', 13, 10, '$'
+msg_media   db 'MEDIA=', '$'
 msg_link100 db 'LINK=100 Mbit (store-and-forward TX)', 13, 10, '$'
 msg_linkq   db 'LINK=? (MII transceiver)', 13, 10, '$'
 msg_badirq  db 13, 10, 'ERROR: IRQ 8-15 needs a second 8259 (AT); this PC/XT-class board has IRQ 0-7 only', 13, 10
@@ -110,6 +111,9 @@ g_wbinvd_ok:    resb 1          ; 1 = WBINVD may run: 486+ AND (real mode OR /v)
 g_coh_nosafe:   resb 1          ; 1 = the coherency probe found a non-coherent cache with no safe flush -> PIO
 g_cpu_hw:       resb 1          ; the DETECTED CPU class (before /8 or /2 override the datapath class)
 g_link_mbit:    resb 1          ; link rate from the transceiver: 10 / 100 / 0 = unknown (link_speed)
+g_media_req:    resb 1          ; /m= request: MEDIA_* + 1, 0 = none (cleared at start)
+g_media:        resb 1          ; the chosen MEDIA_* code (media_select)
+g_media_src:    resb 1          ; where it came from: 0 default (RJ45), 1 EEPROM, 2 /m=
 g_vds_cold_held: resb 1         ; 1 = cold_dds holds the VDS lock on the cold probe span (V86)
                 alignb 2
 cold_dds:       resb 16         ; VDS DDS for the cold probe span [bm_test_buf, coh_probe_end)
@@ -368,9 +372,9 @@ global resident_end
         ; 8088 8-bit datapath (wrong on a 16-bit 3C515) and disables DMA. (ES = DGROUP here.)
         cld
         mov     di, g_cpu_class
-        mov     cx, 11              ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
-                                    ; g_want_large, g_want_v86trust, g_wbinvd_ok, g_coh_nosafe, g_cpu_hw
-                                    ; (a stale /j or /v must not survive a reload either)
+        mov     cx, 13              ; g_cpu_class, g_nic_gen, g_manual, g_force8, g_force286, g_want_dma,
+                                    ; g_want_large, g_want_v86trust, g_wbinvd_ok, g_coh_nosafe, g_cpu_hw,
+                                    ; g_link_mbit, g_media_req (a stale /j, /v or /m= must not survive a reload)
         xor     al, al
         rep     stosb
         ; The NC opt-in state is RESIDENT (read at configure) but set during this cold arg scan, so it can't
@@ -406,6 +410,8 @@ global resident_end
         je      .opt_base
         cmp     al, 'q'
         je      .opt_irq
+        cmp     al, 'm'
+        je      .opt_media
         cmp     al, '8'
         jne     .chk_286
         mov     byte [g_force8], 1  ; force 8-bit byte-loop datapath (test the 8088 fragment)
@@ -450,6 +456,32 @@ global resident_end
         call    parse_dec16         ; ES:SI -> decimal -> BX, SI advanced
         mov     [g_nic_irq], bx
         jmp     .scan_tail
+.opt_media:
+        ; /m=tp|aui|bnc|tx|fx|mii -> the transceiver, overriding the EEPROM (first two letters decide)
+        mov     ax, [es:si + 3]
+        or      ax, 0x2020          ; tolower both
+        mov     bl, MEDIA_TP + 1
+        cmp     ax, 'tp'
+        je      .media_set
+        mov     bl, MEDIA_AUI + 1
+        cmp     ax, 'au'
+        je      .media_set
+        mov     bl, MEDIA_BNC + 1
+        cmp     ax, 'bn'
+        je      .media_set
+        mov     bl, MEDIA_TX + 1
+        cmp     ax, 'tx'
+        je      .media_set
+        mov     bl, MEDIA_FX + 1
+        cmp     ax, 'fx'
+        je      .media_set
+        mov     bl, MEDIA_MII + 1
+        cmp     ax, 'mi'
+        je      .media_set
+        jmp     .st_next            ; unknown -> ignored (media_select reports what it chose)
+.media_set:
+        mov     [g_media_req], bl
+        jmp     .st_next
 .opt_nc:
         ; /n=<id> -- opt in to a non-cacheable DMA region on a KNOWN chipset (default off). Explicit id (not
         ; a probe) so an unrecognized board never gets speculative 0x22 writes: 1=OPTi 2=Eteq 3=UMC 4=SiS
@@ -1479,35 +1511,123 @@ coh_probe_end:                                  ; end of the cold bus-master pro
 %include "install.asm"
 
 ;------------------------------------------------------------------------------
-; link_speed -- g_link_mbit = the link rate in Mbit/s: 10 for a 3C509 (10 Mbit only); for a 3C515 from
-; the transceiver its InternalConfig selects (Window 3): 10 (10BASE-T/AUI/BNC), 100 (100BASE-TX/FX), or
-; 0 = unknown (MII: the PHY negotiates the rate off-chip). Prints " LINK=...". Leaves the card in
-; Window 3 (el3_init selects its own windows). Clobbers AX, CX, DX.
+; media_select -- choose the transceiver (g_media, a MEDIA_* code) and say where it came from:
+;   1. /m= given                      -> that one (g_media_src 2)
+;   2. the EEPROM names a real one    -> that one (1). 3C515: InternalConfig xcvrSelect (Window 3) with
+;      autoselect off, a defined code, and -- when the card reports its media (Window 3 options) -- one it
+;      has. 3C509: Window 0 address configuration bits 14-15 (00 TP, 01 AUI, 11 BNC; 10 is reserved).
+;   3. otherwise                      -> RJ45 10BASE-T (0): autoselect, a reserved code, or media the card
+;      lacks. (No autonegotiation on these cards; 10BASE-T links with any switch. /m=tx for 100 Mbit.)
+; Prints "MEDIA=... (source)". Cold; leaves the card in Window 0 or 3 (el3_init selects its own).
+; Clobbers AX, BX, CX, DX.
+;------------------------------------------------------------------------------
+media_select:
+        mov     al, [g_media_req]
+        or      al, al
+        jz      .eeprom
+        dec     al
+        mov     [g_media], al
+        mov     byte [g_media_src], 2
+        cmp     byte [g_nic_gen], 0
+        jne     .say
+        cmp     al, MEDIA_BNC               ; a 3C509 has TP/AUI/BNC only
+        jbe     .say
+        jmp     .deflt
+.eeprom:
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CMD
+        cmp     byte [g_nic_gen], 0
+        je      .e509
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W3_CONFIG
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_W3_OPTIONS
+        in      ax, dx
+        mov     bx, ax                      ; BX = the media this card has (0 = not reported)
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_W3_INTCFG_HI
+        in      ax, dx
+        test    ax, EL3_CS_AUTOSELECT
+        jnz     .deflt                      ; "driver, pick" -> nothing chosen in the EEPROM
+        mov     cl, EL3_CS_XCVR_SHIFT
+        shr     ax, cl
+        and     ax, EL3_CS_XCVR_MASK
+        cmp     al, 2
+        je      .deflt                      ; reserved
+        cmp     al, 7
+        je      .deflt
+        or      bx, bx
+        jz      .e_ok                       ; options not reported: trust the EEPROM
+        push    bx
+        mov     bx, ax
+        mov     cl, [media_have + bx]       ; the options bit for this transceiver
+        pop     bx
+        test    bl, cl
+        jz      .deflt                      ; the card doesn't have it
+.e_ok:
+        mov     [g_media], al
+        mov     byte [g_media_src], 1
+        jmp     .say
+.e509:
+        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W0_SETUP
+        out     dx, ax
+        mov     dx, [g_nic_io]
+        add     dx, EL3_W0_ADDR_CFG
+        in      ax, dx
+        mov     cl, 14
+        shr     ax, cl                      ; 0 TP, 1 AUI, 2 reserved, 3 BNC (= the MEDIA_* codes)
+        cmp     al, 2
+        je      .deflt
+        mov     [g_media], al
+        mov     byte [g_media_src], 1
+        jmp     .say
+.deflt:
+        mov     byte [g_media], MEDIA_TP
+        mov     byte [g_media_src], 0
+.say:
+        mov     dx, msg_media
+        call    print_str
+        mov     bl, [g_media]
+        xor     bh, bh
+        shl     bx, 1
+        mov     dx, [media_names + bx]
+        call    print_str
+        mov     bl, [g_media_src]
+        xor     bh, bh
+        shl     bx, 1
+        mov     dx, [media_srcs + bx]
+        call    print_str
+        ret
+
+; the Window 3 options bit that says the card has each transceiver (Linux media_tbl masks), by MEDIA_*
+media_have      db 0x08, 0x20, 0x80, 0x10, 0x02, 0x04, 0x40, 0x00
+media_names     dw m_tp, m_aui, m_tp, m_bnc, m_tx, m_fx, m_mii, m_tp
+media_srcs      dw m_src_def, m_src_ee, m_src_opt
+m_tp            db '10BASE-T (RJ45)', '$'
+m_aui           db 'AUI', '$'
+m_bnc           db '10BASE2 (BNC)', '$'
+m_tx            db '100BASE-TX (RJ45)', '$'
+m_fx            db '100BASE-FX', '$'
+m_mii           db 'MII', '$'
+m_src_def       db ' (default)', 13, 10, '$'
+m_src_ee        db ' (EEPROM)', 13, 10, '$'
+m_src_opt       db ' (/m=)', 13, 10, '$'
+
+;------------------------------------------------------------------------------
+; link_speed -- g_link_mbit from the chosen transceiver: 10 for 10BASE-T/AUI/BNC (and any 3C509), 100 for
+; 100BASE-TX/FX, 0 = unknown for MII (the PHY negotiates off-chip). Prints " LINK=...". Clobbers DX.
 ;------------------------------------------------------------------------------
 link_speed:
         mov     byte [g_link_mbit], 10
         mov     dx, msg_link10
-        cmp     byte [g_nic_gen], 0
-        je      .say
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CMD
-        mov     ax, EL3_CMD_SELECT_WINDOW | EL3_W3_CONFIG
-        out     dx, ax
-        mov     dx, [g_nic_io]
-        add     dx, EL3_CS_W3_INTCFG_HI
-        in      ax, dx
-        mov     cl, EL3_CS_XCVR_SHIFT
-        shr     ax, cl
-        and     al, EL3_CS_XCVR_MASK        ; AL = xcvrSelect
-        mov     dx, msg_link10
-        cmp     al, EL3_CS_XCVR_100TX
-        jb      .say                        ; 0-3: 10 Mbit
+        cmp     byte [g_media], MEDIA_TX
+        jb      .say
         mov     byte [g_link_mbit], 100
         mov     dx, msg_link100
-        cmp     al, EL3_CS_XCVR_MII
-        jb      .say                        ; 4-5: 100BASE-TX/FX
+        cmp     byte [g_media], MEDIA_MII
+        jb      .say
         mov     byte [g_link_mbit], 0
-        mov     dx, msg_linkq               ; MII / reserved: rate unknown
+        mov     dx, msg_linkq
 .say:   call    print_str
         ret
 
@@ -1540,6 +1660,7 @@ build_plan:
         ; from its transceiver (link_speed). At 100 Mbit the wire drains faster than any ISA PIO fill, so
         ; it transmits store-and-forward; an unknown speed (MII) keeps the conservative 512.
         push    ax                          ; AX = Window-1 base (the PIO immediates below)
+        call    media_select                ; -> g_media (/m=, the EEPROM, else RJ45), prints MEDIA=
         call    link_speed                  ; -> g_link_mbit (10 / 100 / 0 = unknown), prints LINK=
         pop     ax
         mov     bx, EL3_CMD_SET_TX_START | EL3_TX_THRESH_SF
