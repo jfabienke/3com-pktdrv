@@ -55,6 +55,9 @@ EL3_CMD_SET_TX_START    equ 0x9800   ; OR with the TX start threshold (bytes)
 ; = more overlap of the wire transmit with the CPU's PIO fill, but more underrun risk on a
 ; slow CPU (recovered below, and counted). Tunable; a conservative default for the floor.
 EL3_TX_START_THRESH     equ 512      ; early-start (overlap, low latency) -- 3C509/B @ 10 Mbit
+; 286+ on the 10 Mbit-only 3C509: start at once (Crynwr's value). A 16-bit rep outsw fill (>= 2 MB/s)
+; outruns the 1.25 MB/s wire, so the frame goes out while the CPU is still filling it -- lowest latency.
+EL3_TX_START_IMMED      equ 0
 ; Store-and-forward: a threshold above the max frame so the card never early-starts -- it
 ; transmits only once the whole frame is buffered, with the CPU already done, so underrun is
 ; impossible at ANY link speed. Mandatory where the wire can out-drain PIO fill (e.g. a 3C515

@@ -1429,10 +1429,17 @@ build_plan:
         ; (1.25 MB/s), so early start underruns any frame much over the threshold -- the frame is lost and
         ; every retransmit underruns again. Store-and-forward there (tx_status_drain also raises the
         ; threshold adaptively after an underrun on any CPU).
-        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
-        cmp     byte [g_cpu_class], CPU_8088
-        jne     .tx_start_set
+        ; A 286+ on the 3C509 (10 Mbit only) starts at once: its 16-bit fill outruns the wire, so the frame
+        ; leaves while it is still being written (was 512: the wire started only near the end of a small
+        ; frame -- 14% fill/wire overlap vs Crynwr's 99%). The 3C515 keeps 512: at 100 Mbit the wire drains
+        ; faster than any ISA PIO fill, and the driver can't tell the link speed from here.
         mov     bx, EL3_CMD_SET_TX_START | EL3_TX_THRESH_SF
+        cmp     byte [g_cpu_class], CPU_8088
+        je      .tx_start_set
+        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_THRESH
+        cmp     byte [g_nic_gen], 0
+        jne     .tx_start_set
+        mov     bx, EL3_CMD_SET_TX_START | EL3_TX_START_IMMED
 .tx_start_set:
         mov     [g_tx_start], bx            ; precomputed SET_TX_START command
         mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
