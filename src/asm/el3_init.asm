@@ -121,13 +121,20 @@ el3_load_mac_io:
         ; (a fixed delay loop under-waits at a fast shift -> reads the 0x8000 busy value). Bounded so a
         ; card/model that never asserts busy just falls through; io_delay then covers the latency.
         push    cx
+        push    si
+        mov     si, EL3_EE_BUSY            ; 3C509: busy = bit 15
+        cmp     byte [g_nic_gen], 0
+        je      .eebit
+        mov     si, EL3_CS_EE_BUSY         ; 3C515: busy = bit 9 (Linux 3c515)
+.eebit:
         xor     cx, cx                     ; up to 65536 polls; exits early the moment busy clears
 .eebusy:
-        in      ax, dx                     ; command register: bit 15 = EepromBusy
-        test    ax, 0x8000
+        in      ax, dx                     ; command register: EepromBusy
+        test    ax, si
         jz      .eeready
         loop    .eebusy
 .eeready:
+        pop     si
         pop     cx
         call    io_delay                   ; latency margin (busy-bit-less HW; harmless over-wait)
         mov     dx, bx

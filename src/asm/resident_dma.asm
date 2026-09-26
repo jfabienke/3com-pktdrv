@@ -237,9 +237,33 @@ xms_release_core:
 ; release the VDS locks. Enter DS=CS. Clobbers AX, BX, CX, DX, SI, DI, ES.
 ;------------------------------------------------------------------------------
 dma_teardown:
+        call    isa_dma_mask
         cmp     byte [xms_dma_armed], 0
         je      .vds
         call    xms_release_core
 .vds:
         call    vds_release
+        ret
+
+;------------------------------------------------------------------------------
+; isa_dma_mask -- re-mask the ISA DMA channel isa_dma_cascade put in cascade mode (uninstall, or the
+; cold fallback to PIO). No-op when none was set. Clobbers AL.
+;------------------------------------------------------------------------------
+isa_dma_mask:
+        mov     al, [g_isa_dma]
+        test    al, 0x80
+        jz      .done
+        and     al, 7
+        cmp     al, 4
+        ja      .hi
+        or      al, 4                       ; single mask: bit 2 set = mask this channel
+        out     0x0A, al
+        jmp     .clr
+.hi:
+        and     al, 3
+        or      al, 4
+        out     0xD4, al
+.clr:
+        mov     byte [g_isa_dma], 0
+.done:
         ret

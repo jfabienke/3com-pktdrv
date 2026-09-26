@@ -44,15 +44,18 @@ G_PLAN_N        equ 2
 PLAN_STEP_SIZE  equ 3
 
 ; diagnostic strings ($-terminated for INT 21h AH=09h)
-msg_banner  db '3com-pktdrv floor (3C509 packet driver)', 13, 10, '$'
+msg_banner  db '3com-pktdrv (3C509/3C515 packet driver)', 13, 10, '$'
 msg_cpu     db 'CPU class=', '$'
 msg_nic     db 13, 10, '3C509 I/O=0x', '$'
+msg_nic515  db 13, 10, '3C515 I/O=0x', '$'
 msg_irq     db ' IRQ=0x', '$'
 msg_mac     db ' MAC=', '$'
-msg_no_nic  db 13, 10, 'No 3C509 found', 13, 10, '$'
+msg_no_nic  db 13, 10, 'No 3C509 or 3C515 found', 13, 10
+            db '(a 3C515 in Plug and Play mode needs 3cpdpnp.exe, or /b= /q= /5)', 13, 10, '$'
 msg_badmac  db 'ERROR: invalid station MAC (all-FF/all-00/multicast) -- wrong card gen?', 13, 10
             db '       (/5 selects 3C515 EEPROM at +0x2000; omit it for a 3C509)', 13, 10, '$'
 msg_crlf    db 13, 10, '$'
+msg_isadma  db 'ISA DMA channel (cascade)=', '$'
 msg_no286   db '/2 ignored: CPU below 286', 13, 10, '$'
 msg_link10  db 'LINK=10 Mbit', 13, 10, '$'
 msg_link100 db 'LINK=100 Mbit (store-and-forward TX)', 13, 10, '$'
@@ -329,6 +332,7 @@ nc_saved_ok:    resb 1             ; 1 = nc_saved_base/size hold the chipset's p
 nc_saved_base:  resb 1
 nc_saved_size:  resb 1
 g_tx_slot_sz:   resw 1             ; TX ring slot size: TX_SLOT_SZ, or TX_SLOT_LARGE with /j (build_plan)
+g_isa_dma:      resb 1              ; 0x80 | the ISA DMA channel put in cascade mode for the 3C515 bus master; 0 = none
 tx_vds_held:    resb TX_RING_N     ; per TX slot: 1 = tx_vds_dds[i] still holds an AH=F1 frame's VDS lock
                 alignb 2
 tx_span_dds:    resb DDS_LEN       ; VDS DDS: the driver's own DMA span, locked for the driver's lifetime
@@ -529,23 +533,35 @@ global resident_end
 .auto_detect:
 %ifdef CFG_PNP
         ; >=286 (16-bit ISA): try ISA PnP first -- it finds a 3C515 AND a PnP-mode 3C509B --
-        ; then fall back to the legacy ID-port. On an 8088 a 3C515 can't exist (16-bit card)
+        ; then fall back to the legacy probes. On an 8088 a 3C515 can't exist (16-bit card)
         ; so we go straight to the legacy probe and skip the PnP subsystem entirely.
         cmp     byte [g_cpu_class], CPU_8088
         jbe     .legacy_only
         call    detect_nic_pnp      ; direct ISA PnP isolation -> g_nic_io/irq/mac
         jnc     .nic_found
 .legacy_only:
-        call    detect_nic          ; legacy 3Com ID-port (Tomahawk)
-%else
-        call    detect_nic          ; floor: native 3Com ID-port (Tomahawk) only
 %endif
+        ; Legacy probes. The 3C509 answers the ID port; the 3C515 doesn't -- it sits at the I/O base
+        ; its EEPROM sets, found by scanning (detect_nic_corkscrew, >=286: a 16-bit card). /5 without
+        ; /b= means "a 3C515": scan only. Otherwise ID port first, then the 3C515 scan.
+        cmp     byte [g_nic_gen], 1
+        je      .cs_scan
+        call    detect_nic          ; native 3Com ID-port (Tomahawk)
+        jnc     .nic_found
+        cmp     byte [g_cpu_hw], CPU_80286
+        jb      .nic_none           ; 8088/8086: no 16-bit slot, no 3C515
+.cs_scan:
+        call    detect_nic_corkscrew
 %endif
         jc      .nic_none           ; no card found
 .nic_found:
         call    irq_fixup           ; map IRQ 2/9 to the board's PIC layout; refuse 10-15 on a PC/XT
         jc      .bad_irq
-        mov     dx, msg_nic         ; "3C509 I/O=0x"
+        mov     dx, msg_nic
+        cmp     byte [g_nic_gen], 0
+        je      .say_nic
+        mov     dx, msg_nic515
+.say_nic:                   ; "3C509 I/O=0x" / "3C515 I/O=0x"
         call    print_str
         mov     ax, [g_nic_io]
         call    print_hex16
@@ -800,6 +816,7 @@ BM_TEST_LEN     equ 60                      ; probe frame size (min Ethernet pay
 phase_validate_dma:
         cmp     byte [g_use_dma], 0
         je      .pv_done                    ; PIO path: no bus-master engine to test
+        call    isa_dma_cascade             ; the bus master arbitrates through its ISA DMA channel
 
         push    es
         ; (cs << 4) -> dx:ax ; both descriptor and probe buffer live in CS=DGROUP (<1 MB)
@@ -1488,6 +1505,8 @@ build_plan:
         mov     [g_plan_rx_imm], ax         ; PIO datapath FIFO immediate = Window-1 base
         mov     [g_plan_tx_imm], ax
         ; --- resolve bus-master single-transfer TX DMA: /d AND 3C515 AND >=286 (else PIO floor) ---
+        mov     byte [g_isa_dma], 0         ; no cascade channel yet (reserved space isn't zeroed; a stale
+                                            ; bit 7 would let isa_dma_mask mask some other device's channel)
         mov     byte [g_use_dma], 0
         cmp     byte [g_want_dma], 0
         je      .dma_resolved
@@ -1693,11 +1712,57 @@ vds_cold_release:
         ret
 
 ;------------------------------------------------------------------------------
+; isa_dma_cascade -- put the 3C515's ISA DMA channel (DCR = io+0x2000, bits 0-2) in cascade mode and
+; unmask it, as Linux 3c515 does (set_dma_mode(DMA_MODE_CASCADE) + enable_dma). On a real AT the bus
+; master asserts DREQ on that channel and gets the bus through the 8237's HRQ/HLDA; a channel left
+; masked or in single/block mode never grants it. Channels 0-3: mode 0Bh / mask 0Ah; 5-7: D6h / D4h
+; (4 is the controllers' own cascade -- not a card channel, skipped). Cold. Clobbers AX, DX.
+;------------------------------------------------------------------------------
+isa_dma_cascade:
+        mov     dx, [g_nic_io]
+        add     dx, EL3_CS_DCR
+        in      ax, dx
+        and     al, 7
+        cmp     al, 4
+        je      .none
+        mov     ah, al
+        or      ah, 0x80
+        mov     [g_isa_dma], ah
+        push    ax
+        mov     dx, msg_isadma
+        call    print_str
+        pop     ax
+        push    ax
+        add     al, '0'
+        call    print_char
+        mov     dx, msg_crlf
+        call    print_str
+        pop     ax
+        cmp     al, 4
+        ja      .hi
+        mov     ah, al
+        or      al, 0xC0                    ; mode: cascade, this channel
+        out     0x0B, al
+        mov     al, ah                      ; single mask: bit 2 clear = unmask
+        out     0x0A, al
+        ret
+.hi:
+        sub     al, 4
+        mov     ah, al
+        or      al, 0xC0
+        out     0xD6, al
+        mov     al, ah
+        out     0xD4, al
+.none:
+        ret
+
+;------------------------------------------------------------------------------
 ; dma_force_pio -- drop to the PIO floor: clear EVERY bus-master flag together. install keeps only up to
 ; resident_end_pio when g_use_dma == 0, so a flag left set (g_async -> AH=F1 dma_tx_async, g_tx_ring)
 ; would let a resident path touch the freed DMA region (tx_descs / xms_* state). Cold; no clobbers.
 ;------------------------------------------------------------------------------
 dma_force_pio:
+        call    isa_dma_mask                ; the bus master is out: re-mask its cascade channel
         mov     byte [g_use_dma], 0
         mov     byte [g_async], 0
         mov     byte [g_tx_ring], 0

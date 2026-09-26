@@ -145,6 +145,59 @@ id_read_eeprom:
 ; merely over-waits, harmless for one-time cold init.
 ; reset_delay -- ~8x that, for the post-global-reset settle.
 ;------------------------------------------------------------------------------
+;------------------------------------------------------------------------------
+; detect_nic_corkscrew -- find a 3C515 at its legacy (non-PnP) I/O base. The 3C515 takes no part in
+; the 3C509 ID-port isolation: it answers at the base its EEPROM configures. Scan 0x100..0x3E0 step
+; 0x20 as Linux 3c515 does: the window-independent resource-config mirror at base+0x2002 must hold
+; the base's bits 4-8, then EEPROM word 7 (via base+0x200A/0x200C) must be 3Com's 0x6D50. A PnP-mode
+; card on a board with no PnP BIOS stays inactive until isolated -- that needs the pnp build.
+; out: CF=0 with g_nic_io, g_nic_gen=1, g_nic_irq (from the card unless /q= gave one) and g_mac;
+; CF=1 if none. Cold, >=286 only (a 16-bit card). Clobbers AX, BX, CX, DX, SI, DI, BP.
+;------------------------------------------------------------------------------
+detect_nic_corkscrew:
+        mov     bx, EL3_CS_SCAN_FIRST
+.next:
+        mov     dx, bx
+        add     dx, EL3_CS_RESCFG
+        in      ax, dx
+        mov     di, ax                      ; keep: bits 0-3 = the card's IRQ
+        xor     ax, bx
+        test    ax, EL3_CS_RESCFG_IOMASK
+        jnz     .skip                       ; nothing (0xFFFF) or not configured for this base
+        mov     dx, bx
+        add     dx, EL3_CS_W0_EE_CMD
+        mov     ax, EL3_EE_READ | EL3_EE_MFG_ID
+        out     dx, ax
+        call    io_delay                    ; >= 162 us before the first poll (Linux)
+        xor     cx, cx
+.busy:
+        in      ax, dx
+        test    ax, EL3_CS_EE_BUSY
+        jz      .ready
+        loop    .busy
+.ready:
+        add     dx, 2                       ; EEPROM data register
+        in      ax, dx
+        cmp     ax, EL3_MFG_ID
+        je      .found
+.skip:
+        add     bx, EL3_CS_SCAN_STEP
+        cmp     bx, EL3_CS_SCAN_END
+        jb      .next
+        stc
+        ret
+.found:
+        mov     [g_nic_io], bx
+        mov     byte [g_nic_gen], 1
+        cmp     word [g_nic_irq], 0
+        jne     .irq_given
+        and     di, 0x000F
+        mov     [g_nic_irq], di
+.irq_given:
+        call    el3_load_mac_io
+        clc
+        ret
+
 io_delay:
         push    cx
         mov     cx, 1024

@@ -138,6 +138,14 @@ EL3_EE_BUSY             equ 0x8000   ; command register busy bit (clear when rea
 ; io+0x200A, data = cmd+2). Verified against the Linux 3c515 driver + iPXE. (We poll a fixed
 ; io_delay rather than the busy bit, so the differing busy-bit position doesn't matter.)
 EL3_CS_W0_EE_CMD        equ 0x200A   ; 3C515 EEPROM command register (data at +2 = 0x200C)
+EL3_CS_EE_BUSY          equ 0x0200   ; 3C515 EEPROM busy = command-register bit 9 (the 3C509's is bit 15)
+; The 3C515's other window-independent +0x2000 alias registers (Linux 3c515 corkscrew_setup):
+EL3_CS_DCR              equ 0x2000   ; bits 0-2 = the ISA DMA channel the bus master cascades through
+EL3_CS_RESCFG           equ 0x2002   ; bits 4-8 = the I/O base's bits 4-8, bits 0-3 = the IRQ
+EL3_CS_RESCFG_IOMASK    equ 0x01F0
+EL3_CS_SCAN_FIRST       equ 0x100    ; legacy (non-PnP) 3C515 I/O bases: 0x100..0x3E0, step 0x20
+EL3_CS_SCAN_END         equ 0x400
+EL3_CS_SCAN_STEP        equ 0x20
 EL3_EE_ADDR0            equ 0        ; station address words 0..2 (big-endian)
 EL3_EE_ADDR1            equ 1
 EL3_EE_ADDR2            equ 2
