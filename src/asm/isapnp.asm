@@ -70,8 +70,9 @@ msg_pnp_rdp     db ' read port 0x', '$'
 msg_pnp_none    db 'PnP: no card isolated (read ports 0x0213-0x03FB)', 13, 10, '$'
 msg_pnp_no3com  db 'PnP: no 3Com card among them', 13, 10, '$'
 msg_pnp_busy    db 'PnP: I/O 0x', '$'
-msg_pnp_inuse   db ' in use (another card answers there), not used', 13, 10, '$'
-msg_pnp_nobase  db 'PnP: no free I/O base -- give one with /b= (and /q=)', 13, 10, '$'
+msg_pnp_inuse   db ' in use (range check read 0x', '$'
+msg_pnp_inuse2  db '), not used', 13, 10, '$'
+msg_pnp_nobase  db 'PnP: no free I/O base found -- try another with /b= (and /q=)', 13, 10, '$'
 
 ;------------------------------------------------------------------------------
 ; detect_nic_pnp -- isolate every ISA PnP card, configure + activate the first 3Com one, read its MAC.
@@ -227,23 +228,70 @@ detect_nic_pnp:
         clc
         ret
 
-; pnp_io_free -- CF=0 if nothing decodes I/O [BX, BX+0x20): every port reads 0xFF (the ISA bus floats
-; high). Only ports we are about to give the NIC are read. Clobbers AX, CX, DX.
+; pnp_io_free -- CF=0 if nothing else decodes I/O [BX, BX+0x20), by the ISA PnP I/O range check: with the
+; card inactive and base BX programmed, register 0x31 bit1 makes the card answer every read in its range with
+; a test pattern (bit0 selects 0x55 or 0xAA) -- another device driving those ports corrupts it. Both
+; patterns are checked. (Floating-bus 0xFF reads don't work: a real IBM PC/AT returns bus leftovers from
+; empty ports, so every base looked busy.) On a mismatch [pnp_bad] = the value read. The card must be in
+; Config with logical device 0 selected. Clobbers AX, CX, DX.
+PNP_R_IOCHECK   equ 0x31
 pnp_io_free:
+        mov     al, PNP_R_IOBASE_HI
+        mov     ah, bh
+        call    pnp_write_reg
+        mov     al, PNP_R_IOBASE_LO
+        mov     ah, bl
+        call    pnp_write_reg
+        mov     al, PNP_R_IOCHECK         ; pattern A
+        mov     ah, 0x02
+        call    pnp_write_reg
         mov     dx, bx
-        mov     cx, 0x20
-.f:     in      al, dx
-        cmp     al, 0xFF
-        jne     .busy
-        inc     dx
-        loop    .f
+        in      al, dx
+        mov     [pnp_bad], al
+        cmp     al, 0x55
+        je      .pa
+        cmp     al, 0xAA
+        jne     .busy                     ; not a range-check pattern: another card (or no range check)
+.pa:    mov     ah, al                    ; AH = pattern A (0x55 or 0xAA)
+        call    .all
+        jc      .busy
+        mov     al, PNP_R_IOCHECK         ; pattern B must be the other one
+        push    ax
+        mov     ah, 0x03
+        call    pnp_write_reg
+        pop     ax
+        not     ah
+        call    .all
+        jc      .busy
+        call    .off
         clc
         ret
 .busy:
+        call    .off
+        stc
+        ret
+.off:                                     ; range check off
+        push    ax
+        mov     al, PNP_R_IOCHECK
+        xor     ah, ah
+        call    pnp_write_reg
+        pop     ax
+        ret
+.all:                                     ; every port of [BX, BX+0x20) must read AH; CF=1 + [pnp_bad] if not
+        mov     dx, bx
+        mov     cx, 0x20
+.a:     in      al, dx
+        cmp     al, ah
+        jne     .bad
+        inc     dx
+        loop    .a
+        clc
+        ret
+.bad:   mov     [pnp_bad], al
         stc
         ret
 
-; pnp_say_busy -- "PnP: I/O 0x0300 in use" for base BX. Preserves BX, SI.
+; pnp_say_busy -- "PnP: I/O 0x0300 in use (range check read 0x..)" for base BX. Preserves BX, SI.
 pnp_say_busy:
         push    ax
         push    dx
@@ -252,6 +300,11 @@ pnp_say_busy:
         mov     ax, bx
         call    print_hex16
         mov     dx, msg_pnp_inuse
+        call    print_str
+        mov     al, [pnp_bad]
+        xor     ah, ah
+        call    print_hex16
+        mov     dx, msg_pnp_inuse2
         call    print_str
         pop     dx
         pop     ax

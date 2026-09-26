@@ -135,6 +135,7 @@ pnp_id:         resb 9          ; isolated serial id: vendor[2] product[2] seria
 pnp_rdp:        resw 1          ; ISA PnP read-data port in use (0x213.., step 0x20)
 pnp_iter:       resb 1          ; isolation iteration (1 until a card isolates)
 pnp_csn:        resb 1          ; CSNs handed out so far
+pnp_bad:        resb 1          ; the value an I/O range check read instead of its pattern
                 resb 1          ; pad to even
 %endif
 

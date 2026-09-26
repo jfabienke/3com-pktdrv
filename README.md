@@ -60,7 +60,9 @@ the run's **3cpd-binaries** artifact. Pushing a `v*` tag also attaches them to t
 - **3C515 in Plug and Play mode** on a machine without a PnP BIOS (e.g. an IBM PC/AT) is inactive until
   isolated: use `3cpdpnp.exe`, which runs ISA PnP isolation first (the Linux/ISA PnP-spec sequence and
   delays, read ports 0x213-0x3FB) and prints each card it isolates (`PnP card TCM5051 CSN=1 read port
-  0x....`); an unconfigured card gets I/O 0x300, IRQ 10, DMA 5. Or configure it with isapnptools
+  0x....`). It only places the card on a free I/O base, verified with the card's own ISA PnP I/O range
+  check (0x300, 0x320, 0x340, 0x280, 0x2A0, 0x2C0, 0x380; busy ones are listed), IRQ 10 and DMA 5 -- or
+  exactly `/b=` and `/q=` when given (refused if that base is busy). Or configure it with isapnptools
   (`pnpdump`/`isapnp`, the CI's **isapnptools-dos** artifact, real-mode DOS build in
   `tools/isapnptools-dos`) and load `3cpd /b=300 /q=10 /5`, or disable PnP with 3Com's utility.
 - **Bus mastering (`/d`, 3C515):** the card's ISA DMA channel (from the card) is put in cascade mode and
@@ -122,4 +124,4 @@ The driver prints what it chose. Beyond the CPU class, NIC and DMA/coherency lin
 
 ---
 
-_Last updated: 2026-09-26 17:15 CEST (3C515 PnP: the rewritten isolation in `3cpdpnp.exe`, the isapnptools DOS tools). Prior: 2026-09-26 16:45 CEST ("Finding the card": 3C515 legacy I/O scan, `3cpdpnp.exe` for PnP-mode cards, ISA DMA cascade for `/d`; CI builds `3cpdpnp.exe`). Prior: 2026-09-26 15:25 CEST (prebuilt binaries via GitHub Actions; "At load time": 3C515 link speed from the transceiver, TX start threshold per link, resident size; `sendlen.com` in `wmake all`; docs/09 is cfg ABI v3). Prior: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._
+_Last updated: 2026-09-26 17:40 CEST (PnP picks a free I/O base via the I/O range check; honours /b= /q=). Prior: 2026-09-26 17:15 CEST (3C515 PnP: the rewritten isolation in `3cpdpnp.exe`, the isapnptools DOS tools). Prior: 2026-09-26 16:45 CEST ("Finding the card": 3C515 legacy I/O scan, `3cpdpnp.exe` for PnP-mode cards, ISA DMA cascade for `/d`; CI builds `3cpdpnp.exe`). Prior: 2026-09-26 15:25 CEST (prebuilt binaries via GitHub Actions; "At load time": 3C515 link speed from the transceiver, TX start threshold per link, resident size; `sendlen.com` in `wmake all`; docs/09 is cfg ABI v3). Prior: 2026-09-25 09:53 CEST (`/q=` IRQ 2/9 mapping and the PC/XT IRQ 0-7 limit; `/2` ignored below a 286). Prior: 2026-09-22 21:23 CEST (Build section now lists the real `Makefile` targets and `DEFS` variant builds; added the command-line switch list incl. `/v`; docs table extended to 08–17)._
