@@ -130,10 +130,11 @@ g_curid:        resb 1
 %ifdef CFG_PNP
 ; ISA PnP isolation scratch (cold)
 pnp_lfsr:       resb 1          ; running isolation checksum LFSR
-pnp_saw:        resb 1          ; a card drove the bus (0x55AA seen)
-pnp_next_csn:   resb 1          ; next CSN to hand out
 pnp_found_csn:  resb 1          ; CSN of the matched 3Com card
 pnp_id:         resb 9          ; isolated serial id: vendor[2] product[2] serial[4] csum[1]
+pnp_rdp:        resw 1          ; ISA PnP read-data port in use (0x213.., step 0x20)
+pnp_iter:       resb 1          ; isolation iteration (1 until a card isolates)
+pnp_csn:        resb 1          ; CSNs handed out so far
                 resb 1          ; pad to even
 %endif
 

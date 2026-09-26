@@ -3,41 +3,60 @@
 ; the protocol itself is 8086-clean 8-bit port I/O. Shares DS=DGROUP and the BSS scratch in
 ; start.asm. Reuses io_delay from el3_probe.asm.
 ;
-; POLITE by design so it coexists with a PnP BIOS that already configured cards:
-;   - Reset-CSN (config 0x04), never global Reset (0x01) which would deactivate cards and
-;     discard the BIOS's resource assignment.
-;   - read-don't-clobber: if our card is already Active, use its existing I/O/IRQ (inheriting
-;     the BIOS's conflict-free assignment for free); only self-assign when it's unconfigured.
-;   - always restore Wait-for-Key on exit, leaving the bus as we found it.
+; The sequence and delays follow Linux drivers/pnp/isapnp/core.c (isapnp_isolate_rdp_select /
+; isapnp_isolate), which follow the ISA PnP spec:
+;   Wait-for-Key, key, Reset-CSN, 2 ms, Wait-for-Key, key, Wake[0] (CSN-0 cards -> Isolation),
+;   Set-RD_DATA (only honoured in Isolation), 1 ms, select the isolation register, 1 ms; then read the
+;   72-bit serial identifier as pairs (0x55,0xAA = 1) with 250 us after EVERY read, checking the LFSR
+;   checksum; each isolated card gets the next CSN (250 us), then Wake[0] + Set-RD_DATA again for the
+;   next card. If nothing isolates on the first pass, the read port moves up by 8 (skipping the
+;   NE2000 probe space 0x280-0x380) and the whole selection is redone. Every address-port write is
+;   followed by 20 us.
+; (Was: Set-RD_DATA sent before Wake[0], ~4 us between isolation reads, a fixed 0x203 read port -- the
+; card never learned the read port, so a real PnP-mode 3C515 was never found.)
 ;
-; Isolation follows the ISA PnP spec: send the 32-byte LFSR key, Reset-CSN, then repeatedly
-; Wake[0] + read the 72-bit serial identifier (8 ID bytes + 1 checksum) validating the LFSR
-; checksum, assigning a CSN to each card found, until none remain -- taking the first 3Com
-; card (vendor 0x6D50). Cross-referenced with the 3Com pnp.c reference and the ISA PnP spec.
-;
-; UNTESTABLE in emulation (no emulator has a 3C515); structurally verified, awaits hardware.
+; POLITE so it coexists with a PnP BIOS that already configured cards: Reset-CSN only, never the
+; global Reset (which would deactivate cards); an already-active card keeps its I/O/IRQ; Wait-for-Key
+; is restored on exit. Timing is by ~1 us ISA reads of port 0x80, independent of the CPU clock.
 
 %include "el3_corkscrew.inc"
 
 ; ---- ISA PnP ports + registers ----
 PNP_ADDR        equ 0x279       ; address/index port
 PNP_WRITE       equ 0xA79       ; write-data port
-PNP_READ        equ 0x203       ; relocatable read-data port (port>>2 written to reg 0x00)
+PNP_RDP_FIRST   equ 0x213       ; first read-data port tried (Linux); must end in binary 11
+PNP_RDP_STEP    equ 8           ; isapnptools' step (Linux uses 0x20): on a real IBM PC/AT pnpdump's first
+                                ; read port 0x273 failed and 0x27B worked -- a 0x20 step never tries 0x27B
+PNP_RDP_SKIP_LO equ 0x280       ; NE2000 probe space: never used as a read port
+PNP_RDP_SKIP_HI equ 0x380
+PNP_RDP_LAST    equ 0x3FF
 
-PNP_R_SETRDP    equ 0x00        ; set read-data port
+PNP_R_SETRDP    equ 0x00        ; set read-data port (port >> 2)
 PNP_R_ISOLATE   equ 0x01        ; serial isolation
 PNP_R_CONFIG    equ 0x02        ; config control
 PNP_R_WAKE      equ 0x03        ; wake[CSN]
 PNP_R_CSN       equ 0x06        ; card select number
 PNP_R_LDN       equ 0x07        ; logical device number
 PNP_R_ACTIVATE  equ 0x30        ; logical device activate (bit0)
-PNP_R_IOBASE_HI equ 0x60        ; logical device 0 I/O base, high byte
-PNP_R_IOBASE_LO equ 0x61        ; logical device 0 I/O base, low byte
-PNP_R_IRQ       equ 0x70        ; logical device 0 IRQ level
+PNP_R_IOBASE_HI equ 0x60        ; logical device I/O base 0, high byte
+PNP_R_IOBASE_LO equ 0x61        ; logical device I/O base 0, low byte
+PNP_R_IRQ       equ 0x70        ; logical device IRQ 0 level
+PNP_R_DMA       equ 0x74        ; logical device DMA channel 0 (4 = none)
 
 PNP_CFG_RESETCSN equ 0x04       ; reset all CSNs to 0 (does NOT touch resources/activation)
 PNP_CFG_WAITKEY  equ 0x02       ; return cards to Wait-for-Key
 PNP_LFSR_SEED    equ 0x6A       ; isolation checksum LFSR seed
+
+PNP_DEF_IOBASE   equ 0x300      ; resources given to an unconfigured card
+PNP_DEF_IRQ      equ 10
+PNP_DEF_DMA      equ 5          ; 16-bit channel for the 3C515 bus master (free on a stock AT)
+
+; delays, in ~1 us reads of port 0x80
+PNP_US_ADDR      equ 20
+PNP_US_READ      equ 250
+PNP_US_1MS       equ 1000
+PNP_US_2MS       equ 2000
+PNP_US_RDP       equ 100
 
 ; The 32-byte LFSR initiation key (cards: Wait-for-Key -> Sleep). Standard ISA PnP sequence.
 pnp_key:
@@ -46,64 +65,83 @@ pnp_key:
         db 0xB0,0x58,0x2C,0x16,0x8B,0x45,0xA2,0xD1
         db 0xE8,0x74,0x3A,0x9D,0xCE,0xE7,0x73,0x39
 
+msg_pnp_card    db 'PnP card ', '$'
+msg_pnp_csn     db ' CSN=', '$'
+msg_pnp_rdp     db ' read port 0x', '$'
+msg_pnp_none    db 'PnP: no card isolated (read ports 0x0213-0x03FB)', 13, 10, '$'
+msg_pnp_no3com  db 'PnP: no 3Com card among them', 13, 10, '$'
+msg_pnp_active  db ' (already active)', '$'
+
 ;------------------------------------------------------------------------------
-; detect_nic_pnp -- isolate ISA PnP cards, configure the first 3Com one, read its MAC.
-; out: CF=0 and g_nic_io / g_nic_irq / g_mac set on success; CF=1 if no 3Com PnP card.
+; detect_nic_pnp -- isolate every ISA PnP card, configure + activate the first 3Com one, read its MAC.
+; out: CF=0 and g_nic_io / g_nic_irq / g_nic_gen / g_mac set on success; CF=1 if no 3Com PnP card.
 ; clobbers AX, BX, CX, DX, SI, DI.
 ;------------------------------------------------------------------------------
 detect_nic_pnp:
-        call    pnp_send_key                ; Wait-for-Key -> Sleep
-        mov     al, PNP_R_SETRDP            ; set the relocatable read-data port
-        mov     ah, (PNP_READ >> 2)
-        call    pnp_write_reg
-        mov     al, PNP_R_CONFIG           ; polite: Reset-CSN only (NOT global Reset 0x01)
-        mov     ah, PNP_CFG_RESETCSN
-        call    pnp_write_reg
-
-        mov     byte [pnp_next_csn], 1
+        mov     dx, msg_crlf                ; our report lines follow the "CPU class=" digit
+        call    print_str
+        mov     word [pnp_rdp], PNP_RDP_FIRST
+        mov     byte [pnp_csn], 0
+        mov     byte [pnp_iter], 1
+        mov     byte [pnp_found_csn], 0
+        call    pnp_rdp_select
+        jc      .nocards
 .scan:
-        call    pnp_isolate_one             ; -> pnp_id[0..8], CF=1 if no more cards
-        jc      .none
-        mov     al, PNP_R_CSN              ; give this card a CSN (moves it out of isolation)
-        mov     ah, [pnp_next_csn]
+        call    pnp_isolate_one             ; -> pnp_id[0..8], CF=1 if nothing valid isolated
+        jc      .invalid
+        inc     byte [pnp_csn]
+        mov     al, PNP_R_CSN               ; give this card the next CSN (it leaves Isolation)
+        mov     ah, [pnp_csn]
         call    pnp_write_reg
-        inc     byte [pnp_next_csn]
-        ; 3Com? vendor = pnp_id[0..1]; accept either byte order (0x6D50 / 0x506D) -- the exact
-        ; serial bit order is to be confirmed on hardware, and no other vendor collides.
-        mov     al, [pnp_id]
-        mov     ah, [pnp_id + 1]
-        cmp     al, 0x6D
-        jne     .swap
-        cmp     ah, 0x50
-        je      .is3com
-.swap:
-        cmp     al, 0x50
-        jne     .scan
-        cmp     ah, 0x6D
-        jne     .scan
-.is3com:
-        mov     al, [pnp_next_csn]         ; our card's CSN = next_csn - 1
-        dec     al
+        mov     cx, PNP_US_READ
+        call    pnp_delay
+        inc     byte [pnp_iter]
+        call    pnp_report_card
+        cmp     byte [pnp_found_csn], 0
+        jne     .next                       ; already have our card: just isolate the rest
+        call    pnp_is_3com
+        jc      .next
+        mov     al, [pnp_csn]
         mov     [pnp_found_csn], al
-        ; generation: the 3C509B PnP id is 0x5090 (carries a 0x90 byte); the 3C515 family is
-        ; 0x5050..0x5053 (no 0x90). Discriminate byte-order-independently. Confirm on hardware.
-        mov     byte [g_nic_gen], 1        ; assume Corkscrew (3C515: registers +0x10, store-fwd)
+        ; generation: the 3C509B PnP id is TCM5090 (a 0x90 byte); the 3C515 family has none
+        mov     byte [g_nic_gen], 1
         cmp     byte [pnp_id + 2], 0x90
         je      .gen_tomahawk
         cmp     byte [pnp_id + 3], 0x90
-        jne     .configure                ; no 0x90 byte -> 3C515, gen stays 1
+        jne     .next
 .gen_tomahawk:
-        mov     byte [g_nic_gen], 0       ; 3C509B in PnP mode -> Tomahawk layout
-        jmp     .configure
-.none:
-        mov     al, PNP_R_CONFIG          ; restore Wait-for-Key, then fail
-        mov     ah, PNP_CFG_WAITKEY
+        mov     byte [g_nic_gen], 0
+.next:
+        cmp     byte [pnp_csn], 255
+        je      .done
+        mov     al, PNP_R_WAKE              ; CSN-0 cards back to Isolation for the next one
+        xor     ah, ah
         call    pnp_write_reg
+        call    pnp_isolation_setup
+        jmp     .scan
+.invalid:
+        cmp     byte [pnp_iter], 1
+        jne     .done                       ; had cards; none left
+        add     word [pnp_rdp], PNP_RDP_STEP  ; nothing on this read port: try the next one
+        call    pnp_rdp_select
+        jc      .nocards
+        jmp     .scan
+.done:
+        cmp     byte [pnp_found_csn], 0
+        jne     .configure
+        mov     dx, msg_pnp_no3com
+        call    print_str
+        jmp     .fail
+.nocards:
+        mov     dx, msg_pnp_none
+        call    print_str
+.fail:
+        call    pnp_wait_key
         stc
         ret
 
 .configure:
-        mov     al, PNP_R_WAKE            ; Wake[csn] into config, select logical device 0
+        mov     al, PNP_R_WAKE            ; Wake[csn] into Config, select logical device 0
         mov     ah, [pnp_found_csn]
         call    pnp_write_reg
         mov     al, PNP_R_LDN
@@ -113,24 +151,31 @@ detect_nic_pnp:
         call    pnp_read_reg
         test    al, 1
         jnz     .existing
-        ; unconfigured -> assign a default base/IRQ and activate
+        ; unconfigured -> assign the default base/IRQ/DMA and activate
         mov     al, PNP_R_IOBASE_HI
-        mov     ah, 0x03                  ; default I/O base 0x300
+        mov     ah, PNP_DEF_IOBASE >> 8
         call    pnp_write_reg
         mov     al, PNP_R_IOBASE_LO
-        xor     ah, ah
+        mov     ah, PNP_DEF_IOBASE & 0xFF
         call    pnp_write_reg
         mov     al, PNP_R_IRQ
-        mov     ah, 10                    ; default IRQ 10 (a 16-bit-ISA line)
+        mov     ah, PNP_DEF_IRQ
+        call    pnp_write_reg
+        mov     al, PNP_R_DMA
+        mov     ah, PNP_DEF_DMA
         call    pnp_write_reg
         mov     al, PNP_R_ACTIVATE
         mov     ah, 1
         call    pnp_write_reg
-        mov     word [g_nic_io], 0x300
-        mov     word [g_nic_irq], 10
+        mov     cx, PNP_US_READ           ; activation settle (Linux: 250 us)
+        call    pnp_delay
+        mov     word [g_nic_io], PNP_DEF_IOBASE
+        mov     word [g_nic_irq], PNP_DEF_IRQ
         jmp     .got
 .existing:
-        ; already active (e.g. a PnP BIOS configured it) -> inherit its resources
+        ; already active (a PnP BIOS or configuration tool set it up) -> inherit its resources
+        mov     dx, msg_pnp_active
+        call    print_str
         mov     al, PNP_R_IOBASE_HI
         call    pnp_read_reg
         mov     bh, al
@@ -143,27 +188,72 @@ detect_nic_pnp:
         and     ax, 0x000F
         mov     [g_nic_irq], ax
 .got:
-        mov     al, PNP_R_CONFIG          ; quiesce: back to Wait-for-Key (card stays active)
-        mov     ah, PNP_CFG_WAITKEY
-        call    pnp_write_reg
-        call    el3_load_mac_io           ; read the MAC via the now-fixed I/O base
+        call    pnp_wait_key              ; quiesce: back to Wait-for-Key (the card stays active)
+        call    el3_load_mac_io           ; read the MAC via the now-live I/O base
         clc
         ret
 
 ;------------------------------------------------------------------------------
-; pnp_isolate_one -- Wake[0] + read one card's 72-bit serial identifier with checksum check.
+; pnp_rdp_select -- (Linux isapnp_isolate_rdp_select) reset CSNs, re-key, Wake[0], and set the read
+; port [pnp_rdp] (advanced past the NE2000 space). CF=1 when no read port is left. Clobbers AX,CX,DX,SI.
+;------------------------------------------------------------------------------
+pnp_rdp_select:
+        call    pnp_wait_key
+        call    pnp_send_key
+        mov     al, PNP_R_CONFIG           ; Reset-CSN only (NOT the global Reset 0x01)
+        mov     ah, PNP_CFG_RESETCSN
+        call    pnp_write_reg
+        mov     cx, PNP_US_2MS
+        call    pnp_delay
+        call    pnp_wait_key
+        call    pnp_send_key
+        mov     al, PNP_R_WAKE             ; CSN-0 cards -> Isolation (Set-RD_DATA is valid only there)
+        xor     ah, ah
+        call    pnp_write_reg
+.adj:
+        mov     ax, [pnp_rdp]
+        cmp     ax, PNP_RDP_LAST
+        ja      .none
+        cmp     ax, PNP_RDP_SKIP_LO
+        jb      .ok
+        cmp     ax, PNP_RDP_SKIP_HI
+        ja      .ok
+        add     word [pnp_rdp], PNP_RDP_STEP
+        jmp     .adj
+.ok:
+        call    pnp_isolation_setup
+        clc
+        ret
+.none:
+        call    pnp_wait_key
+        stc
+        ret
+
+; pnp_isolation_setup -- Set-RD_DATA = [pnp_rdp], 100 us + 1 ms, select the isolation register, 1 ms.
+pnp_isolation_setup:
+        mov     ax, [pnp_rdp]
+        shr     ax, 1
+        shr     ax, 1
+        mov     ah, al
+        mov     al, PNP_R_SETRDP
+        call    pnp_write_reg
+        mov     cx, PNP_US_RDP
+        call    pnp_delay
+        mov     cx, PNP_US_1MS
+        call    pnp_delay
+        mov     al, PNP_R_ISOLATE
+        call    pnp_set_addr
+        mov     cx, PNP_US_1MS
+        call    pnp_delay
+        ret
+
+;------------------------------------------------------------------------------
+; pnp_isolate_one -- read one card's 72-bit serial identifier (250 us after every read) and check the
+; LFSR checksum (Linux: valid if checksum != 0 and it matches the 9th byte).
 ; out: CF=0 and pnp_id[0..8] filled if a card isolated; CF=1 if none. clobbers AX,BX,CX,DX,DI.
 ;------------------------------------------------------------------------------
 pnp_isolate_one:
-        mov     al, PNP_R_WAKE            ; CSN-0 cards -> Isolation
-        xor     ah, ah
-        call    pnp_write_reg
-        mov     al, PNP_R_ISOLATE        ; subsequent reads stream the isolation sequence
-        call    pnp_set_addr
-        call    io_delay                  ; isolation settle
-
         mov     byte [pnp_lfsr], PNP_LFSR_SEED
-        mov     byte [pnp_saw], 0
         mov     di, pnp_id
         mov     cx, 9                     ; 8 ID bytes + 1 checksum byte
 .byteL:
@@ -181,7 +271,6 @@ pnp_isolate_one:
         cmp     al, 0xAA
         jne     .b0
         mov     bh, 1
-        mov     byte [pnp_saw], 1
 .b0:
         cmp     ch, 1                     ; checksum LFSR over the first 64 bits only
         je      .nocsum
@@ -206,10 +295,10 @@ pnp_isolate_one:
         pop     cx
         loop    .byteL
 
-        cmp     byte [pnp_saw], 0         ; a card must have driven the bus
-        je      .nocard
-        mov     al, [pnp_lfsr]            ; computed checksum must match the read byte
-        cmp     al, [pnp_id + 8]
+        mov     al, [pnp_lfsr]
+        or      al, al
+        jz      .nocard                   ; a zero checksum is never valid (Linux)
+        cmp     al, [pnp_id + 8]          ; computed checksum must match the read byte
         jne     .nocard
         clc
         ret
@@ -217,25 +306,123 @@ pnp_isolate_one:
         stc
         ret
 
+; pnp_is_3com -- CF=0 if pnp_id is a 3Com vendor id (compressed EISA "TCM", 0x50 0x6D; either byte
+; order accepted). Clobbers AX.
+pnp_is_3com:
+        mov     al, [pnp_id]
+        mov     ah, [pnp_id + 1]
+        cmp     ax, 0x6D50                ; bytes 0x50, 0x6D
+        je      .yes
+        cmp     ax, 0x506D                ; swapped
+        je      .yes
+        stc
+        ret
+.yes:
+        clc
+        ret
+
+; pnp_report_card -- "PnP card TCM5051 CSN=1 read port 0x0213" for the card just isolated.
+; The EISA id: bytes 0-1 (big-endian) pack 3 letters as 5-bit fields ('A' = 1), bytes 2-3 the product.
+pnp_report_card:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        mov     dx, msg_pnp_card
+        call    print_str
+        mov     bh, [pnp_id]
+        mov     bl, [pnp_id + 1]          ; BX = vendor, big-endian
+        mov     ax, bx
+        mov     cl, 10
+        shr     ax, cl
+        call    .letter
+        mov     ax, bx
+        mov     cl, 5
+        shr     ax, cl
+        call    .letter
+        mov     ax, bx
+        call    .letter
+        mov     al, [pnp_id + 2]
+        call    .hex2
+        mov     al, [pnp_id + 3]
+        call    .hex2
+        mov     dx, msg_pnp_csn
+        call    print_str
+        mov     al, [pnp_csn]
+        add     al, '0'
+        call    print_char
+        mov     dx, msg_pnp_rdp
+        call    print_str
+        mov     ax, [pnp_rdp]
+        call    print_hex16
+        mov     dx, msg_crlf
+        call    print_str
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+.letter:
+        and     al, 0x1F
+        add     al, '@'
+        call    print_char
+        ret
+.hex2:
+        push    ax
+        mov     cl, 4
+        shr     al, cl
+        call    .nib
+        pop     ax
+.nib:
+        and     al, 0x0F
+        add     al, '0'
+        cmp     al, '9'
+        jbe     .pc
+        add     al, 7
+.pc:
+        call    print_char
+        ret
+
 ;------------------------------------------------------------------------------
 ; low-level ISA PnP port helpers
 ;------------------------------------------------------------------------------
-pnp_send_key:                            ; reset the key LFSR, then clock the 32-byte key
-        mov     dx, PNP_ADDR
+; pnp_delay -- CX x ~1 us (one ISA read of port 0x80 each, CPU-speed independent). Preserves AX.
+pnp_delay:
+        push    ax
+.d:     in      al, 0x80
+        loop    .d
+        pop     ax
+        ret
+
+pnp_wait_key:                            ; all cards -> Wait-for-Key. Clobbers AX, CX.
+        mov     al, PNP_R_CONFIG
+        mov     ah, PNP_CFG_WAITKEY
+        call    pnp_write_reg
+        ret
+
+pnp_send_key:                            ; 1 ms, reset the key LFSR (two 0 writes), 32 key bytes
+        push    si
+        mov     cx, PNP_US_1MS
+        call    pnp_delay
         xor     al, al
-        out     dx, al
-        out     dx, al
+        call    pnp_set_addr
+        xor     al, al
+        call    pnp_set_addr
         mov     si, pnp_key
         mov     cx, 32
 .k:     lodsb                            ; DS:SI -> key (DS = DGROUP)
-        out     dx, al
+        push    cx
+        call    pnp_set_addr
+        pop     cx
         loop    .k
+        pop     si
         ret
 
-pnp_write_reg:                           ; AL=register, AH=data
+pnp_write_reg:                           ; AL=register, AH=data. Clobbers CX.
         push    dx
-        mov     dx, PNP_ADDR
-        out     dx, al
+        push    ax
+        call    pnp_set_addr
+        pop     ax
         mov     dx, PNP_WRITE
         xchg    al, ah
         out     dx, al
@@ -243,26 +430,30 @@ pnp_write_reg:                           ; AL=register, AH=data
         pop     dx
         ret
 
-pnp_set_addr:                            ; AL=register
+pnp_set_addr:                            ; AL=register; 20 us after the write (Linux). Clobbers CX.
         push    dx
         mov     dx, PNP_ADDR
         out     dx, al
+        mov     cx, PNP_US_ADDR
+        call    pnp_delay
         pop     dx
         ret
 
-pnp_read_reg:                            ; AL=register -> AL=value
+pnp_read_reg:                            ; AL=register -> AL=value. Clobbers CX.
         call    pnp_set_addr
-        call    pnp_read_data
+        push    dx
+        mov     dx, [pnp_rdp]
+        in      al, dx
+        pop     dx
         ret
 
-pnp_read_data:                           ; -> AL. Brief settle first (ISA PnP read timing;
-        push    dx                       ; tune the count on hardware). Preserves DH, CX.
+pnp_read_data:                           ; one isolation read from [pnp_rdp], then 250 us. -> AL.
+        push    dx                       ; Preserves CX, DH (the caller keeps data1 in DH).
         push    cx
-        mov     cx, 4
-.d:     in      al, 0x80                 ; ~1 us POST-port reads, bus-bound
-        loop    .d
-        mov     dx, PNP_READ
+        mov     dx, [pnp_rdp]
         in      al, dx
+        mov     cx, PNP_US_READ
+        call    pnp_delay
         pop     cx
         pop     dx
         ret
